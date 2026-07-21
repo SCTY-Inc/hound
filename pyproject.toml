@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evidence-hound"
+version = "0.2.3"
+description = "Bounded research and evidence operations."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE.md" }
+authors = [{ name = "SCTY" }]
+keywords = ["cli", "evidence", "provenance", "research"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/SCTY-Inc/hound"
+Repository = "https://github.com/SCTY-Inc/hound.git"
+Issues = "https://github.com/SCTY-Inc/hound/issues"
+
+[project.scripts]
+hound = "hound_cli.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hound_cli"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

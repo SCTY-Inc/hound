@@ -1,0 +1,24 @@
+{
+  "schema_version": "hound.driver.v1",
+  "id": "example-status",
+  "protocol": "hound.protocol.v1",
+  "owner": {
+    "repo": "../.."
+  },
+  "exec": [
+    "python3",
+    "examples/status/driver.py"
+  ],
+  "capabilities": {
+    "corpus.status": {
+      "effect": "read",
+      "gate": "none"
+    }
+  },
+  "run_root": ".hound/runs",
+  "capture_root": ".hound/captures",
+  "timeouts_seconds": {
+    "default": 30
+  },
+  "env_allowlist": []
+}

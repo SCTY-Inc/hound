@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.4"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv run pytest -q
+      - run: uv build
+      - name: Smoke-test the built wheel
+        run: |
+          uv venv /tmp/hound-smoke
+          uv pip install --python /tmp/hound-smoke/bin/python dist/*.whl
+          /tmp/hound-smoke/bin/hound --version
+          /tmp/hound-smoke/bin/hound --help >/dev/null
