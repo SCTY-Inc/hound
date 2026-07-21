@@ -130,6 +130,21 @@ Read capabilities execute directly. Standard source drivers can also use the
 composed `source discover → capture → inspect` lifecycle, which keeps search
 leads separate from immutable, verified source material.
 
+## Built-in source packs
+
+Hound ships two credential-isolated source packs behind one provider contract:
+
+- **Web:** Exa search and contents, Firecrawl search and passive scrape, and
+  origin-page capture with direct fetching plus Scrapling extraction before a
+  Firecrawl fallback.
+- **Scholarly:** arXiv Atom API search without a credential. Results are marked
+  as academic preprints so the owner driver can apply its own evidence policy.
+
+Drivers opt into kernel composition by declaring `"composition":
+"hound.source.v1"` on all three source capabilities. The owner driver still
+chooses queries, capture modes, and interpretation; Hound owns transport,
+budgets, immutable capture storage, and verification.
+
 ## What Hound enforces
 
 - **Evidence boundary:** discovery results are marked as leads. Verified captures

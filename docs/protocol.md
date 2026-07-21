@@ -111,15 +111,17 @@ digest anchor controlled outside the owner filesystem.
 - `hound.lead.v1` is explicitly `not-evidence`.
 - `hound.capture.v1` addresses raw bytes by SHA-256, binds retrieval provenance in
   a distinct capture ID, and uses create-only blobs and manifests.
-- `hound.provider.request.v1` supports bounded Exa and Firecrawl operations;
-  every operation and nested Exa content object uses a positive field allowlist.
+- `hound.provider.request.v1` supports the built-in `web` pack (Exa and
+  Firecrawl) and `scholarly` pack (arXiv Atom API). Every operation, nested Exa
+  content object, and arXiv query field uses a positive field allowlist.
 - Public URLs use one strict parser boundary: browser-divergent backslashes,
   control/space characters, malformed host labels, private hosts, embedded
   credentials, and ambiguous semicolon parameters are rejected.
 - Firecrawl requests are restricted to passive search/scrape fields; browser
   actions, custom headers, proxy overrides, and disabled TLS are excluded.
-- `hound.provider.response.v1` includes the canonical request hash, raw provider
-  data, and normalized leads for searches, but never the provider credential.
+- `hound.provider.response.v1` includes the source-pack ID, canonical request
+  hash, raw provider data, and normalized leads for searches, but never the
+  provider credential.
 
 ### Standard source composition
 
@@ -135,14 +137,17 @@ kernel-composed read operations, not plain driver pass-throughs:
   response pairs, deduplicated leads, measured usage, and provider diagnostics.
 - The caller passes that discovery inside `hound.source.capture.input.v1`. The
   owner `source.capture` adapter returns `hound.source.capture-spec.v1` with a
-  unique subset of discovered URLs. Hound stores each selected provider-result
-  document under `capture_root` and returns `hound.source.capture-set.v1` with
-  the bound retrieval time and each manifest, inline document, and originating
-  lead. An empty successful discovery remains an empty capture set so the owner
-  can reach its ordinary no-result outcome instead of failing the protocol.
+  `captures` array of unique `{url, mode}` objects. `mode` is `provider-result`
+  for a native API document or `origin` for a selected web page. Origin capture
+  attempts direct HTTP plus Scrapling extraction first and passive Firecrawl
+  scraping second. Hound stores the exact fetched bytes under `capture_root` and
+  binds the extracted inline document hash, method, and attempts in manifest
+  metadata. Failed origins remain diagnostics and do not fall back to discovery
+  excerpts. An empty successful discovery remains an empty capture set so the
+  owner can reach its ordinary no-result outcome instead of failing the protocol.
 - The owner-specific inspect input must contain that capture set. Before calling
-  `source.inspect`, Hound recomputes each inline document hash and byte length,
-  then verifies the create-only manifest and blob in `capture_root`.
+  `source.inspect`, Hound recomputes each inline document hash against manifest
+  metadata, then verifies the create-only raw blob and manifest in `capture_root`.
 
 The owner adapters remain mutation-checked read capabilities and never receive
 provider credentials. The kernel-owned capture-store write is the deliberate

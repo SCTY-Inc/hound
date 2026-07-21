@@ -12,8 +12,9 @@ from typing import Any
 from .contracts import canonical_hash, canonical_json, load_manifest
 from .evidence import EvidenceError, make_lead, store_capture, verify_capture
 from .orchestrator import HoundError, invoke_read
+from .packs import provider_pack
+from .packs.web import WebCapture, WebFetchError, fetch_web_capture
 from .providers import ProviderError, execute_request, validate_request
-
 
 DISCOVERY_SPEC_SCHEMA = "hound.source.discovery-spec.v1"
 DISCOVERY_SCHEMA = "hound.source.discovery.v1"
@@ -24,8 +25,10 @@ CAPTURE_SET_SCHEMA = "hound.source.capture-set.v1"
 MAX_SOURCE_REQUESTS = 16
 MAX_SOURCE_LEADS = 500
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_CAPTURES = 100
 
 ProviderExecutor = Callable[[object], dict[str, Any]]
+WebFetcher = Callable[..., WebCapture]
 
 
 def _object(value: object, label: str) -> dict[str, Any]:
@@ -86,12 +89,11 @@ def _discovery_spec(response: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
     return requests, validated_limits
 
 
-def _provider_response(
-    value: object, request: dict[str, Any]
-) -> dict[str, Any]:
+def _provider_response(value: object, request: dict[str, Any]) -> dict[str, Any]:
     response = _object(value, "provider response")
     required = {
         "schema_version",
+        "pack",
         "provider",
         "operation",
         "request_sha256",
@@ -102,7 +104,11 @@ def _provider_response(
     _strict(response, required, "provider response")
     if response["schema_version"] != "hound.provider.response.v1":
         raise EvidenceError("provider response has an unsupported schema version")
-    if response["provider"] != request["provider"] or response["operation"] != "search":
+    if (
+        response["provider"] != request["provider"]
+        or response["pack"] != provider_pack(request["provider"])
+        or response["operation"] != "search"
+    ):
         raise EvidenceError("provider response does not match its request")
     if response["request_sha256"] != canonical_hash(request):
         raise EvidenceError("provider response request hash does not match")
@@ -160,7 +166,9 @@ def _validate_discovery(value: object) -> dict[str, Any]:
         raise EvidenceError("source discovery leads do not match its provider responses")
     usage = _object(discovery["usage"], "source discovery usage")
     _strict(usage, {"requests", "leads", "bytes"}, "source discovery usage")
-    expected_bytes = sum(len(canonical_json(response).encode("utf-8")) for response in validated_responses)
+    expected_bytes = sum(
+        len(canonical_json(response).encode("utf-8")) for response in validated_responses
+    )
     if usage != {
         "requests": len(validated_requests),
         "leads": len(leads),
@@ -255,9 +263,8 @@ def _capture_root(manifest_path: str | Path) -> Path:
 
 def _search_results(response: dict[str, Any]) -> list[dict[str, Any]]:
     raw_data = _object(response["raw_data"], "provider raw_data")
-    if response["provider"] == "exa":
-        results = raw_data.get("results")
-    else:
+    results = raw_data.get("results")
+    if not isinstance(results, list):
         data = raw_data.get("data")
         results = data.get("web") if isinstance(data, dict) else None
     if not isinstance(results, list):
@@ -270,6 +277,7 @@ def capture_sources(
     payload: dict[str, Any],
     *,
     as_of: str | None = None,
+    web_fetch: WebFetcher = fetch_web_capture,
 ) -> dict[str, Any]:
     """Persist owner-selected discovery documents in the kernel capture store."""
 
@@ -283,16 +291,30 @@ def capture_sources(
     if response.get("data_schema") != CAPTURE_SPEC_SCHEMA:
         raise EvidenceError(f"source.capture must return {CAPTURE_SPEC_SCHEMA}")
     spec = _object(response.get("data"), "source capture spec")
-    _strict(spec, {"schema_version", "selected_urls"}, "source capture spec")
+    _strict(spec, {"schema_version", "captures"}, "source capture spec")
     if spec["schema_version"] != CAPTURE_SPEC_SCHEMA:
         raise EvidenceError("source capture spec has an unsupported schema version")
-    selected_urls = spec["selected_urls"]
-    if not isinstance(selected_urls, list):
-        raise EvidenceError("source capture selected_urls must be an array")
-    if len(selected_urls) != len(set(selected_urls)) or not all(
-        isinstance(url, str) and url for url in selected_urls
-    ):
-        raise EvidenceError("source capture selected_urls must contain unique URLs")
+    raw_requests = spec["captures"]
+    if not isinstance(raw_requests, list):
+        raise EvidenceError("source capture captures must be an array")
+    capture_requests: list[dict[str, str]] = []
+    for raw in raw_requests:
+        item = _object(raw, "source capture request")
+        _strict(item, {"url", "mode"}, "source capture request")
+        url = item["url"]
+        mode = item["mode"]
+        if not isinstance(url, str) or not url:
+            raise EvidenceError("source capture request URL must be a non-empty string")
+        if mode not in {"origin", "provider-result"}:
+            raise EvidenceError("source capture request mode is unsupported")
+        capture_requests.append({"url": url, "mode": mode})
+    selected_urls = [item["url"] for item in capture_requests]
+    if len(selected_urls) != len(set(selected_urls)):
+        raise EvidenceError("source capture requests must contain unique URLs")
+    if len(selected_urls) > MAX_SOURCE_CAPTURES:
+        raise EvidenceError(
+            f"source capture request count exceeds the kernel ceiling {MAX_SOURCE_CAPTURES}"
+        )
 
     available: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
     leads = {
@@ -309,12 +331,73 @@ def capture_sources(
     if unknown:
         raise EvidenceError("source capture selected a URL absent from discovery")
 
+    def prepare_capture(
+        capture_request: dict[str, str],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        WebCapture | None,
+        str | None,
+    ]:
+        url = capture_request["url"]
+        provider_response, discovered_document, lead = available[url]
+        if capture_request["mode"] == "origin":
+            try:
+                fetched = web_fetch(
+                    url,
+                    discovered_document,
+                    retrieved_at=provider_response["retrieved_at"],
+                )
+                return provider_response, discovered_document, lead, fetched, None
+            except WebFetchError as error:
+                return provider_response, discovered_document, lead, None, str(error)
+        document_body = canonical_json(discovered_document).encode("utf-8")
+        fetched = WebCapture(
+            method=f"{provider_response['provider']}-api",
+            body=document_body,
+            media_type="application/json",
+            document=deepcopy(discovered_document),
+            attempts=[
+                {
+                    "method": f"{provider_response['provider']}-api",
+                    "outcome": "captured",
+                }
+            ],
+        )
+        return provider_response, discovered_document, lead, fetched, None
+
+    prepared: list[
+        tuple[
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            WebCapture | None,
+            str | None,
+        ]
+    ] = []
+    if capture_requests:
+        with ThreadPoolExecutor(max_workers=min(4, len(capture_requests))) as executor:
+            prepared = list(executor.map(prepare_capture, capture_requests))
+
     root = _capture_root(manifest_path)
     captures: list[dict[str, Any]] = []
-    for url in selected_urls:
-        provider_response, document, lead = available[url]
-        body = canonical_json(document).encode("utf-8")
+    diagnostics = list(response.get("diagnostics", []))
+    for capture_request, (provider_response, _discovered, lead, fetched, failure) in zip(
+        capture_requests, prepared, strict=True
+    ):
+        url = capture_request["url"]
+        if fetched is None:
+            diagnostics.append(f"origin capture failed for {url}: {failure}")
+            continue
+        document = fetched.document
+        document_sha256 = hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
         metadata = {
+            "attempts": fetched.attempts,
+            "capture_method": fetched.method,
+            "discovery_pack": provider_response["pack"],
+            "discovery_provider": provider_response["provider"],
+            "document_sha256": document_sha256,
             "request_sha256": provider_response["request_sha256"],
             "query": lead.get("query"),
             "rank": _object(lead.get("metadata", {}), "lead metadata").get("rank"),
@@ -327,10 +410,10 @@ def capture_sources(
         }
         manifest = store_capture(
             root,
-            provider=provider_response["provider"],
+            provider=fetched.method,
             source_url=url,
-            body=body,
-            media_type="application/json",
+            body=fetched.body,
+            media_type=fetched.media_type,
             retrieved_at=provider_response["retrieved_at"],
             metadata={key: item for key, item in metadata.items() if item is not None},
         )
@@ -347,6 +430,7 @@ def capture_sources(
             *response.get("proofs", []),
             {"kind": "immutable-capture-store", "passed": True, "count": len(captures)},
         ],
+        "diagnostics": diagnostics,
     }
 
 
@@ -370,13 +454,12 @@ def _validate_capture_set(manifest_path: str | Path, value: object) -> dict[str,
         _strict(entry, {"manifest", "document", "lead"}, "source capture entry")
         manifest = _object(entry["manifest"], "source capture manifest")
         document = _object(entry["document"], "source capture document")
-        body = canonical_json(document).encode("utf-8")
+        metadata = _object(manifest.get("metadata"), "source capture metadata")
+        document_sha256 = hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
         if manifest.get("retrieved_at") != capture_set["retrieved_at"]:
             raise EvidenceError("capture retrieval time does not match its capture set")
-        if manifest.get("sha256") != hashlib.sha256(body).hexdigest():
+        if metadata.get("document_sha256") != document_sha256:
             raise EvidenceError("capture document hash does not match its manifest")
-        if manifest.get("byte_length") != len(body):
-            raise EvidenceError("capture document length does not match its manifest")
         capture_id = manifest.get("capture_id")
         if not isinstance(capture_id, str) or not verify_capture(root, capture_id):
             raise EvidenceError("capture manifest or stored blob is invalid")

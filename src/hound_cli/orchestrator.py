@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+from importlib.metadata import version as package_version
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -42,14 +43,19 @@ class HoundError(Exception):
         self.exit_code = exit_code
 
 
-def _kernel_identity() -> dict[str, str]:
+def _kernel_identity() -> dict[str, Any]:
+    source_root = Path(__file__).parent
     digest = hashlib.sha256()
-    for source in sorted(Path(__file__).parent.glob("*.py")):
-        digest.update(source.name.encode("utf-8"))
+    for source in sorted(source_root.rglob("*.py")):
+        digest.update(source.relative_to(source_root).as_posix().encode("utf-8"))
         digest.update(b"\0")
         digest.update(source.read_bytes())
         digest.update(b"\0")
-    return {"version": __version__, "sha256": digest.hexdigest()}
+    return {
+        "version": __version__,
+        "sha256": digest.hexdigest(),
+        "dependencies": {"scrapling": package_version("scrapling")},
+    }
 
 
 def _owner_repo(manifest: dict[str, Any], manifest_path: Path) -> Path:

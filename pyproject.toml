@@ -19,7 +19,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
-dependencies = []
+dependencies = [
+  "scrapling==0.4.11",
+]
 
 [project.urls]
 Homepage = "https://github.com/SCTY-Inc/hound"

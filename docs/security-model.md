@@ -42,10 +42,16 @@ allowlisted globally and for the selected capability. Environment values are not
 stored in cleartext, though their combined digest can reveal low-entropy values
 through guessing.
 
-Provider credentials stay inside Hound's Exa and Firecrawl transports. Positive
-field allowlists reject credential-shaped parameters and active browser
-features. Search responses are leads marked `not-evidence`; only immutable,
-verified captures cross the evidence boundary.
+Provider credentials stay inside Hound's Exa and Firecrawl transports; the arXiv
+adapter requires no credential. Positive field allowlists reject
+credential-shaped parameters and active browser features. Search responses are
+leads marked `not-evidence`; only immutable, verified captures cross the evidence
+boundary.
+
+For origin capture, Hound rejects private or ambiguous URLs, attempts a direct
+fetch with Scrapling extraction, and permits only passive Firecrawl scraping as
+a fallback. Failed origin fetches remain diagnostics rather than being replaced
+with discovery excerpts presented as evidence.
 
 Provider response bytes and caller wall time are bounded. A timed-out standard
 library network worker may continue until the short-lived Hound process exits,

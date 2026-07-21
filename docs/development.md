@@ -10,8 +10,8 @@ cd hound
 uv sync --locked
 ```
 
-Hound uses only the Python standard library at runtime. Pytest is the development
-dependency.
+Hound uses the Python standard library plus the pinned Scrapling extraction
+runtime. Pytest is the development dependency.
 
 ## Run the verification gate
 

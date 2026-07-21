@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import stat
 import threading
 import time
@@ -18,6 +19,8 @@ from urllib.parse import parse_qsl, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .evidence import EvidenceError, make_lead
+from .packs import provider_pack
+from .packs.scholarly import ARXIV_FIELDS, arxiv_request_url, parse_arxiv_response
 from .safety import (
     contains_credential,
     credential_forms,
@@ -40,10 +43,12 @@ _ENDPOINTS = {
     ("exa", "contents"): "https://api.exa.ai/contents",
     ("firecrawl", "search"): "https://api.firecrawl.dev/v2/search",
     ("firecrawl", "scrape"): "https://api.firecrawl.dev/v2/scrape",
+    ("arxiv", "search"): "https://export.arxiv.org/api/query",
 }
-_ENV_KEYS = {
+_ENV_KEYS: dict[str, str | None] = {
     "exa": "EXA_API_KEY",
     "firecrawl": "FIRECRAWL_API_KEY",
+    "arxiv": None,
 }
 _REQUIRED_FIELDS = {"schema_version", "provider", "operation", "parameters"}
 _OPTIONAL_FIELDS = {"retrieved_at"}
@@ -122,6 +127,7 @@ _ALLOWED_PARAMETER_FIELDS = {
         "storeInCache",
         "zeroDataRetention",
     },
+    ("arxiv", "search"): ARXIV_FIELDS,
 }
 _PROHIBITED_ACTIVE_PARAMETER_KEYS = {
     "actions",
@@ -144,7 +150,7 @@ def load_provider_environment(
     """Load only one provider credential from a private dotenv-style file."""
 
     env_key = _ENV_KEYS.get(provider)
-    if env_key is None:
+    if not env_key:
         raise ProviderError("provider has no credential binding")
     target = Path(path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -201,7 +207,7 @@ def load_provider_environment(
     return {env_key: values[0]}
 
 
-def _validate_url(value: str) -> None:
+def validate_public_url(value: str) -> None:
     if len(value) > 8192:
         raise ProviderError("parameters contain an overlong URL")
     if not url_text_safe(value):
@@ -253,7 +259,7 @@ def _clean_parameter(value: object, path: str, depth: int = 0) -> Any:
         return value
     if isinstance(value, str):
         if value.casefold().startswith(("http://", "https://")):
-            _validate_url(value)
+            validate_public_url(value)
         return value
     raise ProviderError(f"{path} must contain only JSON values")
 
@@ -311,8 +317,26 @@ def _validate_operation_parameters(
         _validate_exa_parameter_objects(operation, parameters)
     _bounded_integer(parameters, "numResults")
     _bounded_integer(parameters, "limit")
+    _bounded_integer(parameters, "maxResults")
     if operation == "search":
         _require_query(parameters)
+    if provider == "arxiv":
+        categories = parameters.get("categories", [])
+        if (
+            not isinstance(categories, list)
+            or len(categories) > 20
+            or any(
+                not isinstance(category, str)
+                or not re.fullmatch(r"[a-z-]+(?:\.[A-Za-z-]+)+", category)
+                for category in categories
+            )
+        ):
+            raise ProviderError("arxiv categories must be a bounded array of category IDs")
+        start = parameters.get("startPublishedDate")
+        if start is not None and (
+            not isinstance(start, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", start) is None
+        ):
+            raise ProviderError("arxiv startPublishedDate must be YYYY-MM-DD")
     elif provider == "exa" and operation == "contents":
         ids = parameters.get("ids")
         urls = parameters.get("urls")
@@ -325,12 +349,12 @@ def _validate_operation_parameters(
             raise ProviderError("Exa contents IDs or URLs must contain 1 through 100 strings")
         if urls is not None:
             for url in urls:
-                _validate_url(url)
+                validate_public_url(url)
     elif provider == "firecrawl" and operation == "scrape":
         url = parameters.get("url")
         if not isinstance(url, str):
             raise ProviderError("Firecrawl scrape parameters.url must be an HTTP URL")
-        _validate_url(url)
+        validate_public_url(url)
 
 
 def validate_request(obj: object) -> dict[str, Any]:
@@ -351,8 +375,12 @@ def validate_request(obj: object) -> dict[str, Any]:
 
     provider = obj["provider"]
     operation = obj["operation"]
-    if not isinstance(provider, str) or provider not in _ENV_KEYS:
-        raise ProviderError("provider must be 'exa' or 'firecrawl'")
+    if (
+        not isinstance(provider, str)
+        or provider not in _ENV_KEYS
+        or provider_pack(provider) is None
+    ):
+        raise ProviderError("provider must name a built-in Hound source adapter")
     if not isinstance(operation, str) or (provider, operation) not in _ENDPOINTS:
         raise ProviderError(f"operation is not supported by provider {provider!r}")
     if not isinstance(obj["parameters"], dict):
@@ -371,6 +399,12 @@ def validate_request(obj: object) -> dict[str, Any]:
         if not isinstance(retrieved_at, str) or not retrieved_at.strip():
             raise ProviderError("retrieved_at must be a non-empty string")
         validated["retrieved_at"] = retrieved_at
+    if (
+        provider == "arxiv"
+        and "startPublishedDate" in parameters
+        and "retrieved_at" not in validated
+    ):
+        raise ProviderError("arxiv date-bounded search requires retrieved_at")
     return validated
 
 
@@ -401,10 +435,20 @@ class _NoRedirects(HTTPRedirectHandler):
 
 
 def _default_transport(
-    *, url: str, headers: Mapping[str, str], body: bytes, timeout: float
+    *,
+    url: str,
+    headers: Mapping[str, str],
+    body: bytes,
+    timeout: float,
+    method: str = "POST",
 ) -> tuple[int, bytes]:
     deadline = time.monotonic() + timeout
-    request = Request(url, data=body, headers=dict(headers), method="POST")
+    request = Request(
+        url,
+        data=body if method == "POST" else None,
+        headers=dict(headers),
+        method=method,
+    )
     opener = build_opener(_NoRedirects())
     completed: queue.Queue[
         tuple[Exception | None, tuple[int, bytes] | None]
@@ -467,7 +511,7 @@ def _credential_headers(provider: str, api_key: str) -> dict[str, str]:
     }
     if provider == "exa":
         headers["x-api-key"] = api_key
-    else:
+    elif provider == "firecrawl":
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
@@ -502,7 +546,7 @@ def _result_leads(
     provider: str, parameters: Mapping[str, object], raw_data: Mapping[str, object]
 ) -> list[dict[str, Any]]:
     query = parameters["query"]
-    if provider == "exa":
+    if provider in {"exa", "arxiv"}:
         results = raw_data.get("results")
     else:
         data = raw_data.get("data")
@@ -519,13 +563,16 @@ def _result_leads(
         if not isinstance(url, str) or (title is not None and not isinstance(title, str)):
             raise ProviderError("provider search result has invalid URL or title")
         try:
+            metadata: dict[str, object] = {"rank": rank}
+            if provider == "arxiv":
+                metadata["source_profile"] = "academic_preprint"
             leads.append(
                 make_lead(
                     provider,
                     query,
                     url,
                     title=title,
-                    metadata={"rank": rank},
+                    metadata=metadata,
                 )
             )
         except EvidenceError as error:
@@ -557,32 +604,63 @@ def execute_request(
     environment = os.environ if env is None else env
     if not isinstance(environment, Mapping):
         raise ProviderError("env must be a mapping")
-    api_key = environment.get(_ENV_KEYS[provider])
-    if not isinstance(api_key, str) or not api_key.strip():
-        raise ProviderError(f"provider credential {_ENV_KEYS[provider]} is missing")
-    if contains_credential(validated["parameters"], credential_forms(api_key)):
+    env_key = _ENV_KEYS[provider]
+    api_key = environment.get(env_key) if env_key else ""
+    if env_key and (not isinstance(api_key, str) or not api_key.strip()):
+        raise ProviderError(f"provider credential {env_key} is missing")
+    forms = credential_forms(api_key) if api_key else []
+    if forms and contains_credential(validated["parameters"], forms):
         raise ProviderError("provider parameters must not contain its credential")
 
     payload = _canonical_json(validated["parameters"])
     if len(payload) > MAX_REQUEST_BYTES:
         raise ProviderError("provider request exceeded size limit")
-    send = _default_transport if transport is None else transport
+    endpoint = _ENDPOINTS[(provider, operation)]
+    headers = _credential_headers(provider, api_key)
+    body = payload
+    method = "POST"
+    if provider == "arxiv":
+        endpoint = arxiv_request_url(validated["parameters"], validated.get("retrieved_at"))
+        headers = {"Accept": "application/atom+xml", "User-Agent": "hound-scholarly/1"}
+        body = b""
+        method = "GET"
     try:
-        transport_result = send(
-            url=_ENDPOINTS[(provider, operation)],
-            headers=_credential_headers(provider, api_key),
-            body=payload,
-            timeout=timeout_seconds,
-        )
+        if transport is None:
+            transport_result = _default_transport(
+                url=endpoint,
+                headers=headers,
+                body=body,
+                timeout=timeout_seconds,
+                method=method,
+            )
+        else:
+            transport_result = transport(
+                url=endpoint,
+                headers=headers,
+                body=body,
+                timeout=timeout_seconds,
+            )
     except Exception:
         raise ProviderError("provider transport failed") from None
     if not isinstance(transport_result, tuple) or len(transport_result) != 2:
         raise ProviderError("provider transport returned an invalid response")
     status, response_body = transport_result
-    raw_data = _decode_response(status, response_body, api_key)
+    if provider == "arxiv":
+        if not isinstance(status, int) or status < 200 or status >= 300:
+            raise ProviderError(f"provider returned HTTP status {status}")
+        if not isinstance(response_body, bytes) or len(response_body) > MAX_RESPONSE_BYTES:
+            raise ProviderError("provider response exceeded size limit")
+        try:
+            raw_data = parse_arxiv_response(response_body)
+        except Exception:
+            raise ProviderError("provider returned malformed Atom XML") from None
+        _canonical_json(raw_data)
+    else:
+        raw_data = _decode_response(status, response_body, api_key)
 
     response: dict[str, Any] = {
         "schema_version": RESPONSE_SCHEMA,
+        "pack": provider_pack(provider),
         "provider": provider,
         "operation": operation,
         "request_sha256": hashlib.sha256(_canonical_json(validated)).hexdigest(),
@@ -592,7 +670,7 @@ def execute_request(
         response["retrieved_at"] = validated["retrieved_at"]
     if operation == "search":
         response["leads"] = _result_leads(provider, validated["parameters"], raw_data)
-    if contains_credential(response, credential_forms(api_key)):
+    if forms and contains_credential(response, forms):
         raise ProviderError("provider response contained credential material")
     return response
 
@@ -601,5 +679,6 @@ __all__ = [
     "ProviderError",
     "execute_request",
     "load_provider_environment",
+    "validate_public_url",
     "validate_request",
 ]

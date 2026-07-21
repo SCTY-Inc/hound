@@ -80,10 +80,10 @@ else:
             ),
         }
         data_schema = "hound.source.discovery-spec.v1"
-    elif operation == "source.capture" and "selected_urls" in payload:
+    elif operation == "source.capture" and "captures" in payload:
         data = {
             "schema_version": "hound.source.capture-spec.v1",
-            "selected_urls": payload["selected_urls"],
+            "captures": payload["captures"],
         }
         data_schema = "hound.source.capture-spec.v1"
     else:

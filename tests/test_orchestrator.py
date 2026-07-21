@@ -42,7 +42,25 @@ def test_plan_is_deterministic_and_bound_to_repo(driver_repo: tuple[Path, Path])
     assert first["gate"] == "human"
     assert first["expected_writes"] == ["output/result.json"]
     assert first["kernel"]["version"] == "0.2.3"
+    assert first["kernel"]["dependencies"] == {"scrapling": "0.4.11"}
     assert len(first["kernel"]["sha256"]) == 64
+
+
+def test_kernel_identity_binds_source_pack_code() -> None:
+    source_root = Path(orchestrator.__file__).parent
+    digest = hashlib.sha256()
+    source_paths = sorted(source_root.rglob("*.py"))
+    assert any(
+        path.relative_to(source_root).as_posix() == "packs/web.py"
+        for path in source_paths
+    )
+    for source in source_paths:
+        digest.update(source.relative_to(source_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+
+    assert orchestrator._kernel_identity()["sha256"] == digest.hexdigest()
 
 
 @pytest.mark.parametrize("expected_write", [".", "./"])

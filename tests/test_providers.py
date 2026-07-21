@@ -7,7 +7,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
 
@@ -318,6 +318,7 @@ def test_execute_exa_search_uses_official_endpoint_and_normalizes_leads() -> Non
         }
     ]
     assert response["schema_version"] == "hound.provider.response.v1"
+    assert response["pack"] == "web"
     assert response["provider"] == "exa"
     assert response["operation"] == "search"
     assert response["request_sha256"] == _canonical_sha256(request)
@@ -343,6 +344,94 @@ def test_execute_exa_search_uses_official_endpoint_and_normalizes_leads() -> Non
         },
     ]
     assert "exa-test-secret" not in json.dumps(response)
+
+
+def test_arxiv_search_uses_the_native_api_and_normalizes_preprints() -> None:
+    request = _request(
+        provider="arxiv",
+        parameters={
+            "query": "caregiver OR caregiving",
+            "categories": ["cs.HC", "q-bio.PE"],
+            "maxResults": 2,
+            "startPublishedDate": "2026-07-16",
+        },
+        retrieved_at="2026-07-20T10:00:00Z",
+    )
+    calls: list[dict[str, object]] = []
+    response_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2607.12345v1</id>
+    <updated>2026-07-19T10:00:00Z</updated>
+    <published>2026-07-19T10:00:00Z</published>
+    <title>Caregiver coordination through accessible systems</title>
+    <summary>We evaluate a caregiver coordination intervention.</summary>
+    <author><name>Ada Example</name></author>
+    <category term="cs.HC"/>
+    <link rel="alternate" href="https://arxiv.org/abs/2607.12345v1"/>
+  </entry>
+</feed>"""
+
+    def transport(**call: object) -> tuple[int, bytes]:
+        calls.append(call)
+        return 200, response_xml
+
+    response = execute_request(request, env={}, transport=transport)
+
+    parsed = urlsplit(str(calls[0]["url"]))
+    parameters = parse_qs(parsed.query)
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://export.arxiv.org/api/query"
+    assert parameters["max_results"] == ["2"]
+    assert "cat:cs.HC" in parameters["search_query"][0]
+    assert "submittedDate:[202607160000 TO 202607202359]" in parameters["search_query"][0]
+    assert calls[0]["body"] == b""
+    assert response["pack"] == "scholarly"
+    assert response["provider"] == "arxiv"
+    assert response["raw_data"]["results"] == [
+        {
+            "arxivId": "2607.12345v1",
+            "authors": ["Ada Example"],
+            "categories": ["cs.HC"],
+            "publishedDate": "2026-07-19T10:00:00Z",
+            "text": "We evaluate a caregiver coordination intervention.",
+            "title": "Caregiver coordination through accessible systems",
+            "url": "https://arxiv.org/abs/2607.12345v1",
+        }
+    ]
+    assert response["leads"][0]["provider"] == "arxiv"
+    assert response["leads"][0]["metadata"] == {"rank": 1, "source_profile": "academic_preprint"}
+
+
+def test_arxiv_rejects_active_xml_declarations() -> None:
+    with pytest.raises(ProviderError, match="malformed Atom XML"):
+        execute_request(
+            _request(
+                provider="arxiv",
+                parameters={"query": "caregiver", "maxResults": 1},
+            ),
+            env={},
+            transport=lambda **_: (
+                200,
+                b'<!DOCTYPE feed [<!ENTITY x "unsafe">]><feed>&x;</feed>',
+            ),
+        )
+
+
+def test_arxiv_request_rejects_unbounded_or_malformed_parameters() -> None:
+    with pytest.raises(ProviderError):
+        validate_request(
+            _request(provider="arxiv", parameters={"query": "care", "maxResults": 101})
+        )
+    with pytest.raises(ProviderError):
+        validate_request(
+            _request(provider="arxiv", parameters={"query": "care", "categories": ["bad category"]})
+        )
+    with pytest.raises(ProviderError):
+        validate_request(
+            _request(
+                provider="arxiv", parameters={"query": "care", "startPublishedDate": "yesterday"}
+            )
+        )
 
 
 def test_execute_firecrawl_search_normalizes_data_web() -> None:

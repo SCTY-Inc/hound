@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from hound_cli.contracts import canonical_hash
+from hound_cli.packs.web import WebCapture, WebFetchError
 from hound_cli.providers import ProviderError
 from hound_cli.source import capture_sources, discover_sources, inspect_sources
 
@@ -44,6 +45,7 @@ def provider_response(request: dict[str, object]) -> dict[str, object]:
     }
     return {
         "schema_version": "hound.provider.response.v1",
+        "pack": "web",
         "provider": "exa",
         "operation": "search",
         "request_sha256": hashlib.sha256(
@@ -104,7 +106,7 @@ def test_discovery_composes_owner_policy_with_kernel_provider_transport(
 
 
 def test_discovery_fails_closed_when_owner_budget_is_exceeded(
-    driver_repo: tuple[Path, Path]
+    driver_repo: tuple[Path, Path],
 ) -> None:
     _, manifest_path = driver_repo
     request = provider_request()
@@ -121,21 +123,19 @@ def test_discovery_fails_closed_when_owner_budget_is_exceeded(
 
 
 def test_discovery_keeps_request_identity_when_one_provider_call_fails(
-    driver_repo: tuple[Path, Path]
+    driver_repo: tuple[Path, Path],
 ) -> None:
     _, manifest_path = driver_repo
     first = provider_request()
     second = provider_request()
     second["parameters"] = {**second["parameters"], "query": "respite access"}
+
     def execute(value: object) -> dict[str, object]:
         assert isinstance(value, dict)
         if value["parameters"]["query"] == "care workforce":
             raise ProviderError("temporary provider failure")
         response = provider_response(value)
-        response["leads"] = [
-            {**lead, "query": "respite access"}
-            for lead in response["leads"]
-        ]
+        response["leads"] = [{**lead, "query": "respite access"} for lead in response["leads"]]
         return response
 
     result = discover_sources(
@@ -152,7 +152,7 @@ def test_discovery_keeps_request_identity_when_one_provider_call_fails(
 
 
 def test_capture_persists_selected_results_and_inspect_verifies_them(
-    driver_repo: tuple[Path, Path]
+    driver_repo: tuple[Path, Path],
 ) -> None:
     repo, manifest_path = driver_repo
     request = provider_request()
@@ -170,7 +170,7 @@ def test_capture_persists_selected_results_and_inspect_verifies_them(
         {
             "schema_version": "hound.source.capture.input.v1",
             "discovery": discovery,
-            "selected_urls": ["https://example.test/one"],
+            "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
         },
     )
 
@@ -192,9 +192,97 @@ def test_capture_persists_selected_results_and_inspect_verifies_them(
     assert inspected["data"]["echo"]["capture_set"] == captured["data"]
 
 
-def test_empty_discovery_can_flow_to_owner_no_edition(
-    driver_repo: tuple[Path, Path]
+def test_capture_fetches_origin_only_when_owner_selects_origin_mode(
+    driver_repo: tuple[Path, Path],
 ) -> None:
+    repo, manifest_path = driver_repo
+    request = provider_request()
+    discovery = discover_sources(
+        manifest_path,
+        {
+            "requests": [request],
+            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
+        },
+        provider_execute=lambda value: provider_response(value),
+    )["data"]
+    seen: list[tuple[str, dict[str, object], str]] = []
+    raw_body = b"<html><article>Origin evidence</article></html>"
+
+    def fetch_origin(
+        url: str,
+        document: dict[str, object],
+        *,
+        retrieved_at: str,
+    ) -> WebCapture:
+        seen.append((url, document, retrieved_at))
+        return WebCapture(
+            method="direct-scrapling",
+            body=raw_body,
+            media_type="text/html",
+            document={
+                "url": url,
+                "title": "Origin title",
+                "publishedDate": "2026-07-20T08:00:00Z",
+                "text": "Origin evidence",
+            },
+            attempts=[{"method": "direct-scrapling", "outcome": "captured"}],
+        )
+
+    captured = capture_sources(
+        manifest_path,
+        {
+            "schema_version": "hound.source.capture.input.v1",
+            "discovery": discovery,
+            "captures": [{"url": "https://example.test/one", "mode": "origin"}],
+        },
+        web_fetch=fetch_origin,
+    )["data"]
+
+    assert seen[0][0] == "https://example.test/one"
+    entry = captured["captures"][0]
+    assert entry["document"]["text"] == "Origin evidence"
+    assert entry["manifest"]["sha256"] == hashlib.sha256(raw_body).hexdigest()
+    assert entry["manifest"]["metadata"]["capture_method"] == "direct-scrapling"
+    assert entry["manifest"]["metadata"]["attempts"] == [
+        {"method": "direct-scrapling", "outcome": "captured"}
+    ]
+    blob_sha256 = entry["manifest"]["sha256"]
+    assert (repo / ".hound" / "captures" / "blobs" / blob_sha256).read_bytes() == raw_body
+
+
+def test_failed_origin_capture_is_diagnostic_not_discovery_evidence(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    _, manifest_path = driver_repo
+    request = provider_request()
+    discovery = discover_sources(
+        manifest_path,
+        {
+            "requests": [request],
+            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
+        },
+        provider_execute=lambda value: provider_response(value),
+    )["data"]
+
+    captured = capture_sources(
+        manifest_path,
+        {
+            "schema_version": "hound.source.capture.input.v1",
+            "discovery": discovery,
+            "captures": [{"url": "https://example.test/one", "mode": "origin"}],
+        },
+        web_fetch=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            WebFetchError("origin capture failed")
+        ),
+    )
+
+    assert captured["data"]["captures"] == []
+    assert captured["diagnostics"] == [
+        "origin capture failed for https://example.test/one: origin capture failed"
+    ]
+
+
+def test_empty_discovery_can_flow_to_owner_no_edition(driver_repo: tuple[Path, Path]) -> None:
     _, manifest_path = driver_repo
     request = provider_request()
     empty_response = provider_response(request)
@@ -214,7 +302,7 @@ def test_empty_discovery_can_flow_to_owner_no_edition(
         {
             "schema_version": "hound.source.capture.input.v1",
             "discovery": discovery,
-            "selected_urls": [],
+            "captures": [],
         },
     )
     assert captured["data"] == {
@@ -222,10 +310,13 @@ def test_empty_discovery_can_flow_to_owner_no_edition(
         "retrieved_at": "2026-07-20T10:00:00Z",
         "captures": [],
     }
-    assert inspect_sources(
-        manifest_path,
-        {"schema_version": "fake.inspect.input.v1", "capture_set": captured["data"]},
-    )["outcome"] == "completed"
+    assert (
+        inspect_sources(
+            manifest_path,
+            {"schema_version": "fake.inspect.input.v1", "capture_set": captured["data"]},
+        )["outcome"]
+        == "completed"
+    )
 
 
 def test_inspect_rejects_document_tampering(driver_repo: tuple[Path, Path]) -> None:
@@ -244,7 +335,7 @@ def test_inspect_rejects_document_tampering(driver_repo: tuple[Path, Path]) -> N
         {
             "schema_version": "hound.source.capture.input.v1",
             "discovery": discovery,
-            "selected_urls": ["https://example.test/one"],
+            "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
         },
     )["data"]
     captured["captures"][0]["document"]["text"] = "tampered"
@@ -256,9 +347,7 @@ def test_inspect_rejects_document_tampering(driver_repo: tuple[Path, Path]) -> N
         )
 
 
-def test_capture_rejects_discovery_lead_tampering(
-    driver_repo: tuple[Path, Path]
-) -> None:
+def test_capture_rejects_discovery_lead_tampering(driver_repo: tuple[Path, Path]) -> None:
     _, manifest_path = driver_repo
     request = provider_request()
     discovery = discover_sources(
@@ -277,6 +366,6 @@ def test_capture_rejects_discovery_lead_tampering(
             {
                 "schema_version": "hound.source.capture.input.v1",
                 "discovery": discovery,
-                "selected_urls": ["https://example.test/one"],
+                "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
             },
         )
