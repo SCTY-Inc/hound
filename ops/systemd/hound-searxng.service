@@ -1,0 +1,16 @@
+[Unit]
+Description=Hound pinned SearXNG search service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'SEARXNG_SECRET="$(/usr/bin/openssl rand -hex 32)"; export SEARXNG_SECRET; exec /usr/bin/docker run --rm --name hound-searxng --pull never --publish 127.0.0.1:8888:8080 --security-opt no-new-privileges --env SEARXNG_SECRET --volume %h/.config/hound/searxng-settings.yml:/etc/searxng/settings.yml:ro ghcr.io/searxng/searxng@sha256:419d2915279be335146a440fd0ad25c657738dde7046387c0d5592cb6aa472d2'
+ExecStop=/usr/bin/docker stop --time 20 hound-searxng
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

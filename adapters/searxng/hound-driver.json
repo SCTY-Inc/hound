@@ -1,0 +1,26 @@
+{
+  "schema_version": "hound.driver.v1",
+  "id": "searxng",
+  "protocol": "hound.protocol.v1",
+  "owner": {
+    "repo": "../.."
+  },
+  "exec": [
+    "python3",
+    "-B",
+    "bin/hound-web-adapter",
+    "searxng"
+  ],
+  "capabilities": {
+    "web.search": {
+      "effect": "read",
+      "gate": "none",
+      "env_allowlist": [
+        "SEARXNG_ENDPOINT"
+      ]
+    }
+  },
+  "timeouts_seconds": {
+    "web.search": 30
+  }
+}

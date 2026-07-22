@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evidence-hound"
-version = "0.2.3"
+version = "0.3.0"
 description = "Bounded research and evidence operations."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,9 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
-dependencies = [
-  "scrapling==0.4.11",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/SCTY-Inc/hound"
@@ -30,14 +28,16 @@ Issues = "https://github.com/SCTY-Inc/hound/issues"
 
 [project.scripts]
 hound = "hound_cli.cli:main"
+hound-web-adapter = "hound_web_adapters.cli:main"
 
 [dependency-groups]
 dev = [
   "pytest>=8.3",
+  "pyyaml==6.0.2",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hound_cli"]
+packages = ["src/hound_cli", "src/hound_web_adapters"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
-from .runtime import RuntimeErrorHound, write_bytes_create_only
+from .runtime import RuntimeErrorHound, write_bytes_create_or_confirm
 from .safety import public_hostname, secret_key, url_text_safe
 
 
@@ -99,6 +99,12 @@ def _retrieval_time(value: object) -> str:
     return text
 
 
+def validate_public_url(value: object, field: str = "url") -> str:
+    """Validate and return one public HTTP(S) URL."""
+
+    return _safe_url(value, field)
+
+
 def make_lead(
     provider: str,
     query: str,
@@ -144,20 +150,13 @@ def _create_or_confirm(path: Path, expected: bytes, kind: str) -> None:
     if path.is_symlink():
         raise EvidenceError(f"existing {kind} is a symlink; refusing to follow it")
     try:
-        write_bytes_create_only(path, expected)
-        return
-    except FileExistsError:
-        pass
+        write_bytes_create_or_confirm(path, expected)
     except RuntimeErrorHound as error:
-        raise EvidenceError(f"{kind} cannot be created") from error
-    if path.is_symlink():
-        raise EvidenceError(f"existing {kind} is a symlink; refusing to follow it")
-    try:
-        existing = path.read_bytes()
-    except OSError as error:
-        raise EvidenceError(f"existing {kind} cannot be verified") from error
-    if existing != expected:
-        raise EvidenceError(f"existing {kind} differs; refusing to overwrite")
+        if path.is_symlink():
+            raise EvidenceError(f"existing {kind} is a symlink; refusing to follow it") from error
+        if not path.exists():
+            raise EvidenceError(f"{kind} cannot be created") from error
+        raise EvidenceError(f"existing {kind} differs; refusing to overwrite") from error
 
 
 def store_capture(
@@ -345,9 +344,7 @@ def enforce_budget(
             continue
         ceiling = _nonnegative_integer(limits[limit_name], limit_name)
         if usage[usage_name] > ceiling:
-            raise EvidenceError(
-                f"{limit_name} exceeded: {usage[usage_name]} > {ceiling}"
-            )
+            raise EvidenceError(f"{limit_name} exceeded: {usage[usage_name]} > {ceiling}")
     return usage
 
 

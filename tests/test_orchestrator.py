@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -37,25 +38,26 @@ def test_plan_is_deterministic_and_bound_to_repo(driver_repo: tuple[Path, Path])
     )
 
     assert first == second
-    assert first["schema_version"] == "hound.plan.v1"
+    assert first["schema_version"] == "hound.plan.v2"
     assert len(first["plan_id"]) == 64
     assert first["gate"] == "human"
-    assert first["expected_writes"] == ["output/result.json"]
-    assert first["kernel"]["version"] == "0.2.3"
-    assert first["kernel"]["dependencies"] == {"scrapling": "0.4.11"}
+    assert first["proposal"]["data"]["expected_writes"] == ["output/result.json"]
+    assert not {"driver_plan", "driver_outcome", "planning_response", "expected_writes"} & set(
+        first
+    )
+    assert first["kernel"]["version"] == "0.3.0"
+    assert first["kernel"]["dependencies"] == {}
     assert len(first["kernel"]["sha256"]) == 64
 
 
-def test_kernel_identity_binds_source_pack_code() -> None:
+def test_kernel_identity_binds_core_but_not_provider_implementations() -> None:
     source_root = Path(orchestrator.__file__).parent
     digest = hashlib.sha256()
-    source_paths = sorted(source_root.rglob("*.py"))
-    assert any(
-        path.relative_to(source_root).as_posix() == "packs/web.py"
-        for path in source_paths
-    )
+    source_paths = sorted(source_root.glob("*.py"))
+    assert any(path.name == "web.py" for path in source_paths)
+    assert all(path.parent == source_root for path in source_paths)
     for source in source_paths:
-        digest.update(source.relative_to(source_root).as_posix().encode("utf-8"))
+        digest.update(source.name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(source.read_bytes())
         digest.update(b"\0")
@@ -106,7 +108,7 @@ def test_plan_requires_object_driver_data(driver_repo: tuple[Path, Path]) -> Non
     assert caught.value.exit_code == 2
 
 
-def test_plan_binds_complete_planning_response(driver_repo: tuple[Path, Path]) -> None:
+def test_plan_binds_one_complete_proposal(driver_repo: tuple[Path, Path]) -> None:
     _, manifest_path = driver_repo
     plan = make_plan(
         manifest_path,
@@ -119,15 +121,9 @@ def test_plan_binds_complete_planning_response(driver_repo: tuple[Path, Path]) -
         as_of="2026-07-17",
     )
 
-    assert plan["planning_response"]["artifacts"] == [
-        {"kind": "capture", "id": "abc"}
-    ]
-    assert plan["planning_response"]["proofs"] == [
-        {"kind": "schema", "passed": True}
-    ]
-    assert plan["planning_response"]["diagnostics"] == [
-        {"level": "warning", "message": "review me"}
-    ]
+    assert plan["proposal"]["artifacts"] == [{"kind": "capture", "id": "abc"}]
+    assert plan["proposal"]["proofs"] == [{"kind": "schema", "passed": True}]
+    assert plan["proposal"]["diagnostics"] == [{"level": "warning", "message": "review me"}]
 
 
 def test_plan_binds_allowlisted_environment_without_storing_cleartext(
@@ -280,7 +276,9 @@ def test_human_gate_requires_approval(driver_repo: tuple[Path, Path]) -> None:
 def test_execute_and_verify_immutable_run(driver_repo: tuple[Path, Path]) -> None:
     repo, manifest_path = driver_repo
     plan = make_plan(manifest_path, "corpus.apply", {"value": "x"}, as_of="2026-07-17")
-    approval = create_approval(plan, reviewer="operator@example.test", approved_at="2026-07-17T01:00:00Z")
+    approval = create_approval(
+        plan, reviewer="operator@example.test", approved_at="2026-07-17T01:00:00Z"
+    )
 
     result = execute_plan(manifest_path, plan, approval=approval)
 
@@ -294,8 +292,29 @@ def test_execute_and_verify_immutable_run(driver_repo: tuple[Path, Path]) -> Non
         execute_plan(manifest_path, plan, approval=approval)
 
 
-def test_execute_default_run_root_need_not_be_git_ignored(
+def test_execute_fails_when_driver_omits_an_expected_write(
     driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {"expected_writes": ["output/result.json"], "skip_write": True},
+        as_of="2026-07-17",
+    )
+
+    with pytest.raises(HoundError, match="did not produce its approved writes"):
+        execute_plan(manifest_path, plan)
+
+    run_dir = repo / ".hound" / "runs" / plan["plan_id"]
+    result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["outcome"] == "failed"
+    assert result["changed_paths"] == []
+    assert verify_run(run_dir)["valid"] is True
+
+
+def test_execute_default_run_root_need_not_be_git_ignored(
+    driver_repo: tuple[Path, Path], tmp_path: Path
 ) -> None:
     repo, manifest_path = driver_repo
     (repo / ".gitignore").unlink()
@@ -305,13 +324,16 @@ def test_execute_default_run_root_need_not_be_git_ignored(
         cwd=repo,
         check=True,
     )
-    assert subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout == ""
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
     plan = make_plan(
         manifest_path,
         "edition.build",
@@ -324,6 +346,13 @@ def test_execute_default_run_root_need_not_be_git_ignored(
     assert result["outcome"] == "completed"
     assert Path(result["run_dir"]) == repo / ".hound" / "runs" / plan["plan_id"]
     assert verify_run(result["run_dir"])["valid"] is True
+    stored = json.loads((Path(result["run_dir"]) / "result.json").read_text())
+    assert stored["schema_version"] == "hound.run.result.v2"
+    assert "run_dir" not in stored
+    copied = tmp_path / "copied" / plan["plan_id"]
+    copied.parent.mkdir()
+    shutil.copytree(result["run_dir"], copied)
+    assert verify_run(copied)["valid"] is True
 
 
 def test_post_driver_snapshot_failure_is_finalized(
@@ -353,7 +382,7 @@ def test_post_driver_snapshot_failure_is_finalized(
 
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     index = json.loads((run_dir / "index.json").read_text(encoding="utf-8"))
-    assert result["schema_version"] == "hound.run.result.v1"
+    assert result["schema_version"] == "hound.run.result.v2"
     assert result["outcome"] == "failed"
     assert result["changed_paths"] == []
     assert index["schema_version"] == "hound.run.index.v1"
@@ -377,9 +406,7 @@ def test_pre_driver_snapshot_failure_after_reservation_is_finalized(
 
     def fail_reserved_snapshot(repo_path):
         if (run_dir / "result.json").exists():
-            raise orchestrator.RuntimeErrorHound(
-                "synthetic pre-driver snapshot failure"
-            )
+            raise orchestrator.RuntimeErrorHound("synthetic pre-driver snapshot failure")
         return real_snapshot(repo_path)
 
     monkeypatch.setattr(orchestrator, "snapshot_repo", fail_reserved_snapshot)
@@ -389,7 +416,7 @@ def test_pre_driver_snapshot_failure_after_reservation_is_finalized(
 
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     index = json.loads((run_dir / "index.json").read_text(encoding="utf-8"))
-    assert result["schema_version"] == "hound.run.result.v1"
+    assert result["schema_version"] == "hound.run.result.v2"
     assert result["outcome"] == "failed"
     assert result["changed_paths"] == []
     assert index["schema_version"] == "hound.run.index.v1"
@@ -491,7 +518,7 @@ def test_kernel_drift_invalidates_plan(
     monkeypatch.setattr(
         orchestrator,
         "_kernel_identity",
-        lambda: {"version": "0.2.3", "sha256": "0" * 64},
+        lambda: {"version": "0.3.0", "sha256": "0" * 64},
     )
 
     with pytest.raises(HoundError, match="kernel"):
@@ -769,7 +796,9 @@ def test_run_verification_rejects_rehashed_manifest_tampering(
     manifest_record.write_text(json.dumps(manifest), encoding="utf-8")
     index_path = run_dir / "index.json"
     index = json.loads(index_path.read_text())
-    index["files"]["driver-manifest.json"] = hashlib.sha256(manifest_record.read_bytes()).hexdigest()
+    index["files"]["driver-manifest.json"] = hashlib.sha256(
+        manifest_record.read_bytes()
+    ).hexdigest()
     index_path.write_text(json.dumps(index), encoding="utf-8")
 
     verification = verify_run(run_dir)
@@ -789,6 +818,28 @@ def test_run_verification_rejects_rehashed_forged_result(
         json.dumps({"plan_id": plan["plan_id"], "forged": "anything"}),
         encoding="utf-8",
     )
+    index_path = run_dir / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["files"]["result.json"] = hashlib.sha256(result_record.read_bytes()).hexdigest()
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    verification = verify_run(run_dir)
+
+    assert verification["valid"] is False
+    assert "result.json" in verification["failures"]
+
+
+def test_run_verification_rejects_rehashed_missing_planned_write(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    _, manifest_path = driver_repo
+    plan = make_plan(manifest_path, "edition.build", {"value": "x"}, as_of="2026-07-17")
+    executed = execute_plan(manifest_path, plan)
+    run_dir = Path(executed["run_dir"])
+    result_record = run_dir / "result.json"
+    result = json.loads(result_record.read_text(encoding="utf-8"))
+    result["changed_paths"] = []
+    result_record.write_text(json.dumps(result), encoding="utf-8")
     index_path = run_dir / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
     index["files"]["result.json"] = hashlib.sha256(result_record.read_bytes()).hexdigest()

@@ -44,7 +44,7 @@ elif mode == "plan":
     artifacts = payload.get("plan_artifacts", [])
     proofs = payload.get("plan_proofs", [])
     diagnostics = payload.get("plan_diagnostics", [])
-    outcome = "planned"
+    outcome = "planned" if ok else "failed"
 elif mode == "execute":
     if payload.get("tamper_run_record"):
         record = Path(".hound") / "runs" / request["plan_id"] / "plan.json"
@@ -56,12 +56,14 @@ elif mode == "execute":
     if payload.get("no_edition"):
         data = {"reason": "threshold-not-met"}
         outcome = "no-edition"
+    elif payload.get("skip_write"):
+        data = {"written": []}
+        outcome = payload.get("execute_outcome", "completed")
     else:
         target = Path(payload.get("write_path", "output/result.json"))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
-            json.dumps({"value": request["driver_plan"]["value"]}, sort_keys=True)
-            + "\n",
+            json.dumps({"value": request["driver_plan"]["value"]}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         data = {"written": [target.as_posix()]}
@@ -70,22 +72,28 @@ else:
     if payload.get("read_write_path"):
         read_target = Path(payload["read_write_path"])
         read_target.write_text("read side effect\n", encoding="utf-8")
-    if operation == "source.discover" and "requests" in payload:
+    if operation == "source.discover" and "searches" in payload:
         data = {
-            "schema_version": "hound.source.discovery-spec.v1",
-            "requests": payload["requests"],
+            "schema_version": "hound.source.discovery-spec.v2",
+            "searches": payload["searches"],
             "limits": payload.get(
                 "limits",
                 {"max_requests": 4, "max_leads": 20, "max_bytes": 1_000_000},
             ),
         }
-        data_schema = "hound.source.discovery-spec.v1"
-    elif operation == "source.capture" and "captures" in payload:
+        data_schema = "hound.source.discovery-spec.v2"
+    elif operation == "source.capture" and "captures" in payload.get("owner_input", {}):
         data = {
-            "schema_version": "hound.source.capture-spec.v1",
-            "captures": payload["captures"],
+            "schema_version": "hound.source.capture-spec.v2",
+            "captures": payload["owner_input"]["captures"],
         }
-        data_schema = "hound.source.capture-spec.v1"
+        data_schema = "hound.source.capture-spec.v2"
+    elif operation == "source.inspect" and "capture_set" in payload:
+        data = payload["capture_set"]
+        data_schema = "hound.source.capture-set.v2"
+    elif operation in {"web.search", "web.extract", "web.interact"}:
+        data = json.loads(Path("fake-web-response.json").read_text(encoding="utf-8"))
+        data_schema = "hound.web.adapter.v1"
     else:
         data = {"operation": operation, "echo": payload}
         data_schema = "fake.data.v1"

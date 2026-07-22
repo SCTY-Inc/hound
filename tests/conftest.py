@@ -32,19 +32,25 @@ def driver_repo(tmp_path: Path, fake_driver_path: Path) -> tuple[Path, Path]:
         "owner": {"repo": "."},
         "exec": [sys.executable, str(fake_driver_path)],
         "capabilities": {
-            operation: {
-                "effect": "read",
-                "gate": "none",
-                "composition": "hound.source.v1",
-            }
+            operation: {"effect": "read", "gate": "none"}
             for operation in ("source.discover", "source.capture", "source.inspect")
-        } | {
+        }
+        | {
+            "web.search": {"effect": "read", "gate": "none"},
+            "web.extract": {"effect": "read", "gate": "none"},
+            "web.interact": {"effect": "read", "gate": "none"},
             "corpus.status": {"effect": "read", "gate": "none"},
             "corpus.apply": {"effect": "write", "gate": "human"},
             "edition.build": {"effect": "write", "gate": "none"},
         },
+        "source": {
+            "schema_version": "hound.source.v2",
+            "adapters": {
+                "search": "hound-driver.json",
+                "extract": "hound-driver.json",
+            },
+        },
         "run_root": ".hound/runs",
-        "capture_root": ".hound/captures",
         "write_scopes": ["output"],
         "timeouts_seconds": {"default": 10},
         "env_allowlist": [],

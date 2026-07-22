@@ -42,7 +42,6 @@ def response(**overrides):
 def test_validate_manifest_accepts_complete_manifest():
     value = manifest(
         run_root=".hound/runs",
-        capture_root=".hound/captures",
         write_scopes=[".hound", "exports/report.json"],
         ignored_snapshot_excludes=["node_modules", "apps/web-pulse/.wrangler"],
         timeouts_seconds={"diagnose": 30, "publish": 120.5},
@@ -54,26 +53,31 @@ def test_validate_manifest_accepts_complete_manifest():
 
 
 def test_validate_manifest_accepts_complete_source_composition():
-    value = manifest(capabilities={
-        operation: {
-            "effect": "read",
-            "gate": "none",
-            "composition": "hound.source.v1",
-        }
-        for operation in ("source.discover", "source.capture", "source.inspect")
-    })
+    value = manifest(
+        capabilities={
+            operation: {"effect": "read", "gate": "none"}
+            for operation in ("source.discover", "source.capture", "source.inspect")
+        },
+        source={
+            "schema_version": "hound.source.v2",
+            "adapters": {
+                "search": "../adapters/search.json",
+                "extract": "../adapters/extract.json",
+            },
+        },
+    )
 
     assert validate_manifest(value) == value
 
 
 def test_validate_manifest_rejects_partial_source_composition():
-    value = manifest(capabilities={
-        "source.discover": {
-            "effect": "read",
-            "gate": "none",
-            "composition": "hound.source.v1",
-        }
-    })
+    value = manifest(
+        capabilities={"source.discover": {"effect": "read", "gate": "none"}},
+        source={
+            "schema_version": "hound.source.v2",
+            "adapters": {"search": "../adapters/search.json"},
+        },
+    )
 
     with pytest.raises(ContractError, match="requires discover, capture, and inspect"):
         validate_manifest(value)
@@ -146,7 +150,6 @@ def test_validate_manifest_accepts_relative_owner_repo_locator(locator):
         ("ignored_snapshot_excludes", ["cache", "cache"]),
         ("ignored_snapshot_excludes", ["."]),
         ("run_root", "../runs"),
-        ("capture_root", "/tmp/captures"),
         ("timeouts_seconds", {"diagnose": 0}),
         ("timeouts_seconds", {"diagnose": True}),
         ("timeouts_seconds", {"diagnose": float("inf")}),
@@ -202,9 +205,7 @@ def test_load_manifest_reads_and_validates_json(tmp_path):
     assert load_manifest(path) == value
 
 
-@pytest.mark.parametrize(
-    "contents", ["not json", "[]", '{"schema_version": "hound.driver.v1"}']
-)
+@pytest.mark.parametrize("contents", ["not json", "[]", '{"schema_version": "hound.driver.v1"}'])
 def test_load_manifest_wraps_invalid_files_as_contract_errors(tmp_path, contents):
     path = tmp_path / "driver.json"
     path.write_text(contents, encoding="utf-8")
@@ -224,6 +225,7 @@ def test_load_manifest_wraps_read_errors_as_contract_errors(tmp_path):
 )
 def test_validate_response_accepts_every_outcome(outcome):
     value = response(
+        ok=outcome not in {"held", "failed"},
         outcome=outcome,
         data_schema="hound.plan.v1",
         data={"items": []},
@@ -244,6 +246,8 @@ def test_validate_response_accepts_every_outcome(outcome):
         response(ok=1),
         response(outcome="success"),
         response(outcome=[]),
+        response(ok=True, outcome="failed"),
+        response(ok=False, outcome="completed"),
         response(extra=True),
         response(data_schema=""),
         response(artifacts={}),

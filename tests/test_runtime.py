@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ from hound_cli.runtime import (
     paths_within_scopes,
     repo_fingerprint,
     run_driver,
+    run_driver_with_receipt,
     snapshot_repo,
     write_json_atomic,
     write_json_create_only,
@@ -69,6 +71,81 @@ def _driver(repo: Path, body: str) -> Path:
     path = repo / "driver.py"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def test_run_driver_rejects_credentials_hidden_in_decoded_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    secret = "secret-inside-provider-body"
+    raw = json.dumps({"token": secret}, separators=(",", ":")).encode()
+    response = {
+        **VALID_RESPONSE,
+        "data": {"raw": {"body_base64": base64.b64encode(raw).decode("ascii")}},
+    }
+    driver = _driver(repo, f"print({json.dumps(json.dumps(response))})\n")
+    manifest, manifest_path = _manifest(
+        repo,
+        [sys.executable, str(driver)],
+        env_allowlist=["HOUND_API_KEY"],
+    )
+    monkeypatch.setenv("HOUND_API_KEY", secret)
+
+    with pytest.raises(RuntimeErrorHound, match="credential"):
+        run_driver_with_receipt(
+            manifest,
+            {},
+            manifest_path=manifest_path,
+            decoded_outputs=lambda value: [
+                base64.b64decode(value["data"]["raw"]["body_base64"], validate=True)
+            ],
+        )
+
+
+def test_public_endpoint_environment_cannot_hide_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    driver = _driver(repo, f"print({json.dumps(json.dumps(VALID_RESPONSE))})\n")
+    manifest, manifest_path = _manifest(
+        repo,
+        [sys.executable, str(driver)],
+        env_allowlist=["SERVICE_ENDPOINT"],
+    )
+    monkeypatch.setenv("SERVICE_ENDPOINT", "https://user:secret@example.test")
+
+    with pytest.raises(RuntimeErrorHound, match="without credentials"):
+        run_driver(manifest, {}, manifest_path=manifest_path)
+
+
+def test_run_driver_receipt_binds_the_executed_manifest_repo_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    driver = _driver(repo, f"print({json.dumps(json.dumps(VALID_RESPONSE))})\n")
+    manifest, manifest_path = _manifest(
+        repo,
+        [sys.executable, str(driver)],
+        env_allowlist=["HOUND_CONFIG"],
+    )
+    monkeypatch.setenv("HOUND_CONFIG", "configuration")
+
+    response, receipt = run_driver_with_receipt(
+        manifest,
+        {},
+        manifest_path=manifest_path,
+    )
+
+    assert response == VALID_RESPONSE
+    assert receipt["schema_version"] == "hound.invocation.receipt.v1"
+    assert receipt["manifest"] == manifest
+    assert receipt["manifest_sha256"]
+    fingerprint = repo_fingerprint(repo)
+    assert receipt["repository"] == {
+        "head": fingerprint["head"],
+        "fingerprint_sha256": fingerprint["fingerprint_sha256"],
+    }
+    assert receipt["environment_sha256"]
 
 
 def test_run_driver_uses_argv_and_treats_shell_metacharacters_literally(
@@ -239,14 +316,15 @@ def test_run_driver_can_use_a_frozen_allowlisted_environment(
     )
     monkeypatch.setenv("HOUND_ACCOUNT", "approved-account")
     approved_environment = runtime.capture_driver_environment(manifest)
-    approved_fingerprint = runtime.driver_environment_fingerprint(
-        manifest, approved_environment
-    )
+    approved_fingerprint = runtime.driver_environment_fingerprint(manifest, approved_environment)
     monkeypatch.setenv("HOUND_ACCOUNT", "different-account")
 
-    assert runtime.driver_environment_fingerprint(
-        manifest, runtime.capture_driver_environment(manifest)
-    ) != approved_fingerprint
+    assert (
+        runtime.driver_environment_fingerprint(
+            manifest, runtime.capture_driver_environment(manifest)
+        )
+        != approved_fingerprint
+    )
     assert (
         run_driver(
             manifest,
@@ -351,6 +429,27 @@ print(json.dumps({
     assert secret not in str(caught.value)
 
 
+def test_run_driver_allows_public_allowlisted_configuration_in_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    public_url = "https://media.example.test"
+    monkeypatch.setenv("CLOUDFLARE_R2_PUBLIC_URL", public_url)
+    driver = _driver(
+        repo,
+        f"print({json.dumps(json.dumps({**VALID_RESPONSE, 'data': {'url': public_url}}))})\n",
+    )
+    manifest, manifest_path = _manifest(
+        repo,
+        [sys.executable, str(driver)],
+        env_allowlist=["CLOUDFLARE_R2_PUBLIC_URL"],
+    )
+
+    response = run_driver(manifest, {}, manifest_path=manifest_path)
+
+    assert response["data"]["url"] == public_url
+
+
 def test_run_driver_fails_closed_on_nonzero_and_reports_stderr(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     driver = _driver(
@@ -386,9 +485,7 @@ def test_run_driver_uses_manifest_timeout_when_no_override(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("timeout", [float("inf"), float("nan")])
-def test_run_driver_rejects_nonfinite_explicit_timeout(
-    tmp_path: Path, timeout: float
-) -> None:
+def test_run_driver_rejects_nonfinite_explicit_timeout(tmp_path: Path, timeout: float) -> None:
     repo = _repo(tmp_path)
     driver = _driver(
         repo,
@@ -544,9 +641,7 @@ def test_supervisor_terminates_driver_tree_if_hound_parent_dies(tmp_path: Path) 
     assert not marker.exists()
 
 
-def test_driver_output_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_driver_output_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import hound_cli.runtime as runtime
 
     repo = _repo(tmp_path)
@@ -660,9 +755,7 @@ def test_snapshot_observes_reflog_mutation(tmp_path: Path) -> None:
     with (repo / ".git" / "logs" / "HEAD").open("a", encoding="utf-8") as log:
         log.write("# unexpected mutation\n")
 
-    assert changed_paths(before, snapshot_repo(repo)) == [
-        ".git/hound-refs-state"
-    ]
+    assert changed_paths(before, snapshot_repo(repo)) == [".git/hound-refs-state"]
 
 
 def test_repo_fingerprint_binds_effective_git_config_and_hooks(tmp_path: Path) -> None:
@@ -731,9 +824,7 @@ def test_git_command_has_a_wall_clock_timeout(
         runtime._git(tmp_path, "status")
 
 
-def test_git_command_output_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_git_command_output_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import hound_cli.runtime as runtime
 
     fake_git = tmp_path / "fake-git"

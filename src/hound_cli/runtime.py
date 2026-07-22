@@ -14,11 +14,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
+from hound_cli import __version__
 from hound_cli.contracts import (
     ContractError,
     canonical_hash,
@@ -26,7 +28,7 @@ from hound_cli.contracts import (
     load_manifest,
     validate_response,
 )
-from hound_cli.safety import contains_credential, credential_forms
+from hound_cli.safety import contains_credential, credential_forms, normalized_key, secret_key
 
 try:
     import fcntl
@@ -45,6 +47,21 @@ MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 GIT_COMMAND_TIMEOUT_SECONDS = 30.0
 
 
+def kernel_identity() -> dict[str, Any]:
+    source_root = Path(__file__).parent
+    digest = hashlib.sha256()
+    for source in sorted(source_root.glob("*.py")):
+        digest.update(source.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+    return {
+        "version": __version__,
+        "sha256": digest.hexdigest(),
+        "dependencies": {},
+    }
+
+
 @contextmanager
 def repo_execution_lock(repo: str | Path, *, timeout: float = 30) -> Iterator[None]:
     """Serialize Hound write executions for one owner Git repository."""
@@ -52,9 +69,7 @@ def repo_execution_lock(repo: str | Path, *, timeout: float = 30) -> Iterator[No
     if fcntl is None:
         raise RuntimeErrorHound("repository execution locking is unavailable")
     root = _git_root(repo)
-    git_dir = Path(
-        _git(root, "rev-parse", "--absolute-git-dir").decode("utf-8").strip()
-    ).resolve()
+    git_dir = Path(_git(root, "rev-parse", "--absolute-git-dir").decode("utf-8").strip()).resolve()
     lock_path = git_dir / "hound-execute.lock"
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -80,14 +95,15 @@ def repo_execution_lock(repo: str | Path, *, timeout: float = 30) -> Iterator[No
             os.close(descriptor)
 
 
-def run_driver(
+def run_driver_with_receipt(
     manifest: Mapping[str, Any],
     request: Any,
     *,
     manifest_path: str | Path,
     timeout: float | None = None,
     driver_environment: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
+    decoded_outputs: Callable[[dict[str, Any]], Iterable[object]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest_file = Path(manifest_path).resolve()
     try:
         persisted = load_manifest(manifest_file)
@@ -117,14 +133,26 @@ def run_driver(
     selected_environment = (
         capture_driver_environment(persisted, operation=operation)
         if driver_environment is None
-        else _validate_driver_environment(
-            persisted, driver_environment, operation=operation
-        )
+        else _validate_driver_environment(persisted, driver_environment, operation=operation)
     )
     environment = {"PATH": os.defpath, **selected_environment}
     credential_forms = _credential_forms(
         _driver_environment_names(persisted, operation), selected_environment
     )
+    fingerprint = repo_fingerprint(repo)
+    receipt = {
+        "schema_version": "hound.invocation.receipt.v1",
+        "manifest": persisted,
+        "manifest_sha256": canonical_hash(persisted),
+        "repository": {
+            "head": fingerprint["head"],
+            "fingerprint_sha256": fingerprint["fingerprint_sha256"],
+        },
+        "environment_sha256": driver_environment_fingerprint(
+            persisted, selected_environment, operation=operation
+        ),
+        "kernel": kernel_identity(),
+    }
 
     failure: str | None = None
     try:
@@ -184,9 +212,7 @@ def run_driver(
         raise RuntimeErrorHound(f"driver timed out{suffix}")
     if returncode != 0:
         suffix = f"; stderr: {diagnostic}" if diagnostic else ""
-        raise RuntimeErrorHound(
-            f"driver exited with status {returncode}{suffix}"
-        )
+        raise RuntimeErrorHound(f"driver exited with status {returncode}{suffix}")
 
     try:
         response = json.loads(stdout)
@@ -196,10 +222,33 @@ def run_driver(
             f"driver stdout must contain exactly one JSON value{suffix}"
         ) from error
     try:
-        return validate_response(response)
+        validated = validate_response(response)
     except ContractError as error:
         suffix = f"; stderr: {diagnostic}" if diagnostic else ""
         raise RuntimeErrorHound(f"invalid driver response: {error}{suffix}") from error
+    if decoded_outputs is not None and any(
+        contains_credential(item, credential_forms) for item in decoded_outputs(validated)
+    ):
+        raise RuntimeErrorHound("driver output contained allowlisted credential material")
+    return validated, receipt
+
+
+def run_driver(
+    manifest: Mapping[str, Any],
+    request: Any,
+    *,
+    manifest_path: str | Path,
+    timeout: float | None = None,
+    driver_environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    response, _ = run_driver_with_receipt(
+        manifest,
+        request,
+        manifest_path=manifest_path,
+        timeout=timeout,
+        driver_environment=driver_environment,
+    )
+    return response
 
 
 def repo_fingerprint(repo: str | Path) -> dict[str, Any]:
@@ -215,7 +264,11 @@ def repo_fingerprint(repo: str | Path) -> dict[str, Any]:
         for path in _listed_paths(root, "--others", "--exclude-standard")
     }
     tracked = {
-        path: _path_hash(root / path) if (root / path).exists() or (root / path).is_symlink() else "missing"
+        path: (
+            _path_hash(root / path)
+            if (root / path).exists() or (root / path).is_symlink()
+            else "missing"
+        )
         for path in _listed_paths(root, "--cached")
     }
     value = {
@@ -263,9 +316,7 @@ def driver_environment_fingerprint(
 ) -> str:
     """Bind exported values without placing their cleartext in a plan."""
 
-    selected = _validate_driver_environment(
-        manifest, environment, operation=operation
-    )
+    selected = _validate_driver_environment(manifest, environment, operation=operation)
     names = _driver_environment_names(manifest, operation)
     state = {
         "system_path_sha256": hashlib.sha256(os.fsencode(os.defpath)).hexdigest(),
@@ -295,18 +346,36 @@ def _validate_driver_environment(
         raise RuntimeErrorHound("driver environment must be a mapping")
     allowed = set(_driver_environment_names(manifest, operation))
     if any(
-        not isinstance(name, str)
-        or name not in allowed
-        or not isinstance(value, str)
+        not isinstance(name, str) or name not in allowed or not isinstance(value, str)
         for name, value in environment.items()
     ):
         raise RuntimeErrorHound("driver environment does not match its allowlist")
+    for name, value in environment.items():
+        if not normalized_key(name).endswith("_endpoint"):
+            continue
+        try:
+            parsed = urlsplit(value)
+            parsed.port
+        except ValueError as error:
+            raise RuntimeErrorHound(
+                f"driver environment {name} is not a public endpoint"
+            ) from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeErrorHound(
+                f"driver environment {name} must be an HTTP endpoint without credentials"
+            )
     return dict(environment)
 
 
-def _driver_environment_names(
-    manifest: Mapping[str, Any], operation: str | None
-) -> list[str]:
+def _driver_environment_names(manifest: Mapping[str, Any], operation: str | None) -> list[str]:
     names = set(manifest.get("env_allowlist", []))
     if operation is not None:
         capability = manifest.get("capabilities", {}).get(operation, {})
@@ -322,15 +391,10 @@ def snapshot_repo(
     root = _git_root(repo)
     snapshot: dict[str, str] = {}
     paths = set(_listed_paths(root, "--cached", "--others", "--exclude-standard"))
-    excluded = tuple(
-        PurePosixPath(value.replace("\\", "/"))
-        for value in ignored_snapshot_excludes
-    )
+    excluded = tuple(PurePosixPath(value.replace("\\", "/")) for value in ignored_snapshot_excludes)
     paths.update(
         relative
-        for relative in _listed_paths(
-            root, "--others", "--ignored", "--exclude-standard"
-        )
+        for relative in _listed_paths(root, "--others", "--ignored", "--exclude-standard")
         if not _path_is_within_any(PurePosixPath(relative), excluded)
     )
     for relative in sorted(paths):
@@ -344,19 +408,13 @@ def snapshot_repo(
     return snapshot
 
 
-def _path_is_within_any(
-    path: PurePosixPath, prefixes: Iterable[PurePosixPath]
-) -> bool:
+def _path_is_within_any(path: PurePosixPath, prefixes: Iterable[PurePosixPath]) -> bool:
     return any(path == prefix or prefix in path.parents for prefix in prefixes)
 
 
-def changed_paths(
-    before: Mapping[str, str], after: Mapping[str, str]
-) -> list[str]:
+def changed_paths(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
     return sorted(
-        path
-        for path in before.keys() | after.keys()
-        if before.get(path) != after.get(path)
+        path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
     )
 
 
@@ -367,8 +425,7 @@ def paths_within_scopes(
     resolved_scopes = [
         resolved
         for scope in scopes
-        if (resolved := _safe_repo_path(root, scope)) is not None
-        and resolved.is_relative_to(root)
+        if (resolved := _safe_repo_path(root, scope)) is not None and resolved.is_relative_to(root)
     ]
     violations: list[str] = []
     for relative in sorted(set(changed)):
@@ -377,8 +434,7 @@ def paths_within_scopes(
             resolved is None
             or not resolved.is_relative_to(root)
             or not any(
-                resolved == scope or resolved.is_relative_to(scope)
-                for scope in resolved_scopes
+                resolved == scope or resolved.is_relative_to(scope) for scope in resolved_scopes
             )
         ):
             violations.append(relative)
@@ -403,6 +459,20 @@ def write_bytes_create_only(path: str | Path, payload: bytes) -> None:
         raise RuntimeErrorHound(f"cannot create {destination}: {error}") from error
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_bytes_create_or_confirm(path: str | Path, payload: bytes) -> None:
+    """Create bytes once or confirm an identical non-symlink already exists."""
+
+    destination = Path(path)
+    try:
+        write_bytes_create_only(destination, payload)
+    except FileExistsError:
+        try:
+            if destination.is_symlink() or destination.read_bytes() != payload:
+                raise RuntimeErrorHound(f"existing immutable file differs: {destination}")
+        except OSError as error:
+            raise RuntimeErrorHound(f"cannot verify {destination}: {error}") from error
 
 
 def write_json_create_only(path: str | Path, obj: Any) -> None:
@@ -441,18 +511,12 @@ def _git_root(repo: str | Path) -> Path:
 def _git(repo: Path, *arguments: str) -> bytes:
     returncode, stdout, stderr = _run_git(repo, *arguments)
     if returncode:
-        raise RuntimeErrorHound(
-            f"git {' '.join(arguments)} failed: {_diagnostic(stderr)}"
-        )
+        raise RuntimeErrorHound(f"git {' '.join(arguments)} failed: {_diagnostic(stderr)}")
     return stdout
 
 
 def _git_index_state(repo: Path) -> str:
-    state = (
-        _git(repo, "ls-files", "--stage", "-z")
-        + b"\0"
-        + _git(repo, "ls-files", "-v", "-z")
-    )
+    state = _git(repo, "ls-files", "--stage", "-z") + b"\0" + _git(repo, "ls-files", "-v", "-z")
     return hashlib.sha256(state).hexdigest()
 
 
@@ -520,9 +584,7 @@ def _git_sensitive_state(repo: Path) -> str:
     config = _git_path(repo, "config")
     worktree_config = _git_path(repo, "config.worktree")
     exclude = _git_path(repo, "info/exclude")
-    returncode, hooks_output, _ = _run_git(
-        repo, "config", "--path", "--get", "core.hooksPath"
-    )
+    returncode, hooks_output, _ = _run_git(repo, "config", "--path", "--get", "core.hooksPath")
     if returncode == 0:
         try:
             hooks_text = hooks_output.decode("utf-8").strip()
@@ -568,9 +630,7 @@ def _path_tree_hash(path: Path, *, excluded: Iterable[str] = ()) -> str:
     if not path.is_dir():
         raise RuntimeErrorHound(f"cannot hash non-file metadata path {path}")
     excluded_paths = tuple(PurePosixPath(value) for value in excluded)
-    entries: dict[str, str] = {
-        ".": f"directory:{stat.S_IMODE(path.lstat().st_mode):o}"
-    }
+    entries: dict[str, str] = {".": f"directory:{stat.S_IMODE(path.lstat().st_mode):o}"}
     pending = [path]
     try:
         while pending:
@@ -581,9 +641,7 @@ def _path_tree_hash(path: Path, *, excluded: Iterable[str] = ()) -> str:
                     continue
                 child_state = child.lstat()
                 if stat.S_ISDIR(child_state.st_mode):
-                    entries[relative] = (
-                        f"directory:{stat.S_IMODE(child_state.st_mode):o}"
-                    )
+                    entries[relative] = f"directory:{stat.S_IMODE(child_state.st_mode):o}"
                     pending.append(child)
                 elif stat.S_ISREG(child_state.st_mode) or stat.S_ISLNK(child_state.st_mode):
                     entries[relative] = _path_hash(child)
@@ -663,13 +721,9 @@ def _path_hash(path: Path) -> str:
             try:
                 opened_state = os.fstat(descriptor)
                 if not stat.S_ISREG(opened_state.st_mode):
-                    raise RuntimeErrorHound(
-                        f"cannot hash non-file repository path {path}"
-                    )
+                    raise RuntimeErrorHound(f"cannot hash non-file repository path {path}")
                 digest = hashlib.sha256()
-                digest.update(
-                    f"file\0{stat.S_IMODE(opened_state.st_mode):o}\0".encode()
-                )
+                digest.update(f"file\0{stat.S_IMODE(opened_state.st_mode):o}\0".encode())
                 while chunk := os.read(descriptor, 1024 * 1024):
                     digest.update(chunk)
                 return digest.hexdigest()
@@ -831,13 +885,23 @@ def _diagnostic(value: str | bytes | None) -> str:
     return value if len(value) <= 4096 else value[:4093] + "..."
 
 
-def _credential_forms(
-    names: Iterable[str], environment: Mapping[str, str]
-) -> tuple[str, ...]:
+def _credential_forms(names: Iterable[str], environment: Mapping[str, str]) -> tuple[str, ...]:
     forms: set[str] = set()
     for name in names:
+        normalized = normalized_key(name)
         value = environment.get(name, "")
         if not value:
+            continue
+        parsed = urlsplit(value)
+        if not (
+            secret_key(name)
+            or normalized == "key"
+            or normalized.endswith("_key")
+            or normalized == "database_url"
+            or normalized.endswith("_database_url")
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             continue
         forms.update(credential_forms(value))
     return tuple(item for item in forms if item)

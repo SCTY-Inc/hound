@@ -1,0 +1,27 @@
+{
+  "schema_version": "hound.driver.v1",
+  "id": "camofox",
+  "protocol": "hound.protocol.v1",
+  "owner": {
+    "repo": "../.."
+  },
+  "exec": [
+    "python3",
+    "-B",
+    "bin/hound-web-adapter",
+    "camofox"
+  ],
+  "capabilities": {
+    "web.interact": {
+      "effect": "read",
+      "gate": "none",
+      "env_allowlist": [
+        "CAMOFOX_ACCESS_KEY",
+        "CAMOFOX_ENDPOINT"
+      ]
+    }
+  },
+  "timeouts_seconds": {
+    "web.interact": 60
+  }
+}

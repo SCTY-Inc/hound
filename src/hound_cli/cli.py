@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
 from typing import Any, Sequence
 
 from . import __version__
-from .contracts import ContractError, load_manifest
+from .contracts import ContractError
 from .evidence import EvidenceError, store_capture, verify_capture
 from .orchestrator import (
     HoundError,
@@ -21,21 +20,9 @@ from .orchestrator import (
     make_plan,
     verify_run,
 )
-from .providers import (
-    ProviderError,
-    execute_request as execute_provider_request,
-    load_provider_environment,
-    validate_request as validate_provider_request,
-)
 from .runtime import RuntimeErrorHound, write_json_create_only
 from .source import capture_sources, discover_sources, inspect_sources
-
-
-OPERATIONS = {
-    "source": ("discover", "capture", "inspect"),
-    "corpus": ("status", "propose", "apply", "project"),
-    "edition": ("build", "publish", "replay"),
-}
+from .web import WebError, run_web, verify_web_run
 
 
 class _HoundArgumentParser(argparse.ArgumentParser):
@@ -58,9 +45,7 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     try:
         return _json_object(target.read_text(encoding="utf-8"), source=str(target))
     except UnicodeDecodeError as exc:
-        raise HoundError(
-            f"cannot read {target}: input is not UTF-8", exit_code=2
-        ) from exc
+        raise HoundError(f"cannot read {target}: input is not UTF-8", exit_code=2) from exc
     except OSError as exc:
         raise HoundError(f"cannot read {target}: {exc}", exit_code=2) from exc
 
@@ -78,19 +63,20 @@ def _payload(args: argparse.Namespace) -> dict[str, Any]:
 def _emit(value: dict[str, Any], *, stream: Any | None = None) -> None:
     if stream is None:
         stream = sys.stdout
-    stream.write(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+    stream.write(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+    )
 
 
-def _add_operation_parser(parent: argparse._SubParsersAction[Any], namespace: str, verb: str) -> None:
-    parser = parent.add_parser(verb, help=f"Run {namespace}.{verb}")
-    parser.set_defaults(handler=_handle_operation, operation=f"{namespace}.{verb}")
-    parser.add_argument("--driver", required=True, help="Path to hound.driver.v1 manifest")
+def _input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", help="Path to a JSON input object")
     parser.add_argument("--json", help="Inline JSON input object")
-    parser.add_argument("--as-of", help="Explicit data cutoff; required when planning writes")
-    parser.add_argument("--plan-out", help="Create the deterministic plan at this path")
-    parser.add_argument("--execute", metavar="PLAN", help="Execute an existing plan")
-    parser.add_argument("--approval", help="Approval artifact for a human-gated plan")
+
+
+def _driver_arguments(parser: argparse.ArgumentParser, *, operation: bool = True) -> None:
+    parser.add_argument("--driver", required=True, help="Path to hound.driver.v1 manifest")
+    if operation:
+        parser.add_argument("--operation", required=True, help="Declared driver capability")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Bounded research and evidence operations.",
     )
     parser.add_argument("--version", action="version", version=f"hound {__version__}")
-    top = parser.add_subparsers(dest="namespace", required=True)
+    top = parser.add_subparsers(dest="command", required=True)
 
     driver = top.add_parser("driver", help="Inspect driver contracts")
     driver_sub = driver.add_subparsers(dest="driver_command", required=True)
@@ -107,25 +93,61 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--driver", required=True)
     check.set_defaults(handler=_handle_driver_check)
 
-    for namespace, verbs in OPERATIONS.items():
-        group = top.add_parser(namespace, help=f"{namespace.title()} lifecycle operations")
-        group_sub = group.add_subparsers(dest=f"{namespace}_command", required=True)
-        for verb in verbs:
-            _add_operation_parser(group_sub, namespace, verb)
+    invoke = top.add_parser("invoke", help="Invoke one declared read capability")
+    _driver_arguments(invoke)
+    _input_arguments(invoke)
+    invoke.add_argument("--as-of", help="Optional owner data cutoff")
+    invoke.set_defaults(handler=_handle_invoke)
 
-    provider = top.add_parser("provider", help="Run credential-safe provider transport")
-    provider_sub = provider.add_subparsers(dest="provider_command", required=True)
-    provider_run = provider_sub.add_parser("run", help="Execute a versioned provider request")
-    provider_input = provider_run.add_mutually_exclusive_group(required=True)
-    provider_input.add_argument("--request", help="Path to hound.provider.request.v1 JSON")
-    provider_input.add_argument("--json", help="Inline hound.provider.request.v1 JSON")
-    provider_run.add_argument(
-        "--env-file",
-        help="Private dotenv-style file; only the selected provider credential is loaded",
-    )
-    provider_run.set_defaults(handler=_handle_provider_run)
+    plan = top.add_parser("plan", help="Create one deterministic write plan")
+    _driver_arguments(plan)
+    _input_arguments(plan)
+    plan.add_argument("--as-of", required=True, help="Explicit owner data cutoff")
+    plan.add_argument("--output", required=True, help="Create the plan at this path")
+    plan.set_defaults(handler=_handle_plan)
 
-    capture = top.add_parser("capture", help="Store and verify immutable source captures")
+    execute = top.add_parser("execute", help="Execute one unchanged plan")
+    _driver_arguments(execute, operation=False)
+    execute.add_argument("--plan", required=True)
+    execute.add_argument("--approval")
+    execute.set_defaults(handler=_handle_execute)
+
+    approve = top.add_parser("approve", help="Approve exactly one plan and write scope")
+    approve.add_argument("--plan", required=True)
+    approve.add_argument("--reviewer", required=True)
+    approve.add_argument("--approved-at")
+    approve.add_argument("--expires-at")
+    approve.add_argument("--output", required=True)
+    approve.set_defaults(handler=_handle_approve)
+
+    verify = top.add_parser("verify", help="Verify an immutable web or write record")
+    verify.add_argument("record")
+    verify.set_defaults(handler=_handle_verify)
+
+    source = top.add_parser("source", help="Compose source records from web adapters")
+    source_sub = source.add_subparsers(dest="source_command", required=True)
+    for verb in ("discover", "capture", "inspect"):
+        operation = source_sub.add_parser(verb, help=f"Run source.{verb}")
+        _driver_arguments(operation, operation=False)
+        _input_arguments(operation)
+        operation.add_argument("--as-of", help="Optional owner data cutoff")
+        operation.set_defaults(handler=_handle_source, source_verb=verb)
+
+    for verb in ("search", "extract", "interact"):
+        web = top.add_parser(verb, help=f"Run one bounded web {verb} adapter")
+        web.add_argument(
+            "--adapter", required=True, help="Path to a hound.driver.v1 adapter manifest"
+        )
+        _input_arguments(web)
+        web.add_argument("--as-of", help="Optional owner data cutoff")
+        web.add_argument(
+            "--record-root",
+            default=".hound/web",
+            help="Directory for immutable web provenance records",
+        )
+        web.set_defaults(handler=_handle_web, web_verb=verb)
+
+    capture = top.add_parser("capture", help="Store or verify immutable origin bytes")
     capture_sub = capture.add_subparsers(dest="capture_command", required=True)
     capture_store = capture_sub.add_parser("store", help="Store raw bytes by content hash")
     capture_store.add_argument("--root", required=True)
@@ -140,22 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
     capture_verify.add_argument("--root", required=True)
     capture_verify.add_argument("--capture-id", required=True)
     capture_verify.set_defaults(handler=_handle_capture_verify)
-
-    approval = top.add_parser("approval", help="Create explicit approval artifacts")
-    approval_sub = approval.add_subparsers(dest="approval_command", required=True)
-    create = approval_sub.add_parser("create", help="Approve exactly one plan and write scope")
-    create.add_argument("--plan", required=True)
-    create.add_argument("--reviewer", required=True)
-    create.add_argument("--approved-at")
-    create.add_argument("--expires-at")
-    create.add_argument("--output", required=True)
-    create.set_defaults(handler=_handle_approval_create)
-
-    run = top.add_parser("run", help="Inspect immutable run records")
-    run_sub = run.add_subparsers(dest="run_command", required=True)
-    verify = run_sub.add_parser("verify", help="Verify hashes in a run directory")
-    verify.add_argument("run_dir")
-    verify.set_defaults(handler=_handle_run_verify)
     return parser
 
 
@@ -163,53 +169,77 @@ def _handle_driver_check(args: argparse.Namespace) -> dict[str, Any]:
     return check_driver(Path(args.driver).resolve())
 
 
-def _handle_operation(args: argparse.Namespace) -> dict[str, Any]:
-    manifest_path = Path(args.driver).resolve()
-    manifest = load_manifest(manifest_path)
-    capability = manifest["capabilities"].get(args.operation)
-    if capability is None:
-        raise HoundError(f"driver does not declare {args.operation}", exit_code=2)
+def _handle_invoke(args: argparse.Namespace) -> dict[str, Any]:
+    return invoke_read(
+        Path(args.driver).resolve(),
+        args.operation,
+        _payload(args),
+        as_of=args.as_of,
+    )
 
-    if args.execute:
-        if args.input or args.json or args.plan_out or args.as_of:
-            raise HoundError("--execute cannot be combined with planning inputs", exit_code=2)
-        plan = _read_json(args.execute)
-        approval = _read_json(args.approval) if args.approval else None
-        if plan.get("operation") != args.operation:
-            raise HoundError("plan operation does not match the selected command", exit_code=2)
-        return execute_plan(manifest_path, plan, approval=approval)
 
-    if args.approval:
-        raise HoundError("--approval is only valid with --execute", exit_code=2)
-    payload = _payload(args)
-    if capability["effect"] == "read":
-        if args.plan_out:
-            raise HoundError("read operations do not create execution plans", exit_code=2)
-        if capability.get("composition") == "hound.source.v1" and args.operation == "source.discover":
-            return discover_sources(manifest_path, payload, as_of=args.as_of)
-        if capability.get("composition") == "hound.source.v1" and args.operation == "source.capture":
-            return capture_sources(manifest_path, payload, as_of=args.as_of)
-        if capability.get("composition") == "hound.source.v1" and args.operation == "source.inspect":
-            return inspect_sources(manifest_path, payload, as_of=args.as_of)
-        return invoke_read(manifest_path, args.operation, payload, as_of=args.as_of)
-    if not args.as_of:
-        raise HoundError("--as-of is required for deterministic write plans", exit_code=2)
-    plan = make_plan(manifest_path, args.operation, payload, as_of=args.as_of)
-    if args.plan_out:
-        write_json_create_only(Path(args.plan_out), plan)
+def _handle_plan(args: argparse.Namespace) -> dict[str, Any]:
+    plan = make_plan(
+        Path(args.driver).resolve(),
+        args.operation,
+        _payload(args),
+        as_of=args.as_of,
+    )
+    write_json_create_only(Path(args.output), plan)
     return plan
 
 
-def _handle_provider_run(args: argparse.Namespace) -> dict[str, Any]:
-    request = _read_json(args.request) if args.request else _json_object(args.json, source="--json")
-    try:
-        validated = validate_provider_request(request)
-    except ProviderError as exc:
-        raise HoundError(str(exc), exit_code=2) from exc
-    if args.env_file:
-        environment = load_provider_environment(args.env_file, validated["provider"])
-        return execute_provider_request(validated, env=environment)
-    return execute_provider_request(validated)
+def _handle_execute(args: argparse.Namespace) -> dict[str, Any]:
+    plan = _read_json(args.plan)
+    approval = _read_json(args.approval) if args.approval else None
+    return execute_plan(Path(args.driver).resolve(), plan, approval=approval)
+
+
+def _handle_approve(args: argparse.Namespace) -> dict[str, Any]:
+    approval = create_approval(
+        _read_json(args.plan),
+        reviewer=args.reviewer,
+        approved_at=args.approved_at,
+        expires_at=args.expires_at,
+    )
+    write_json_create_only(Path(args.output), approval)
+    return approval
+
+
+def _handle_verify(args: argparse.Namespace) -> dict[str, Any]:
+    record = Path(args.record)
+    index = _read_json(record / "index.json")
+    result = (
+        verify_web_run(record)
+        if index.get("schema_version") == "hound.web.run.index.v1"
+        else verify_run(record)
+    )
+    if not result["valid"]:
+        raise HoundError("record verification failed")
+    return result
+
+
+def _handle_source(args: argparse.Namespace) -> dict[str, Any]:
+    handlers = {
+        "discover": discover_sources,
+        "capture": capture_sources,
+        "inspect": inspect_sources,
+    }
+    return handlers[args.source_verb](
+        Path(args.driver).resolve(),
+        _payload(args),
+        as_of=args.as_of,
+    )
+
+
+def _handle_web(args: argparse.Namespace) -> dict[str, Any]:
+    return run_web(
+        Path(args.adapter).resolve(),
+        args.web_verb,
+        _payload(args),
+        record_root=Path(args.record_root).resolve(),
+        as_of=args.as_of,
+    )
 
 
 def _handle_capture_store(args: argparse.Namespace) -> dict[str, Any]:
@@ -218,9 +248,7 @@ def _handle_capture_store(args: argparse.Namespace) -> dict[str, Any]:
     except OSError as exc:
         raise HoundError(f"cannot read capture body {args.body}: {exc}", exit_code=2) from exc
     metadata = (
-        _json_object(args.metadata_json, source="--metadata-json")
-        if args.metadata_json
-        else None
+        _json_object(args.metadata_json, source="--metadata-json") if args.metadata_json else None
     )
     return store_capture(
         args.root,
@@ -241,32 +269,11 @@ def _handle_capture_verify(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _handle_approval_create(args: argparse.Namespace) -> dict[str, Any]:
-    plan = _read_json(args.plan)
-    approval = create_approval(
-        plan,
-        reviewer=args.reviewer,
-        approved_at=args.approved_at,
-        expires_at=args.expires_at,
-    )
-    write_json_create_only(Path(args.output), approval)
-    return approval
-
-
-def _handle_run_verify(args: argparse.Namespace) -> dict[str, Any]:
-    result = verify_run(args.run_dir)
-    if not result["valid"]:
-        raise HoundError("run verification failed")
-    return result
-
-
 def _exit_for_result(result: dict[str, Any]) -> int:
     outcome = result.get("outcome")
     if outcome == "held":
         return 3
-    if outcome == "failed" or result.get("ok") is False:
-        return 1
-    if result.get("valid") is False:
+    if outcome == "failed" or result.get("ok") is False or result.get("valid") is False:
         return 1
     return 0
 
@@ -281,7 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HoundError as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return exc.exit_code
-    except (ContractError, RuntimeErrorHound, ProviderError, EvidenceError) as exc:
+    except (ContractError, RuntimeErrorHound, EvidenceError, WebError) as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return 2 if isinstance(exc, ContractError) else 1
     except KeyboardInterrupt:

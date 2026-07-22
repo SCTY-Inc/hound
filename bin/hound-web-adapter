@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run a first-party adapter directly from a Hound source checkout."""
+
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from hound_web_adapters.cli import main
+
+raise SystemExit(main())

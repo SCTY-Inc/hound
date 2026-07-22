@@ -1,354 +1,270 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import sys
 
 from hound_cli import cli
 
 
-def run_cli(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    src = str(Path(__file__).parents[1] / "src")
-    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
-    return subprocess.run(
-        [sys.executable, "-m", "hound_cli.cli", *args],
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+def run_cli(*args: str):
+    from io import StringIO
+    from contextlib import redirect_stderr, redirect_stdout
+
+    stdout = StringIO()
+    stderr = StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        code = cli.main(list(args))
+    return code, stdout.getvalue(), stderr.getvalue()
 
 
-def test_installed_console_script_smoke() -> None:
-    executable = shutil.which("hound")
-    assert executable is not None
+def test_help_exposes_primitives_not_owner_domain_names(capsys) -> None:
+    try:
+        cli.main(["--help"])
+    except SystemExit as error:
+        assert error.code == 0
+    output = capsys.readouterr().out
 
-    result = subprocess.run(
-        [executable, "--version"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 0
-    assert result.stdout.strip() == "hound 0.2.3"
-
-
-def test_help_exposes_lifecycle_namespaces() -> None:
-    result = run_cli("--help")
-
-    assert result.returncode == 0
-    assert "source" in result.stdout
-    assert "corpus" in result.stdout
-    assert "edition" in result.stdout
-    assert "approval" in result.stdout
-    assert "run" in result.stdout
-    assert "provider" in result.stdout
-    assert "capture" in result.stdout
-
-
-def test_usage_errors_are_machine_readable_json() -> None:
-    result = run_cli("provider", "run")
-
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert json.loads(result.stderr) == {
-        "schema_version": "hound.error.v1",
-        "error": "one of the arguments --request --json is required",
-    }
-
-
-def test_provider_run_uses_central_transport(
-    monkeypatch, capsys,
-) -> None:
-    seen: list[dict[str, object]] = []
-
-    def fake_execute(request: object) -> dict[str, object]:
-        assert isinstance(request, dict)
-        seen.append(request)
-        return {
-            "schema_version": "hound.provider.response.v1",
-            "provider": "exa",
-            "operation": "search",
-            "request_sha256": "abc",
-            "raw_data": {"results": []},
-            "leads": [],
-        }
-
-    monkeypatch.setattr(cli, "execute_provider_request", fake_execute)
-    exit_code = cli.main(
-        [
-            "provider",
-            "run",
-            "--json",
-            '{"schema_version":"hound.provider.request.v1","provider":"exa",'
-            '"operation":"search","parameters":{"query":"caregiving","numResults":2}}',
-        ]
-    )
-
-    assert exit_code == 0
-    assert seen[0]["provider"] == "exa"
-    assert json.loads(capsys.readouterr().out)["leads"] == []
-
-
-def test_provider_run_loads_only_selected_credential_from_private_env_file(
-    tmp_path: Path, monkeypatch, capsys,
-) -> None:
-    env_file = tmp_path / "providers.env"
-    env_file.write_text(
-        "EXA_API_KEY=exa-file-secret\n"
-        "FIRECRAWL_API_KEY=firecrawl-file-secret\n"
-        "UNRELATED_SECRET=must-not-load\n",
-        encoding="utf-8",
-    )
-    env_file.chmod(0o600)
-    seen: list[dict[str, str]] = []
-
-    def fake_execute(
-        request: object, *, env: dict[str, str]
-    ) -> dict[str, object]:
-        assert isinstance(request, dict)
-        seen.append(env)
-        return {
-            "schema_version": "hound.provider.response.v1",
-            "provider": "exa",
-            "operation": "search",
-            "request_sha256": "abc",
-            "raw_data": {"results": []},
-            "leads": [],
-        }
-
-    monkeypatch.setattr(cli, "execute_provider_request", fake_execute)
-    exit_code = cli.main(
-        [
-            "provider",
-            "run",
-            "--env-file",
-            str(env_file),
-            "--json",
-            '{"schema_version":"hound.provider.request.v1","provider":"exa",'
-            '"operation":"search","parameters":{"query":"caregiving","numResults":2}}',
-        ]
-    )
-
-    output = capsys.readouterr()
-    assert exit_code == 0
-    assert seen == [{"EXA_API_KEY": "exa-file-secret"}]
-    assert "exa-file-secret" not in output.out
-    assert "firecrawl-file-secret" not in output.out
-    assert "must-not-load" not in output.out
-
-
-def test_provider_run_rejects_non_private_env_file(tmp_path: Path, capsys) -> None:
-    env_file = tmp_path / "providers.env"
-    env_file.write_text("EXA_API_KEY=must-not-leak\n", encoding="utf-8")
-    env_file.chmod(0o644)
-
-    exit_code = cli.main(
-        [
-            "provider",
-            "run",
-            "--env-file",
-            str(env_file),
-            "--json",
-            '{"schema_version":"hound.provider.request.v1","provider":"exa",'
-            '"operation":"search","parameters":{"query":"caregiving","numResults":2}}',
-        ]
-    )
-
-    output = capsys.readouterr()
-    assert exit_code == 1
-    assert output.out == ""
-    assert json.loads(output.err) == {
-        "schema_version": "hound.error.v1",
-        "error": "provider credential file must not be accessible by group or other users",
-    }
-    assert "must-not-leak" not in output.err
-
-
-def test_non_utf8_json_file_returns_structured_usage_error(tmp_path: Path) -> None:
-    request = tmp_path / "request.json"
-    request.write_bytes(b"\xff\xfe")
-
-    result = run_cli("provider", "run", "--request", str(request))
-
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert json.loads(result.stderr) == {
-        "schema_version": "hound.error.v1",
-        "error": f"cannot read {request}: input is not UTF-8",
-    }
-
-
-def test_capture_store_and_verify_cli(tmp_path: Path, capsys) -> None:
-    body = tmp_path / "page.md"
-    body.write_text("# Durable source\n", encoding="utf-8")
-    root = tmp_path / "captures"
-
-    stored_exit = cli.main(
-        [
-            "capture",
-            "store",
-            "--root",
-            str(root),
-            "--provider",
-            "direct-fetch",
-            "--source-url",
-            "https://example.test/source",
-            "--body",
-            str(body),
-            "--media-type",
-            "text/markdown",
-            "--retrieved-at",
-            "2026-07-17T12:00:00Z",
-        ]
-    )
-    stored = json.loads(capsys.readouterr().out)
-    verified_exit = cli.main(
-        [
-            "capture",
-            "verify",
-            "--root",
-            str(root),
-            "--capture-id",
-            stored["capture_id"],
-        ]
-    )
-    verified = json.loads(capsys.readouterr().out)
-
-    assert stored_exit == 0
-    assert verified_exit == 0
-    assert verified == {
-        "schema_version": "hound.capture.verification.v1",
-        "capture_id": stored["capture_id"],
-        "valid": True,
-    }
-
-
-def test_driver_check_and_read_operation(driver_repo: tuple[Path, Path]) -> None:
-    _, manifest_path = driver_repo
-    checked = run_cli("driver", "check", "--driver", str(manifest_path))
-    status = run_cli(
-        "corpus",
-        "status",
-        "--driver",
-        str(manifest_path),
-        "--json",
-        '{"question":"what changed?"}',
-    )
-
-    assert checked.returncode == 0, checked.stderr
-    assert json.loads(checked.stdout)["outcome"] == "completed"
-    assert status.returncode == 0, status.stderr
-    assert json.loads(status.stdout)["data"]["echo"]["question"] == "what changed?"
-
-
-def test_source_commands_use_kernel_composition(monkeypatch, capsys, driver_repo) -> None:
-    _, manifest_path = driver_repo
-    seen: list[tuple[str, object]] = []
-
-    def discover(path: object, payload: object, *, as_of: object = None) -> dict[str, object]:
-        seen.append((str(path), payload))
-        return {"schema_version": "hound.driver.response.v1", "ok": True, "outcome": "completed"}
-
-    monkeypatch.setattr(cli, "discover_sources", discover)
-    exit_code = cli.main([
+    for command in (
+        "driver",
+        "invoke",
+        "plan",
+        "approve",
+        "execute",
+        "verify",
         "source",
-        "discover",
-        "--driver",
-        str(manifest_path),
-        "--json",
-        '{"date":"2026-07-20"}',
-    ])
-
-    assert exit_code == 0
-    assert seen == [(str(manifest_path.resolve()), {"date": "2026-07-20"})]
-    assert json.loads(capsys.readouterr().out)["outcome"] == "completed"
+        "search",
+        "extract",
+        "interact",
+        "capture",
+    ):
+        assert command in output
+    for removed in ("provider", "corpus", "edition", "approval", "run"):
+        assert f"  {removed}" not in output
 
 
-def test_source_commands_without_composition_remain_driver_reads(driver_repo) -> None:
+def test_invoke_runs_an_arbitrary_declared_read_capability(
+    driver_repo: tuple[Path, Path],
+) -> None:
     _, manifest_path = driver_repo
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for operation in ("source.discover", "source.capture", "source.inspect"):
-        manifest["capabilities"][operation].pop("composition")
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-    result = run_cli(
-        "source",
-        "discover",
+    code, stdout, stderr = run_cli(
+        "invoke",
         "--driver",
         str(manifest_path),
+        "--operation",
+        "corpus.status",
         "--json",
-        '{"question":"legacy"}',
+        '{"value":"x"}',
     )
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["data"]["echo"] == {"question": "legacy"}
+    assert code == 0
+    assert stderr == ""
+    result = json.loads(stdout)
+    assert result["data"] == {"operation": "corpus.status", "echo": {"value": "x"}}
 
 
-def test_cli_plan_approve_execute_e2e(driver_repo: tuple[Path, Path], tmp_path: Path) -> None:
+def test_invoke_rejects_write_capabilities(
+    driver_repo: tuple[Path, Path],
+) -> None:
     _, manifest_path = driver_repo
+
+    code, _, stderr = run_cli(
+        "invoke",
+        "--driver",
+        str(manifest_path),
+        "--operation",
+        "corpus.apply",
+    )
+
+    assert code == 2
+    assert "must be planned" in json.loads(stderr)["error"]
+
+
+def test_plan_approve_execute_and_verify_use_saved_artifacts(
+    driver_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, manifest_path = driver_repo
     plan_path = tmp_path / "plan.json"
     approval_path = tmp_path / "approval.json"
 
-    planned = run_cli(
-        "corpus",
-        "apply",
+    planned, stdout, _ = run_cli(
+        "plan",
         "--driver",
         str(manifest_path),
+        "--operation",
+        "corpus.apply",
         "--json",
-        '{"value":"canonical"}',
+        '{"value":"reviewed"}',
         "--as-of",
-        "2026-07-17",
-        "--plan-out",
+        "2026-07-21",
+        "--output",
         str(plan_path),
     )
-    approved = run_cli(
-        "approval",
-        "create",
+    assert planned == 0
+    assert json.loads(stdout) == json.loads(plan_path.read_text())
+
+    approved, _, _ = run_cli(
+        "approve",
         "--plan",
         str(plan_path),
         "--reviewer",
         "operator@example.test",
         "--approved-at",
-        "2026-07-17T01:00:00Z",
+        "2026-07-21T12:00:00Z",
         "--output",
         str(approval_path),
     )
-    executed = run_cli(
-        "corpus",
-        "apply",
+    assert approved == 0
+
+    executed, stdout, stderr = run_cli(
+        "execute",
         "--driver",
         str(manifest_path),
-        "--execute",
+        "--plan",
         str(plan_path),
         "--approval",
         str(approval_path),
     )
+    assert executed == 0
+    assert stderr == ""
+    result = json.loads(stdout)
+    assert json.loads((repo / "output" / "result.json").read_text()) == {"value": "reviewed"}
 
-    assert planned.returncode == 0, planned.stderr
-    assert approved.returncode == 0, approved.stderr
-    assert executed.returncode == 0, executed.stderr
-    assert json.loads(executed.stdout)["outcome"] == "completed"
+    verified, stdout, _ = run_cli("verify", result["run_dir"])
+    assert verified == 0
+    assert json.loads(stdout)["valid"] is True
 
 
-def test_missing_human_approval_is_exit_three(driver_repo: tuple[Path, Path], tmp_path: Path) -> None:
+def test_plan_requires_an_output_path_and_cutoff(
+    driver_repo: tuple[Path, Path],
+) -> None:
     _, manifest_path = driver_repo
-    plan_path = tmp_path / "plan.json"
-    planned = run_cli(
-        "corpus", "apply", "--driver", str(manifest_path), "--as-of", "2026-07-17",
-        "--plan-out", str(plan_path),
-    )
-    assert planned.returncode == 0
 
-    result = run_cli(
-        "corpus", "apply", "--driver", str(manifest_path), "--execute", str(plan_path),
+    code, _, stderr = run_cli(
+        "plan",
+        "--driver",
+        str(manifest_path),
+        "--operation",
+        "corpus.apply",
     )
 
-    assert result.returncode == 3
-    assert "approval" in result.stderr.lower()
+    assert code == 2
+    assert "required" in json.loads(stderr)["error"]
+
+
+def test_source_command_uses_source_v2_composition(
+    driver_repo: tuple[Path, Path], monkeypatch
+) -> None:
+    _, manifest_path = driver_repo
+    seen: list[tuple[Path, dict[str, object]]] = []
+
+    def discover(path: Path, payload: dict[str, object], *, as_of: str | None = None):
+        seen.append((path, payload))
+        return {"ok": True, "outcome": "completed", "as_of": as_of}
+
+    monkeypatch.setattr(cli, "discover_sources", discover)
+
+    code, stdout, _ = run_cli(
+        "source",
+        "discover",
+        "--driver",
+        str(manifest_path),
+        "--json",
+        '{"date":"2026-07-21"}',
+        "--as-of",
+        "2026-07-21",
+    )
+
+    assert code == 0
+    assert json.loads(stdout)["outcome"] == "completed"
+    assert seen == [(manifest_path.resolve(), {"date": "2026-07-21"})]
+
+
+def test_web_commands_require_explicit_adapter_and_preserve_record_root(
+    driver_repo: tuple[Path, Path], tmp_path: Path, monkeypatch
+) -> None:
+    _, manifest_path = driver_repo
+    seen: list[tuple[Path, str, dict[str, object], Path]] = []
+
+    def run_web(adapter, verb, payload, *, record_root, as_of=None):
+        seen.append((adapter, verb, payload, record_root))
+        return {"ok": True, "outcome": "completed", "record_id": "a" * 64}
+
+    monkeypatch.setattr(cli, "run_web", run_web)
+    record_root = tmp_path / "records"
+
+    code, _, _ = run_cli(
+        "search",
+        "--adapter",
+        str(manifest_path),
+        "--json",
+        '{"query":"care","limit":2}',
+        "--record-root",
+        str(record_root),
+    )
+
+    assert code == 0
+    assert seen == [
+        (
+            manifest_path.resolve(),
+            "search",
+            {"query": "care", "limit": 2},
+            record_root.resolve(),
+        )
+    ]
+
+
+def test_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
+    body = tmp_path / "body.bin"
+    body.write_bytes(b"source bytes")
+    root = tmp_path / "captures"
+
+    stored, stdout, _ = run_cli(
+        "capture",
+        "store",
+        "--root",
+        str(root),
+        "--provider",
+        "direct-api",
+        "--source-url",
+        "https://example.test/source",
+        "--body",
+        str(body),
+        "--media-type",
+        "application/json",
+        "--retrieved-at",
+        "2026-07-21T12:00:00Z",
+    )
+    assert stored == 0
+    capture_id = json.loads(stdout)["capture_id"]
+
+    verified, stdout, _ = run_cli(
+        "capture",
+        "verify",
+        "--root",
+        str(root),
+        "--capture-id",
+        capture_id,
+    )
+    assert verified == 0
+    assert json.loads(stdout)["valid"] is True
+
+
+def test_invalid_json_returns_a_machine_readable_error(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    _, manifest_path = driver_repo
+
+    code, stdout, stderr = run_cli(
+        "invoke",
+        "--driver",
+        str(manifest_path),
+        "--operation",
+        "corpus.status",
+        "--json",
+        "{",
+    )
+
+    assert code == 2
+    assert stdout == ""
+    assert json.loads(stderr)["schema_version"] == "hound.error.v1"

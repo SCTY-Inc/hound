@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 import hashlib
-from importlib.metadata import version as package_version
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
 from typing import Any
 
-from . import __version__
 from .contracts import (
     ContractError,
     canonical_hash,
@@ -21,14 +20,15 @@ from .contracts import (
     validate_response,
 )
 from .runtime import (
-    RuntimeErrorHound,
     capture_driver_environment,
     changed_paths,
     driver_environment_fingerprint,
+    kernel_identity as _kernel_identity,
     paths_within_scopes,
     repo_execution_lock,
     repo_fingerprint,
     run_driver,
+    run_driver_with_receipt,
     snapshot_repo,
     write_json_atomic,
     write_json_create_only,
@@ -43,21 +43,6 @@ class HoundError(Exception):
         self.exit_code = exit_code
 
 
-def _kernel_identity() -> dict[str, Any]:
-    source_root = Path(__file__).parent
-    digest = hashlib.sha256()
-    for source in sorted(source_root.rglob("*.py")):
-        digest.update(source.relative_to(source_root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(source.read_bytes())
-        digest.update(b"\0")
-    return {
-        "version": __version__,
-        "sha256": digest.hexdigest(),
-        "dependencies": {"scrapling": package_version("scrapling")},
-    }
-
-
 def _owner_repo(manifest: dict[str, Any], manifest_path: Path) -> Path:
     raw = Path(manifest["owner"]["repo"])
     repo = raw if raw.is_absolute() else manifest_path.parent / raw
@@ -67,9 +52,7 @@ def _owner_repo(manifest: dict[str, Any], manifest_path: Path) -> Path:
     return resolved
 
 
-def _snapshot_owner_repo(
-    manifest: dict[str, Any], repo: Path
-) -> dict[str, str]:
+def _snapshot_owner_repo(manifest: dict[str, Any], repo: Path) -> dict[str, str]:
     excludes = manifest.get("ignored_snapshot_excludes", [])
     if excludes:
         return snapshot_repo(repo, ignored_snapshot_excludes=excludes)
@@ -134,7 +117,7 @@ def _validated_expected_writes(data: dict[str, Any], scopes: list[str]) -> list[
     return writes
 
 
-def _invoke_nonmutating_driver(
+def _invoke_nonmutating_driver_with_receipt(
     manifest: dict[str, Any],
     request: dict[str, Any],
     *,
@@ -142,7 +125,8 @@ def _invoke_nonmutating_driver(
     repo: Path,
     mode: str,
     driver_environment: dict[str, str] | None = None,
-) -> dict[str, Any]:
+    decoded_outputs: Callable[[dict[str, Any]], Iterable[object]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     selected_environment = (
         capture_driver_environment(manifest, operation=request.get("operation"))
         if driver_environment is None
@@ -151,14 +135,15 @@ def _invoke_nonmutating_driver(
     before = _snapshot_owner_repo(manifest, repo)
     if not before.get(".git/hound-integrity-state", "").startswith("0:"):
         raise HoundError("repository Git object integrity check failed")
-    response: dict[str, Any] | None = None
+    invocation: tuple[dict[str, Any], dict[str, Any]] | None = None
     driver_error: BaseException | None = None
     try:
-        response = run_driver(
+        invocation = run_driver_with_receipt(
             manifest,
             request,
             manifest_path=manifest_path,
             driver_environment=selected_environment,
+            decoded_outputs=decoded_outputs,
         )
     except BaseException as exc:
         driver_error = exc
@@ -169,7 +154,27 @@ def _invoke_nonmutating_driver(
         ) from driver_error
     if driver_error is not None:
         raise driver_error
-    assert response is not None
+    assert invocation is not None
+    return invocation
+
+
+def _invoke_nonmutating_driver(
+    manifest: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    manifest_path: Path,
+    repo: Path,
+    mode: str,
+    driver_environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    response, _ = _invoke_nonmutating_driver_with_receipt(
+        manifest,
+        request,
+        manifest_path=manifest_path,
+        repo=repo,
+        mode=mode,
+        driver_environment=driver_environment,
+    )
     return response
 
 
@@ -178,11 +183,39 @@ def _plan_without_id(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_plan(plan: dict[str, Any]) -> None:
-    if not isinstance(plan, dict) or plan.get("schema_version") != "hound.plan.v1":
+    if not isinstance(plan, dict) or plan.get("schema_version") not in {
+        "hound.plan.v1",
+        "hound.plan.v2",
+    }:
         raise HoundError("unsupported or malformed Hound plan", exit_code=2)
     plan_id = plan.get("plan_id")
     if not isinstance(plan_id, str) or canonical_hash(_plan_without_id(plan)) != plan_id:
         raise HoundError("plan_id does not match plan contents", exit_code=2)
+    if plan["schema_version"] == "hound.plan.v2":
+        try:
+            proposal = validate_response(plan.get("proposal"))
+        except ContractError as error:
+            raise HoundError("plan proposal is malformed", exit_code=2) from error
+        if proposal["outcome"] not in {"planned", "no-change", "no-edition"}:
+            raise HoundError("plan proposal has an invalid outcome", exit_code=2)
+        data = proposal.get("data")
+        if not isinstance(data, dict):
+            raise HoundError("plan proposal data must be an object", exit_code=2)
+        _validated_expected_writes(data, plan.get("write_scopes", []))
+
+
+def _plan_proposal(plan: dict[str, Any]) -> dict[str, Any]:
+    if plan.get("schema_version") == "hound.plan.v2":
+        return plan["proposal"]
+    return plan["planning_response"]
+
+
+def _plan_expected_writes(plan: dict[str, Any]) -> list[str]:
+    if plan.get("schema_version") == "hound.plan.v2":
+        return _validated_expected_writes(
+            _plan_proposal(plan)["data"], plan.get("write_scopes", [])
+        )
+    return plan["expected_writes"]
 
 
 def make_plan(
@@ -217,11 +250,14 @@ def make_plan(
         mode="plan",
         driver_environment=driver_environment,
     )
-    if driver_environment_fingerprint(
-        manifest,
-        capture_driver_environment(manifest, operation=operation),
-        operation=operation,
-    ) != environment_sha256:
+    if (
+        driver_environment_fingerprint(
+            manifest,
+            capture_driver_environment(manifest, operation=operation),
+            operation=operation,
+        )
+        != environment_sha256
+    ):
         raise HoundError("driver environment changed while planning", exit_code=2)
     if not response["ok"]:
         raise HoundError("driver reported failure while planning")
@@ -232,9 +268,9 @@ def make_plan(
     driver_data = response.get("data", {})
     if not isinstance(driver_data, dict):
         raise HoundError("driver plan data must be an object", exit_code=2)
-    expected_writes = _validated_expected_writes(driver_data, scopes)
+    _validated_expected_writes(driver_data, scopes)
     body: dict[str, Any] = {
-        "schema_version": "hound.plan.v1",
+        "schema_version": "hound.plan.v2",
         "driver_id": manifest["id"],
         "driver_manifest_sha256": canonical_hash(manifest),
         "driver_environment_sha256": environment_sha256,
@@ -248,10 +284,7 @@ def make_plan(
         "repo_fingerprint": repo_fingerprint(repo),
         "write_scopes": scopes,
         "write_scope_sha256": canonical_hash(scopes),
-        "expected_writes": expected_writes,
-        "driver_outcome": response["outcome"],
-        "driver_plan": driver_data,
-        "planning_response": response,
+        "proposal": response,
     }
     return {**body, "plan_id": canonical_hash(body)}
 
@@ -282,6 +315,8 @@ def create_approval(
     """Create an explicit approval artifact bound to exactly one plan."""
 
     _validate_plan(plan)
+    if plan["schema_version"] != "hound.plan.v2":
+        raise HoundError("historical plans are verification-only", exit_code=2)
     if not isinstance(reviewer, str) or not reviewer.strip():
         raise HoundError("reviewer must not be empty", exit_code=2)
     timestamp = approved_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -311,9 +346,7 @@ def _approval_timestamp(value: object, label: str, *, exit_code: int) -> datetim
     except ValueError as exc:
         raise HoundError(f"approval {label} is malformed", exit_code=exit_code) from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise HoundError(
-            f"approval {label} must include a timezone", exit_code=exit_code
-        )
+        raise HoundError(f"approval {label} must include a timezone", exit_code=exit_code)
     return parsed
 
 
@@ -347,7 +380,9 @@ def _validate_approval_artifact(
     if any(approval.get(key) != value for key, value in expected.items()):
         raise HoundError("approval does not match the exact plan and write scope", exit_code=3)
     body = {key: value for key, value in approval.items() if key != "approval_id"}
-    if approval.get("schema_version") != "hound.approval.v1" or approval.get("approval_id") != canonical_hash(body):
+    if approval.get("schema_version") != "hound.approval.v1" or approval.get(
+        "approval_id"
+    ) != canonical_hash(body):
         raise HoundError("approval artifact is malformed or has been modified", exit_code=3)
     reviewer = approval["reviewer"]
     if not isinstance(reviewer, str) or not reviewer.strip():
@@ -384,9 +419,7 @@ def _run_root(manifest: dict[str, Any], manifest_path: Path, repo: Path) -> Path
 def _fingerprint_without_run_records(
     repo: Path, run_dir: Path, record_names: list[str]
 ) -> dict[str, Any]:
-    record_paths = {
-        (run_dir / name).relative_to(repo).as_posix() for name in record_names
-    }
+    record_paths = {(run_dir / name).relative_to(repo).as_posix() for name in record_names}
     fingerprint = repo_fingerprint(repo)
     fingerprint["untracked"] = {
         path: digest
@@ -394,18 +427,12 @@ def _fingerprint_without_run_records(
         if path not in record_paths
     }
     fingerprint["fingerprint_sha256"] = canonical_hash(
-        {
-            key: value
-            for key, value in fingerprint.items()
-            if key != "fingerprint_sha256"
-        }
+        {key: value for key, value in fingerprint.items() if key != "fingerprint_sha256"}
     )
     return fingerprint
 
 
-def _protected_record_matches(
-    path: Path, expected_size: int, expected_sha256: str
-) -> bool:
+def _protected_record_matches(path: Path, expected_size: int, expected_sha256: str) -> bool:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -431,10 +458,7 @@ def _write_run_index(run_dir: Path, plan_id: str, *, replace: bool = False) -> N
     names = ["driver-manifest.json", "plan.json", "request.json", "result.json"]
     if (run_dir / "approval.json").is_file():
         names.append("approval.json")
-    hashes = {
-        name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest()
-        for name in names
-    }
+    hashes = {name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest() for name in names}
     writer = write_json_atomic if replace else write_json_create_only
     writer(
         run_dir / "index.json",
@@ -460,18 +484,20 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
         "ok",
         "changed_paths",
         "driver_response",
-        "run_dir",
     }
     optional = {"error", "data"}
+    schema = result.get("schema_version")
+    if schema == "hound.run.result.v1":
+        required.add("run_dir")
+    elif schema != "hound.run.result.v2":
+        return False
     if set(result) - required - optional or required - result.keys():
         return False
     if (
-        result["schema_version"] != "hound.run.result.v1"
-        or result["plan_id"] != plan.get("plan_id")
-        or result["run_dir"] != str(root)
+        result["plan_id"] != plan.get("plan_id")
+        or (schema == "hound.run.result.v1" and result["run_dir"] != str(root))
         or not isinstance(result["ok"], bool)
-        or result["outcome"]
-        not in {"completed", "no-change", "no-edition", "held", "failed"}
+        or result["outcome"] not in {"completed", "no-change", "no-edition", "held", "failed"}
     ):
         return False
     changed = result["changed_paths"]
@@ -495,7 +521,7 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
             or not response["ok"]
             or response["outcome"] != result["outcome"]
             or result.get("data") != response.get("data", {})
-            or any(path not in plan.get("expected_writes", []) for path in changed)
+            or changed != _plan_expected_writes(plan)
         ):
             return False
     elif (
@@ -517,6 +543,8 @@ def execute_plan(
     """Execute an unchanged plan once, recording proof and checking writes."""
 
     _validate_plan(plan)
+    if plan["schema_version"] != "hound.plan.v2":
+        raise HoundError("historical plans are verification-only", exit_code=2)
     path = Path(manifest_path).resolve()
     manifest = load_manifest(path)
     repo = _owner_repo(manifest, path)
@@ -533,10 +561,15 @@ def _execute_plan_locked(
 ) -> dict[str, Any]:
     capability = _capability(manifest, plan["operation"])
     if capability["effect"] != "write":
-        raise HoundError("read capabilities are invoked directly, not executed as plans", exit_code=2)
+        raise HoundError(
+            "read capabilities are invoked directly, not executed as plans", exit_code=2
+        )
     if _kernel_identity() != plan.get("kernel"):
         raise HoundError("Hound kernel no longer matches the approved plan", exit_code=2)
-    if manifest["id"] != plan["driver_id"] or canonical_hash(manifest) != plan["driver_manifest_sha256"]:
+    if (
+        manifest["id"] != plan["driver_id"]
+        or canonical_hash(manifest) != plan["driver_manifest_sha256"]
+    ):
         raise HoundError("driver manifest no longer matches the plan", exit_code=2)
     root = _run_root(manifest, path, repo)
     run_dir = root / plan["plan_id"]
@@ -564,7 +597,7 @@ def _execute_plan_locked(
         "as_of": plan["as_of"],
         "input": plan["input"],
         "plan_id": plan["plan_id"],
-        "driver_plan": plan["driver_plan"],
+        "driver_plan": _plan_proposal(plan)["data"],
     }
     reserved_records: dict[str, Any] = {
         "driver-manifest.json": manifest,
@@ -629,9 +662,7 @@ def _execute_plan_locked(
                     operation=plan["operation"],
                 )
                 != plan.get("driver_environment_sha256")
-                or _fingerprint_without_run_records(
-                    repo, run_dir, protected_names
-                )
+                or _fingerprint_without_run_records(repo, run_dir, protected_names)
                 != plan["repo_fingerprint"]
             ):
                 raise HoundError(
@@ -661,13 +692,15 @@ def _execute_plan_locked(
     altered_records = [
         name
         for name, (expected_size, expected_hash) in protected_records.items()
-        if not _protected_record_matches(
-            run_dir / name, expected_size, expected_hash
-        )
+        if not _protected_record_matches(run_dir / name, expected_size, expected_hash)
     ]
     changed = changed_paths(before, after)
     in_scope, violations = paths_within_scopes(repo, changed, plan["write_scopes"])
-    unexpected = [item for item in changed if not _actual_matches_expected(item, plan["expected_writes"])]
+    expected = _plan_expected_writes(plan)
+    unexpected = [
+        item for item in changed if not _actual_matches_expected(item, expected)
+    ]
+    missing = [item for item in expected if item not in changed]
 
     if driver_interrupt is not None:
         error = "driver interrupted"
@@ -683,6 +716,8 @@ def _execute_plan_locked(
         error = f"driver wrote outside declared scopes: {', '.join(violations)}"
     elif unexpected:
         error = f"driver wrote outside its approved plan: {', '.join(unexpected)}"
+    elif missing:
+        error = f"driver did not produce its approved writes: {', '.join(missing)}"
     elif response is not None and response["outcome"] not in {
         "completed",
         "no-change",
@@ -698,13 +733,12 @@ def _execute_plan_locked(
 
     held = isinstance(driver_error, HoundError) and driver_error.exit_code == 3
     result: dict[str, Any] = {
-        "schema_version": "hound.run.result.v1",
+        "schema_version": "hound.run.result.v2",
         "plan_id": plan["plan_id"],
         "outcome": "held" if held else ("failed" if error else response["outcome"]),
         "ok": error is None,
         "changed_paths": changed,
         "driver_response": response,
-        "run_dir": str(run_dir),
     }
     if error:
         result["error"] = error
@@ -728,7 +762,7 @@ def _execute_plan_locked(
         raise snapshot_interrupt
     if error:
         raise HoundError(error, exit_code=3 if held else 1)
-    return result
+    return {**result, "run_dir": str(run_dir)}
 
 
 def verify_run(run_dir: str | Path) -> dict[str, Any]:
@@ -796,7 +830,7 @@ def verify_run(run_dir: str | Path) -> dict[str, Any]:
             "as_of": plan["as_of"],
             "input": plan["input"],
             "plan_id": plan["plan_id"],
-            "driver_plan": plan["driver_plan"],
+            "driver_plan": _plan_proposal(plan)["data"],
         }
         if request != expected_request:
             fail("request.json")
@@ -828,14 +862,15 @@ def verify_run(run_dir: str | Path) -> dict[str, Any]:
     }
 
 
-def invoke_read(
+def invoke_read_with_receipt(
     manifest_path: str | Path,
     operation: str,
     payload: dict[str, Any] | None,
     *,
     as_of: str | None = None,
-) -> dict[str, Any]:
-    """Invoke a declared read capability without entering the write lifecycle."""
+    decoded_outputs: Callable[[dict[str, Any]], Iterable[object]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Invoke one declared read capability and return its execution receipt."""
 
     path = Path(manifest_path).resolve()
     manifest = load_manifest(path)
@@ -851,13 +886,32 @@ def invoke_read(
     }
     if as_of is not None:
         request["as_of"] = as_of
-    response = _invoke_nonmutating_driver(
+    response, receipt = _invoke_nonmutating_driver_with_receipt(
         manifest,
         request,
         manifest_path=path,
         repo=repo,
         mode="read",
+        decoded_outputs=decoded_outputs,
     )
     if response["outcome"] == "planned":
         raise HoundError("driver returned invalid outcome for read mode: planned", exit_code=2)
+    return response, receipt
+
+
+def invoke_read(
+    manifest_path: str | Path,
+    operation: str,
+    payload: dict[str, Any] | None,
+    *,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """Invoke a declared read capability without entering the write lifecycle."""
+
+    response, _ = invoke_read_with_receipt(
+        manifest_path,
+        operation,
+        payload,
+        as_of=as_of,
+    )
     return response

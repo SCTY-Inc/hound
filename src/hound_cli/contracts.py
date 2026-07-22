@@ -24,11 +24,11 @@ _MANIFEST_REQUIRED = {
 }
 _MANIFEST_OPTIONAL = {
     "run_root",
-    "capture_root",
     "write_scopes",
     "ignored_snapshot_excludes",
     "timeouts_seconds",
     "env_allowlist",
+    "source",
 }
 _RESPONSE_REQUIRED = {"schema_version", "ok", "outcome"}
 _RESPONSE_OPTIONAL = {
@@ -60,7 +60,14 @@ def canonical_json(obj: Any) -> str:
             sort_keys=True,
         )
         encoded.encode("utf-8")
-    except (ContractError, OverflowError, RecursionError, TypeError, UnicodeError, ValueError) as error:
+    except (
+        ContractError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as error:
         if isinstance(error, ContractError):
             raise
         raise ContractError(f"value is not canonical JSON: {error}") from error
@@ -116,7 +123,7 @@ def validate_manifest(obj: Any) -> dict[str, Any]:
         _require_fields(
             capability,
             {"effect", "gate"},
-            {"env_allowlist", "composition"},
+            {"env_allowlist"},
             f"manifest.capabilities.{operation}",
         )
         if not isinstance(capability["effect"], str) or capability["effect"] not in {
@@ -130,9 +137,7 @@ def validate_manifest(obj: Any) -> dict[str, Any]:
             "none",
             "human",
         }:
-            raise ContractError(
-                f"manifest.capabilities.{operation}.gate must be 'none' or 'human'"
-            )
+            raise ContractError(f"manifest.capabilities.{operation}.gate must be 'none' or 'human'")
         if capability["effect"] == "read" and capability["gate"] != "none":
             raise ContractError(
                 f"manifest.capabilities.{operation} read effects must use gate 'none'"
@@ -142,39 +147,32 @@ def validate_manifest(obj: Any) -> dict[str, Any]:
                 capability["env_allowlist"],
                 f"manifest.capabilities.{operation}.env_allowlist",
             )
-        if "composition" in capability:
-            if capability["composition"] != "hound.source.v1":
-                raise ContractError(
-                    f"manifest.capabilities.{operation}.composition is unsupported"
-                )
-            if operation not in {"source.discover", "source.capture", "source.inspect"}:
-                raise ContractError("hound.source.v1 is valid only for source capabilities")
-            if capability["effect"] != "read":
-                raise ContractError("hound.source.v1 capabilities must use effect 'read'")
-    composed_source = {
-        operation
-        for operation, capability in capabilities.items()
-        if capability.get("composition") == "hound.source.v1"
-    }
-    if composed_source and composed_source != {
-        "source.discover",
-        "source.capture",
-        "source.inspect",
-    }:
-        raise ContractError("hound.source.v1 requires discover, capture, and inspect")
+    if "source" in obj:
+        source = obj["source"]
+        _require_object(source, "manifest.source")
+        _require_fields(source, {"schema_version", "adapters"}, set(), "manifest.source")
+        if source["schema_version"] != "hound.source.v2":
+            raise ContractError("manifest.source.schema_version must be 'hound.source.v2'")
+        adapters = source["adapters"]
+        if not isinstance(adapters, dict) or not adapters:
+            raise ContractError("manifest.source.adapters must be a non-empty object")
+        for alias, locator in adapters.items():
+            _require_identifier(alias, "manifest.source adapter alias")
+            _require_repo_locator(locator, f"manifest.source.adapters.{alias}")
+        source_capabilities = {"source.discover", "source.capture", "source.inspect"}
+        if not source_capabilities.issubset(capabilities):
+            raise ContractError("hound.source.v2 requires discover, capture, and inspect")
+        if any(capabilities[name]["effect"] != "read" for name in source_capabilities):
+            raise ContractError("hound.source.v2 capabilities must use effect 'read'")
 
-    for field in ("run_root", "capture_root"):
-        if field in obj:
-            _require_relative_path(obj[field], f"manifest.{field}")
+    if "run_root" in obj:
+        _require_relative_path(obj["run_root"], "manifest.run_root")
     if "write_scopes" in obj:
         _require_path_list(obj["write_scopes"], "manifest.write_scopes")
     if "ignored_snapshot_excludes" in obj:
         excludes = obj["ignored_snapshot_excludes"]
         _require_path_list(excludes, "manifest.ignored_snapshot_excludes")
-        if any(
-            PurePosixPath(value.replace("\\", "/")).as_posix() == "."
-            for value in excludes
-        ):
+        if any(PurePosixPath(value.replace("\\", "/")).as_posix() == "." for value in excludes):
             raise ContractError("manifest.ignored_snapshot_excludes must not contain '.'")
 
     if "timeouts_seconds" in obj:
@@ -211,6 +209,8 @@ def validate_response(obj: Any) -> dict[str, Any]:
         raise ContractError("response.ok must be a boolean")
     if not isinstance(obj["outcome"], str) or obj["outcome"] not in _OUTCOMES:
         raise ContractError(f"response.outcome must be one of {sorted(_OUTCOMES)!r}")
+    if obj["ok"] != (obj["outcome"] not in {"held", "failed"}):
+        raise ContractError("response.ok contradicts response.outcome")
     if "data_schema" in obj:
         _require_safe_string(obj["data_schema"], "response.data_schema")
     for field in ("artifacts", "proofs", "diagnostics"):

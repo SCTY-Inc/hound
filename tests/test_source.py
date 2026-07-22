@@ -1,371 +1,263 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from hound_cli.contracts import canonical_hash
-from hound_cli.packs.web import WebCapture, WebFetchError
-from hound_cli.providers import ProviderError
+from hound_cli.contracts import canonical_json
+from hound_cli.evidence import EvidenceError
 from hound_cli.source import capture_sources, discover_sources, inspect_sources
+from hound_cli.web import verify_web_run
 
 
-def provider_request() -> dict[str, object]:
+def _raw(value: object) -> tuple[str, str]:
+    body = canonical_json(value).encode("utf-8")
+    return base64.b64encode(body).decode("ascii"), hashlib.sha256(body).hexdigest()
+
+
+def _configure(repo: Path, data: dict[str, object]) -> None:
+    (repo / "fake-web-response.json").write_text(
+        json.dumps(data, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _search_data(query: str = "care workforce") -> dict[str, object]:
+    body_base64, sha256 = _raw({"query": query, "results": []})
     return {
-        "schema_version": "hound.provider.request.v1",
-        "provider": "exa",
-        "operation": "search",
-        "parameters": {
-            "query": "care workforce",
-            "numResults": 2,
-            "text": {"maxCharacters": 4_000},
+        "schema_version": "hound.web.adapter.v1",
+        "retrieved_at": "2026-07-21T12:00:00Z",
+        "raw": {
+            "media_type": "application/json",
+            "body_base64": body_base64,
+            "sha256": sha256,
         },
-        "retrieved_at": "2026-07-20T10:00:00Z",
+        "output": {
+            "schema_version": "hound.web.search.v1",
+            "trust": "untrusted",
+            "evidence_status": "not-evidence",
+            "leads": [
+                {
+                    "schema_version": "hound.lead.v1",
+                    "evidence_status": "not-evidence",
+                    "provider": "searxng",
+                    "query": query,
+                    "url": "https://example.test/one",
+                    "title": "First result",
+                    "metadata": {"engines": ["federal register"], "rank": 1},
+                }
+            ],
+        },
+        "usage": {"requests": 1, "bytes": len(base64.b64decode(body_base64))},
     }
 
 
-def provider_response(request: dict[str, object]) -> dict[str, object]:
-    raw = {
-        "results": [
-            {
-                "url": "https://example.test/one",
-                "title": "First result",
-                "publishedDate": "2026-07-20T08:00:00Z",
-                "text": "A state raised its direct-care wage floor.",
-            },
-            {
-                "url": "https://example.test/two",
-                "title": "Second result",
-                "publishedDate": "2026-07-20T09:00:00Z",
-                "text": "A provider opened a respite program.",
-            },
-        ]
-    }
+def _extract_data(markdown: str = "Verified source document") -> dict[str, object]:
+    body_base64, sha256 = _raw({"markdown": markdown})
     return {
-        "schema_version": "hound.provider.response.v1",
-        "pack": "web",
-        "provider": "exa",
-        "operation": "search",
-        "request_sha256": hashlib.sha256(
-            json.dumps(
-                request,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest(),
-        "retrieved_at": "2026-07-20T10:00:00Z",
-        "raw_data": raw,
-        "leads": [
-            {
-                "schema_version": "hound.lead.v1",
-                "evidence_status": "not-evidence",
-                "provider": "exa",
-                "query": "care workforce",
-                "url": result["url"],
-                "title": result["title"],
-                "metadata": {"rank": rank},
-            }
-            for rank, result in enumerate(raw["results"], start=1)
-        ],
+        "schema_version": "hound.web.adapter.v1",
+        "retrieved_at": "2026-07-21T12:01:00Z",
+        "raw": {
+            "media_type": "application/json",
+            "body_base64": body_base64,
+            "sha256": sha256,
+        },
+        "output": {
+            "schema_version": "hound.web.extract.v1",
+            "trust": "untrusted",
+            "evidence_class": "provider-derived",
+            "documents": [
+                {
+                    "url": "https://example.test/one",
+                    "markdown": markdown,
+                    "markdown_sha256": hashlib.sha256(markdown.encode()).hexdigest(),
+                    "links": [],
+                    "metadata": {"publishedDate": "2026-07-20T09:00:00Z"},
+                }
+            ],
+        },
+        "usage": {"requests": 1, "bytes": len(base64.b64decode(body_base64))},
     }
 
 
-def test_discovery_composes_owner_policy_with_kernel_provider_transport(
+def _discover_payload(count: int = 1) -> dict[str, object]:
+    return {
+        "searches": [
+            {
+                "adapter": "search",
+                "input": {"query": "care workforce", "limit": 2},
+            }
+            for _ in range(count)
+        ],
+        "limits": {"max_requests": count, "max_leads": count * 2, "max_bytes": 1_000_000},
+    }
+
+
+def test_discovery_composes_explicit_adapters_into_verified_record_references(
     driver_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-    seen: list[dict[str, object]] = []
+    repo, manifest_path = driver_repo
+    _configure(repo, _search_data())
+    monkeypatch.setenv("OWNER_MUST_NOT_SEE", "secret")
+    payload = {**_discover_payload(), "forbid_env": "OWNER_MUST_NOT_SEE"}
 
-    def execute(value: object) -> dict[str, object]:
-        assert isinstance(value, dict)
-        seen.append(value)
-        return provider_response(value)
+    result = discover_sources(manifest_path, payload)
 
-    monkeypatch.setenv("EXA_API_KEY", "kernel-only-secret")
-    result = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "forbid_env": "EXA_API_KEY",
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=execute,
-    )
-
-    assert seen == [request]
-    assert result["data_schema"] == "hound.source.discovery.v1"
-    assert result["data"]["schema_version"] == "hound.source.discovery.v1"
-    assert len(result["data"]["leads"]) == 2
-    assert result["data"]["leads"][0]["evidence_status"] == "not-evidence"
-    assert "kernel-only-secret" not in json.dumps(result)
+    assert result["data_schema"] == "hound.source.discovery.v2"
+    discovery = result["data"]
+    assert discovery["usage"]["requests"] == 1
+    assert discovery["usage"]["leads"] == 1
+    reference = discovery["leads"][0]
+    assert reference["record_id"] == discovery["records"][0]
+    assert reference["lead_id"] == reference["lead"]["lead_id"]
+    assert reference["lead"]["evidence_status"] == "not-evidence"
+    assert verify_web_run(repo / ".hound" / "web" / reference["record_id"])["valid"] is True
+    assert "secret" not in json.dumps(result)
 
 
-def test_discovery_fails_closed_when_owner_budget_is_exceeded(
-    driver_repo: tuple[Path, Path],
-) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-
-    with pytest.raises(ValueError, match="max_leads exceeded"):
-        discover_sources(
-            manifest_path,
-            {
-                "requests": [request],
-                "limits": {"max_requests": 1, "max_leads": 1, "max_bytes": 20_000},
-            },
-            provider_execute=lambda value: provider_response(value),
-        )
-
-
-def test_discovery_keeps_request_identity_when_one_provider_call_fails(
-    driver_repo: tuple[Path, Path],
-) -> None:
-    _, manifest_path = driver_repo
-    first = provider_request()
-    second = provider_request()
-    second["parameters"] = {**second["parameters"], "query": "respite access"}
-
-    def execute(value: object) -> dict[str, object]:
-        assert isinstance(value, dict)
-        if value["parameters"]["query"] == "care workforce":
-            raise ProviderError("temporary provider failure")
-        response = provider_response(value)
-        response["leads"] = [{**lead, "query": "respite access"} for lead in response["leads"]]
-        return response
-
-    result = discover_sources(
-        manifest_path,
-        {
-            "requests": [first, second],
-            "limits": {"max_requests": 2, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=execute,
-    )
-
-    assert result["data"]["requests"] == [second]
-    assert result["data"]["responses"][0]["request_sha256"] == canonical_hash(second)
-
-
-def test_capture_persists_selected_results_and_inspect_verifies_them(
+def test_discovery_keeps_duplicate_urls_as_distinct_record_lead_references(
     driver_repo: tuple[Path, Path],
 ) -> None:
     repo, manifest_path = driver_repo
-    request = provider_request()
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: provider_response(value),
-    )["data"]
+    _configure(repo, _search_data())
 
-    captured = capture_sources(
-        manifest_path,
-        {
-            "schema_version": "hound.source.capture.input.v1",
-            "discovery": discovery,
-            "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
-        },
-    )
+    result = discover_sources(manifest_path, _discover_payload(count=2))
 
-    assert captured["data_schema"] == "hound.source.capture-set.v1"
-    assert captured["data"]["retrieved_at"] == "2026-07-20T10:00:00Z"
-    entry = captured["data"]["captures"][0]
-    assert entry["document"]["title"] == "First result"
-    capture_id = entry["manifest"]["capture_id"]
-    assert (repo / ".hound" / "captures" / "manifests" / f"{capture_id}.json").exists()
+    references = result["data"]["leads"]
+    assert len(references) == 2
+    assert references[0]["lead"]["url"] == references[1]["lead"]["url"]
+    assert references[0]["record_id"] != references[1]["record_id"]
+    assert len({(reference["record_id"], reference["lead_id"]) for reference in references}) == 2
+
+
+def test_capture_and_inspect_bind_the_exact_selected_search_lead(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    _configure(repo, _search_data())
+    discovery = discover_sources(manifest_path, _discover_payload())["data"]
+    selected = discovery["leads"][0]
+    _configure(repo, _extract_data())
+    capture_input = {
+        "schema_version": "hound.source.capture.input.v2",
+        "discovery": discovery,
+        "owner_input": {
+            "captures": [
+                {
+                    "search_record_id": selected["record_id"],
+                    "lead_id": selected["lead_id"],
+                    "adapter": "extract",
+                }
+            ]
+        },
+    }
+
+    captured = capture_sources(manifest_path, capture_input)
+
+    assert captured["data_schema"] == "hound.source.capture-set.v2"
+    reference = captured["data"]["captures"][0]
+    assert reference["search_record_id"] == selected["record_id"]
+    assert reference["lead_id"] == selected["lead_id"]
+    assert verify_web_run(repo / ".hound" / "web" / reference["extract_record_id"])["valid"] is True
 
     inspected = inspect_sources(
         manifest_path,
-        {
-            "schema_version": "fake.inspect.input.v1",
-            "capture_set": captured["data"],
-        },
+        {"capture_set": captured["data"]},
     )
-    assert inspected["outcome"] == "completed"
-    assert inspected["data"]["echo"]["capture_set"] == captured["data"]
+
+    assert inspected["data_schema"] == "hound.source.capture-set.v2"
+    evidence = inspected["data"]["captures"][0]
+    assert evidence["capture_id"] == reference["extract_record_id"]
+    assert evidence["lead"]["lead_id"] == selected["lead_id"]
+    assert evidence["documents"][0]["markdown"] == "Verified source document"
 
 
-def test_capture_fetches_origin_only_when_owner_selects_origin_mode(
+def test_capture_rejects_duplicated_discovery_references(
     driver_repo: tuple[Path, Path],
 ) -> None:
     repo, manifest_path = driver_repo
-    request = provider_request()
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: provider_response(value),
-    )["data"]
-    seen: list[tuple[str, dict[str, object], str]] = []
-    raw_body = b"<html><article>Origin evidence</article></html>"
+    _configure(repo, _search_data())
+    discovery = discover_sources(manifest_path, _discover_payload())["data"]
+    discovery["leads"].append(discovery["leads"][0])
+    discovery["usage"]["leads"] += 1
 
-    def fetch_origin(
-        url: str,
-        document: dict[str, object],
-        *,
-        retrieved_at: str,
-    ) -> WebCapture:
-        seen.append((url, document, retrieved_at))
-        return WebCapture(
-            method="direct-scrapling",
-            body=raw_body,
-            media_type="text/html",
-            document={
-                "url": url,
-                "title": "Origin title",
-                "publishedDate": "2026-07-20T08:00:00Z",
-                "text": "Origin evidence",
-            },
-            attempts=[{"method": "direct-scrapling", "outcome": "captured"}],
-        )
-
-    captured = capture_sources(
-        manifest_path,
-        {
-            "schema_version": "hound.source.capture.input.v1",
-            "discovery": discovery,
-            "captures": [{"url": "https://example.test/one", "mode": "origin"}],
-        },
-        web_fetch=fetch_origin,
-    )["data"]
-
-    assert seen[0][0] == "https://example.test/one"
-    entry = captured["captures"][0]
-    assert entry["document"]["text"] == "Origin evidence"
-    assert entry["manifest"]["sha256"] == hashlib.sha256(raw_body).hexdigest()
-    assert entry["manifest"]["metadata"]["capture_method"] == "direct-scrapling"
-    assert entry["manifest"]["metadata"]["attempts"] == [
-        {"method": "direct-scrapling", "outcome": "captured"}
-    ]
-    blob_sha256 = entry["manifest"]["sha256"]
-    assert (repo / ".hound" / "captures" / "blobs" / blob_sha256).read_bytes() == raw_body
-
-
-def test_failed_origin_capture_is_diagnostic_not_discovery_evidence(
-    driver_repo: tuple[Path, Path],
-) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: provider_response(value),
-    )["data"]
-
-    captured = capture_sources(
-        manifest_path,
-        {
-            "schema_version": "hound.source.capture.input.v1",
-            "discovery": discovery,
-            "captures": [{"url": "https://example.test/one", "mode": "origin"}],
-        },
-        web_fetch=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            WebFetchError("origin capture failed")
-        ),
-    )
-
-    assert captured["data"]["captures"] == []
-    assert captured["diagnostics"] == [
-        "origin capture failed for https://example.test/one: origin capture failed"
-    ]
-
-
-def test_empty_discovery_can_flow_to_owner_no_edition(driver_repo: tuple[Path, Path]) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-    empty_response = provider_response(request)
-    empty_response["raw_data"] = {"results": []}
-    empty_response["leads"] = []
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: empty_response,
-    )["data"]
-
-    captured = capture_sources(
-        manifest_path,
-        {
-            "schema_version": "hound.source.capture.input.v1",
-            "discovery": discovery,
-            "captures": [],
-        },
-    )
-    assert captured["data"] == {
-        "schema_version": "hound.source.capture-set.v1",
-        "retrieved_at": "2026-07-20T10:00:00Z",
-        "captures": [],
-    }
-    assert (
-        inspect_sources(
-            manifest_path,
-            {"schema_version": "fake.inspect.input.v1", "capture_set": captured["data"]},
-        )["outcome"]
-        == "completed"
-    )
-
-
-def test_inspect_rejects_document_tampering(driver_repo: tuple[Path, Path]) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: provider_response(value),
-    )["data"]
-    captured = capture_sources(
-        manifest_path,
-        {
-            "schema_version": "hound.source.capture.input.v1",
-            "discovery": discovery,
-            "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
-        },
-    )["data"]
-    captured["captures"][0]["document"]["text"] = "tampered"
-
-    with pytest.raises(ValueError, match="capture document hash"):
-        inspect_sources(
-            manifest_path,
-            {"schema_version": "fake.inspect.input.v1", "capture_set": captured},
-        )
-
-
-def test_capture_rejects_discovery_lead_tampering(driver_repo: tuple[Path, Path]) -> None:
-    _, manifest_path = driver_repo
-    request = provider_request()
-    discovery = discover_sources(
-        manifest_path,
-        {
-            "requests": [request],
-            "limits": {"max_requests": 1, "max_leads": 2, "max_bytes": 20_000},
-        },
-        provider_execute=lambda value: provider_response(value),
-    )["data"]
-    discovery["leads"][0]["query"] = "tampered"
-
-    with pytest.raises(ValueError, match="leads do not match"):
+    with pytest.raises(EvidenceError, match="duplicates"):
         capture_sources(
             manifest_path,
             {
-                "schema_version": "hound.source.capture.input.v1",
+                "schema_version": "hound.source.capture.input.v2",
                 "discovery": discovery,
-                "captures": [{"url": "https://example.test/one", "mode": "provider-result"}],
+                "owner_input": {"captures": []},
             },
         )
+
+
+def test_capture_rejects_a_lead_reference_absent_from_discovery(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    _configure(repo, _search_data())
+    discovery = discover_sources(manifest_path, _discover_payload())["data"]
+    _configure(repo, _extract_data())
+
+    with pytest.raises(EvidenceError, match="absent from discovery"):
+        capture_sources(
+            manifest_path,
+            {
+                "schema_version": "hound.source.capture.input.v2",
+                "discovery": discovery,
+                "owner_input": {
+                    "captures": [
+                        {
+                            "search_record_id": "0" * 64,
+                            "lead_id": discovery["leads"][0]["lead_id"],
+                            "adapter": "extract",
+                        }
+                    ]
+                },
+            },
+        )
+
+
+def test_inspection_rejects_tampered_extract_records(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    _configure(repo, _search_data())
+    discovery = discover_sources(manifest_path, _discover_payload())["data"]
+    selected = discovery["leads"][0]
+    _configure(repo, _extract_data())
+    captured = capture_sources(
+        manifest_path,
+        {
+            "schema_version": "hound.source.capture.input.v2",
+            "discovery": discovery,
+            "owner_input": {
+                "captures": [
+                    {
+                        "search_record_id": selected["record_id"],
+                        "lead_id": selected["lead_id"],
+                        "adapter": "extract",
+                    }
+                ]
+            },
+        },
+    )["data"]
+    extract_id = captured["captures"][0]["extract_record_id"]
+    (repo / ".hound" / "web" / extract_id / "raw.bin").write_bytes(b"tampered")
+
+    with pytest.raises(EvidenceError, match="record is invalid"):
+        inspect_sources(manifest_path, {"capture_set": captured})
+
+
+def test_source_limits_fail_closed_before_adapter_execution(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    _, manifest_path = driver_repo
+    payload = _discover_payload()
+    payload["limits"]["max_requests"] = 33
+
+    with pytest.raises(EvidenceError, match="max_requests"):
+        discover_sources(manifest_path, payload)

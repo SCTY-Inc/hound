@@ -1,0 +1,27 @@
+{
+  "schema_version": "hound.driver.v1",
+  "id": "firecrawl",
+  "protocol": "hound.protocol.v1",
+  "owner": {
+    "repo": "../.."
+  },
+  "exec": [
+    "python3",
+    "-B",
+    "bin/hound-web-adapter",
+    "firecrawl"
+  ],
+  "capabilities": {
+    "web.extract": {
+      "effect": "read",
+      "gate": "none",
+      "env_allowlist": [
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_ENDPOINT"
+      ]
+    }
+  },
+  "timeouts_seconds": {
+    "web.extract": 60
+  }
+}
