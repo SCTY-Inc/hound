@@ -10,8 +10,10 @@ cd hound
 uv sync --locked
 ```
 
-Hound uses the Python standard library plus the pinned Scrapling extraction
-runtime. Pytest is the development dependency.
+Hound's kernel and first-party adapter bundle use the Python standard library.
+Pytest and PyYAML are development dependencies; PyYAML validates the SearXNG
+settings overlay. SearXNG, Firecrawl, and Camofox remain separate services
+rather than package dependencies.
 
 ## Run the verification gate
 
@@ -30,8 +32,10 @@ uv pip install --python /tmp/hound-smoke/bin/python dist/*.whl
 /tmp/hound-smoke/bin/hound --help
 ```
 
-The wheel and source distribution must contain every module beneath
-`src/hound_cli`, including modules imported by the console entry point.
+The wheel and source distribution must contain the kernel beneath
+`src/hound_cli` and the provider implementations beneath
+`src/hound_web_adapters`. Guarded-write kernel identity intentionally excludes
+the latter.
 
 ## Change a protocol boundary
 
@@ -40,6 +44,6 @@ The wheel and source distribution must contain every module beneath
 3. Update [Protocol v1](protocol.md) and any affected example.
 4. Run the full verification gate and artifact smoke test.
 
-Do not silently widen provider fields, driver environment access, write scopes,
+Do not silently widen adapter fields, driver environment access, write scopes,
 or mutation permissions. New trust boundaries require explicit documentation
 and negative tests.

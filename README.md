@@ -5,10 +5,11 @@
 **Make research automation prove what it read, what it plans to change, and what
 it changed.**
 
-Hound is a CLI execution layer for research agents and data pipelines that read
-from the web and update a Git repository. It isolates provider credentials,
-stores source material with provenance, requires deterministic plans before
-writes, rejects drift after review, and leaves a verifiable run record.
+Hound is a CLI execution layer for research agents and data pipelines that
+search, extract, interact with the web, and update Git repositories. It runs
+replaceable adapters through one constrained protocol, stores source material
+with provenance and lineage, requires deterministic plans before writes, rejects
+drift after review, and leaves verifiable records.
 
 ## The problem
 
@@ -39,12 +40,13 @@ Hound owns the risky mechanics around that driver:
 ```text
 request
   → owner driver defines the operation
-  → Hound discovers and captures sources
+  → Hound searches for leads and records provider responses
+  → selected URLs are extracted; browser interaction is explicit and last
   → owner driver proposes repository changes
   → Hound creates a content-bound plan
   → a person approves that exact plan when required
   → Hound executes, checks scope, and records the run
-  → anyone with the records can run hound run verify
+  → anyone with the records can run hound verify
 ```
 
 The manifest between them declares literal driver commands, capabilities,
@@ -79,8 +81,9 @@ uv sync --locked
 uv run hound driver check \
   --driver examples/status/hound-driver.json
 
-uv run hound corpus status \
+uv run hound invoke \
   --driver examples/status/hound-driver.json \
+  --operation corpus.status \
   --input examples/status/request.json
 ```
 
@@ -103,61 +106,100 @@ state, expected writes, and declared scopes.
 
 ```bash
 # 1. Create the plan. Nothing is written to the owner repository.
-hound corpus apply \
+hound plan \
   --driver research/hound-driver.json \
+  --operation corpus.apply \
   --input research/request.json \
   --as-of 2026-07-21 \
-  --plan-out /tmp/hound-plan.json
+  --output /tmp/hound-plan.json
 
 # 2. Review that file, then approve its exact plan ID and write scope.
-hound approval create \
+hound approve \
   --plan /tmp/hound-plan.json \
   --reviewer operator@example.com \
   --output /tmp/hound-approval.json
 
 # 3. Execute. Hound replans first and rejects any drift.
-hound corpus apply \
+hound execute \
   --driver research/hound-driver.json \
-  --execute /tmp/hound-plan.json \
+  --plan /tmp/hound-plan.json \
   --approval /tmp/hound-approval.json \
   | tee /tmp/hound-result.json
 
 # 4. Independently verify the immutable run record.
-hound run verify "$(jq -r .run_dir /tmp/hound-result.json)"
+hound verify "$(jq -r .run_dir /tmp/hound-result.json)"
 ```
 
-Read capabilities execute directly. Standard source drivers can also use the
-composed `source discover → capture → inspect` lifecycle, which keeps search
-leads separate from immutable, verified source material.
+Read capabilities execute directly. Existing owner drivers may use the composed
+source lifecycle:
 
-## Built-in source packs
+```text
+source discover → source capture → source inspect
+```
 
-Hound ships two credential-isolated source packs behind one provider contract:
+`discover` executes only owner-declared search adapters and returns immutable
+search-record/lead references. `capture` extracts exact selected references
+through an explicit adapter. `inspect` verifies every referenced search and
+extract record before owner interpretation. Drivers opt in once with a
+`hound.source.v2` adapter map. There is no provider registry or hidden fallback.
 
-- **Web:** Exa search and contents, Firecrawl search and passive scrape, and
-  origin-page capture with direct fetching plus Scrapling extraction before a
-  Firecrawl fallback.
-- **Scholarly:** arXiv Atom API search without a credential. Results are marked
-  as academic preprints so the owner driver can apply its own evidence policy.
+The lower-level web adapter surface remains explicit:
 
-Drivers opt into kernel composition by declaring `"composition":
-"hound.source.v1"` on all three source capabilities. The owner driver still
-chooses queries, capture modes, and interpretation; Hound owns transport,
-budgets, immutable capture storage, and verification.
+```text
+search → extract → interact only when required
+```
+
+## Web adapters
+
+Hound's first adapters use the same reviewed driver protocol as external ones:
+
+- **Search — SearXNG:** federated candidate discovery with explicit engine or
+  category routing, language, time range, safe search, and bounded paging.
+  Suggestions, corrections, configuration identity, and unresponsive engines
+  remain visible. Results are leads, never evidence.
+- **Extract — Firecrawl:** known-URL markdown and metadata. One-page scrape is
+  normal; a crawl requires an explicit page cap no greater than 20.
+- **Interact — Camofox:** anonymous disposable browser actions for JavaScript or
+  page interaction that static extraction cannot handle.
+
+Each command receives an explicit adapter manifest. Hound never silently chooses
+or escalates providers. Exact provider responses, normalized output, adapter Git
+identity, requests, hashes, and failures are stored in immutable web run records.
+A transformed markdown document or browser snapshot is labeled
+`provider-derived`; it is not misrepresented as raw origin bytes. The
+[upstream SearXNG overlay](examples/searxng/README.md) demonstrates first-class
+government discovery through the Federal Register API without maintaining a
+fork.
 
 ## What Hound enforces
 
 - **Evidence boundary:** discovery results are marked as leads. Verified captures
   bind raw bytes to source URL, provider, retrieval time, media type, and hashes.
-- **Credential boundary:** Exa and Firecrawl credentials stay inside Hound's
-  transport. Owner drivers receive only explicitly allowlisted environment
-  variables.
+- **Credential boundary:** adapters receive only manifest-allowlisted
+  environment variables, and Hound rejects credential material in their output.
 - **Review boundary:** approvals bind to one deterministic plan and write-scope
   hash. Repository or environment drift invalidates the plan.
 - **Mutation boundary:** check, read, and planning calls fail if the driver
   changes the owner repository. Executions detect out-of-scope writes.
 - **Audit boundary:** each execution creates a strict, create-only run record
-  that `hound run verify` can check independently.
+  that `hound verify` can check independently.
+
+## What Hound does not build
+
+- No giant browse tool: call `search`, `extract`, and `interact` explicitly.
+- No automatic `search → extract → interact` escalation: compose those calls in
+  the owner driver, source lifecycle, or shell.
+- No scheduler, database, valuation logic, or notifier: use files, SQLite, cron,
+  and the destination's existing delivery tool.
+- No provider lifecycle manager: run pinned services with Docker, systemd, or
+  tmux.
+- No MCP in core: a harness may wrap the three CLI verbs without privileged
+  access.
+- No authenticated browser state in the first adapters: Camofox sessions are
+  anonymous and disposable.
+- No prompt-injection or network-sandbox claim Hound cannot enforce: outputs are
+  labeled untrusted; model context and network isolation belong to their actual
+  owning layers.
 
 ## Trust model
 
@@ -167,28 +209,34 @@ out-of-scope mutation, but it does not automatically roll the repository back.
 Linux provides the strongest detached-process containment.
 
 Read the [security model](docs/security-model.md) before enabling writes or
-provider credentials.
+adapter credentials.
 
 ## Commands
 
 ```text
 hound driver check
-hound provider run
-hound capture store|verify
+hound invoke
+hound plan
+hound approve
+hound execute
+hound verify
 hound source discover|capture|inspect
-hound corpus status|propose|apply|project
-hound edition build|publish|replay
-hound approval create
-hound run verify
+hound search
+hound extract
+hound interact
+hound capture store|verify
 ```
 
 ## Documentation
 
+- [Vision](VISION.md)
 - [Getting started](docs/getting-started.md)
 - [Protocol v1 reference](docs/protocol.md)
 - [Security model](docs/security-model.md)
 - [Local development](docs/development.md)
 - [Security policy](SECURITY.md)
+- [SearXNG discovery overlay](examples/searxng/README.md)
+- [Family SUV watch example](examples/family_suv_watch/README.md)
 
 Hound is pre-1.0. Wire formats are versioned; the Python package API is not yet
 stable. The distribution is `evidence-hound`, and the installed command is
