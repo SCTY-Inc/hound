@@ -16,7 +16,6 @@
     }
   },
   "run_root": ".hound/runs",
-  "capture_root": ".hound/captures",
   "timeouts_seconds": {
     "default": 30
   },

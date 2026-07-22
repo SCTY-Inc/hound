@@ -1,0 +1,20 @@
+{
+  "queries": [
+    "Toyota Grand Highlander Hybrid used dealer CPO Long Island NY",
+    "Honda Pilot AWD used dealer CPO Long Island NY",
+    "Lexus TX AWD used dealer CPO Long Island NY",
+    "Lexus GX 460 used dealer Long Island NY"
+  ],
+  "models": [
+    "Toyota Grand Highlander Hybrid",
+    "Honda Pilot",
+    "Lexus TX",
+    "Lexus GX 460"
+  ],
+  "search_adapter": "../../adapters/searxng/hound-driver.json",
+  "extract_adapter": "../../adapters/firecrawl/hound-driver.json",
+  "record_root": ".hound/web",
+  "database": ".hound/listings.sqlite3",
+  "alerts": ".hound/discord-alerts.json",
+  "review_queue": ".hound/browser-review.json"
+}

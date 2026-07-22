@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+
+ROOT = Path(__file__).parents[1]
+SETTINGS = ROOT / "examples" / "searxng" / "settings.yml"
+
+
+def test_overlay_uses_upstream_defaults_and_enables_json() -> None:
+    settings = yaml.safe_load(SETTINGS.read_text(encoding="utf-8"))
+
+    assert settings["use_default_settings"] is True
+    assert "json" in settings["search"]["formats"]
+
+
+def test_federal_register_is_a_native_government_search_engine() -> None:
+    settings = yaml.safe_load(SETTINGS.read_text(encoding="utf-8"))
+    engines = {engine["name"]: engine for engine in settings["engines"]}
+    engine = engines["federal register"]
+
+    assert engine == {
+        "name": "federal register",
+        "engine": "json_engine",
+        "shortcut": "fr",
+        "categories": ["government", "news"],
+        "disabled": False,
+        "paging": True,
+        "search_url": (
+            "https://www.federalregister.gov/api/v1/documents.json"
+            "?per_page=20&page={pageno}&conditions%5Bterm%5D={query}"
+        ),
+        "results_query": "results",
+        "url_query": "html_url",
+        "title_query": "title",
+        "content_query": "excerpts",
+        "content_html_to_text": True,
+        "timeout": 10,
+    }

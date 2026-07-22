@@ -1,0 +1,23 @@
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: federal register
+    engine: json_engine
+    shortcut: fr
+    categories:
+      - government
+      - news
+    disabled: false
+    paging: true
+    search_url: "https://www.federalregister.gov/api/v1/documents.json?per_page=20&page={pageno}&conditions%5Bterm%5D={query}"
+    results_query: results
+    url_query: html_url
+    title_query: title
+    content_query: excerpts
+    content_html_to_text: true
+    timeout: 10
