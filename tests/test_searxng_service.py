@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import yaml
@@ -33,7 +34,11 @@ def test_operational_overlay_enables_pulse_routes_and_json() -> None:
 
     assert settings["use_default_settings"] is True
     assert "json" in settings["search"]["formats"]
-    assert engines["arxiv"]["disabled"] is False
+    assert engines["arxiv"] == {
+        "name": "arxiv",
+        "disabled": False,
+        "timeout": 15,
+    }
     assert engines["exa publications"] == {
         "name": "exa publications",
         "engine": "exa",
@@ -43,4 +48,29 @@ def test_operational_overlay_enables_pulse_routes_and_json() -> None:
         "results_per_page": 16,
         "timeout": 15,
     }
+    assert engines["exa web"] == {
+        "name": "exa web",
+        "engine": "exa",
+        "shortcut": "exaw",
+        "categories": ["general", "web"],
+        "disabled": False,
+        "search_category": "",
+        "results_per_page": 16,
+        "timeout": 15,
+    }
     assert engines["federal register"]["disabled"] is False
+
+
+def test_searxng_adapter_excludes_only_build_outputs_from_owner_snapshots() -> None:
+    manifest = json.loads(
+        (ROOT / "adapters/searxng/hound-driver.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["ignored_snapshot_excludes"] == [
+        ".pytest_cache",
+        "dist",
+        "examples/__pycache__",
+        "examples/family_suv_watch/__pycache__",
+        "examples/searxng/__pycache__",
+        "tests/__pycache__",
+    ]

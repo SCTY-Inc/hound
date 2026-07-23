@@ -85,6 +85,27 @@ def test_exa_engine_builds_bounded_publication_request(
     assert params["json"]["startPublishedDate"].endswith("Z")
 
 
+def test_exa_engine_builds_uncategorized_web_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "test-secret")
+    engine = load_engine(monkeypatch)
+    engine.init({"search_category": ""})
+    params: dict[str, Any] = {
+        "headers": {},
+        "pageno": 1,
+        "time_range": "year",
+    }
+
+    engine.request("new state caregiver benefit", params)
+
+    assert params["json"]["query"] == "new state caregiver benefit"
+    assert "category" not in params["json"]
+    assert params["json"]["type"] == "auto"
+    assert params["json"]["numResults"] == 16
+    assert params["json"]["startPublishedDate"].endswith("Z")
+
+
 def test_exa_engine_normalizes_publication_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

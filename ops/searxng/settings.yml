@@ -11,6 +11,7 @@ search:
 engines:
   - name: arxiv
     disabled: false
+    timeout: 15
   - name: exa publications
     engine: exa
     shortcut: exap
@@ -18,6 +19,16 @@ engines:
       - science
       - scientific publications
     disabled: false
+    results_per_page: 16
+    timeout: 15
+  - name: exa web
+    engine: exa
+    shortcut: exaw
+    categories:
+      - general
+      - web
+    disabled: false
+    search_category: ""
     results_per_page: 16
     timeout: 15
   - name: federal register

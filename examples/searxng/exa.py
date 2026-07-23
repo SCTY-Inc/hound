@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""SearXNG engine for Exa's publication-specific search index."""
+"""SearXNG engine for Exa's bounded publication or web search."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ time_range_support = True
 api_url = "https://api.exa.ai/search"
 api_key = ""
 results_per_page = 16
+search_category = "publication"
 
 _TIME_RANGE_DAYS = {
     "day": 1,
@@ -42,12 +43,16 @@ _TIME_RANGE_DAYS = {
 }
 
 
-def init(_engine_settings: dict[str, t.Any]) -> None:
+def init(engine_settings: dict[str, t.Any]) -> None:
     """Load the service-owned credential without putting it in settings.yml."""
-    global api_key  # pylint: disable=global-statement
+    global api_key, search_category  # pylint: disable=global-statement
     api_key = os.environ.get("EXA_API_KEY", "").strip()
     if not api_key:
         raise SearxEngineAPIException("EXA_API_KEY is required")
+    configured_category = engine_settings.get("search_category", search_category)
+    if not isinstance(configured_category, str):
+        raise SearxEngineAPIException("Exa search_category must be a string")
+    search_category = configured_category.strip()
 
 
 def _published_after(time_range: str) -> str | None:
@@ -63,7 +68,6 @@ def request(query: str, params: "OnlineParams") -> None:
     body: dict[str, t.Any] = {
         "query": query,
         "type": "auto",
-        "category": "publication",
         "numResults": max(1, min(results_per_page, 100)),
         "contents": {
             "highlights": {
@@ -72,6 +76,8 @@ def request(query: str, params: "OnlineParams") -> None:
             }
         },
     }
+    if search_category:
+        body["category"] = search_category
     published_after = _published_after(params.get("time_range") or "")
     if published_after:
         body["startPublishedDate"] = published_after

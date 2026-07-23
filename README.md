@@ -156,7 +156,8 @@ Hound's first adapters use the same reviewed driver protocol as external ones:
 - **Search — SearXNG:** federated candidate discovery with explicit engine or
   category routing, language, time range, safe search, and bounded paging.
   Suggestions, corrections, configuration identity, and unresponsive engines
-  remain visible. Results are leads, never evidence.
+  remain visible. An explicit engine request fails if every requested engine is
+  unresponsive and no leads were returned. Results are leads, never evidence.
 - **Extract — Firecrawl:** known-URL markdown and metadata. One-page scrape is
   normal; a crawl requires an explicit page cap no greater than 20.
 - **Interact — Camofox:** anonymous disposable browser actions for JavaScript or
@@ -168,8 +169,10 @@ identity, requests, hashes, and failures are stored in immutable web run records
 A transformed markdown document or browser snapshot is labeled
 `provider-derived`; it is not misrepresented as raw origin bytes. The
 [upstream SearXNG overlay](examples/searxng/README.md) demonstrates first-class
-government discovery through the Federal Register API without maintaining a
-fork.
+government discovery through the Federal Register API and credentialed
+general-web discovery through Exa without maintaining a fork. The dated
+[SearXNG source map](docs/searxng-sources.md) records tested engine behavior,
+preferred routes, degraded alternatives, and the available endpoint surface.
 
 ## What Hound enforces
 

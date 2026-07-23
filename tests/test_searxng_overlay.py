@@ -54,4 +54,14 @@ def test_exa_is_a_credential_free_publications_engine_definition() -> None:
         "results_per_page": 16,
         "timeout": 15,
     }
+    assert engines["exa web"] == {
+        "name": "exa web",
+        "engine": "exa",
+        "shortcut": "exaw",
+        "categories": ["general", "web"],
+        "disabled": False,
+        "search_category": "",
+        "results_per_page": 16,
+        "timeout": 15,
+    }
     assert "EXA_API_KEY" not in SETTINGS.read_text(encoding="utf-8")
