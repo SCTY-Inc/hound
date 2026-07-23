@@ -39,3 +39,19 @@ def test_federal_register_is_a_native_government_search_engine() -> None:
         "content_html_to_text": True,
         "timeout": 10,
     }
+
+
+def test_exa_is_a_credential_free_publications_engine_definition() -> None:
+    settings = yaml.safe_load(SETTINGS.read_text(encoding="utf-8"))
+    engines = {engine["name"]: engine for engine in settings["engines"]}
+
+    assert engines["exa publications"] == {
+        "name": "exa publications",
+        "engine": "exa",
+        "shortcut": "exap",
+        "categories": ["science", "scientific publications"],
+        "disabled": False,
+        "results_per_page": 16,
+        "timeout": 15,
+    }
+    assert "EXA_API_KEY" not in SETTINGS.read_text(encoding="utf-8")

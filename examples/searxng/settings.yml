@@ -6,6 +6,15 @@ search:
     - json
 
 engines:
+  - name: exa publications
+    engine: exa
+    shortcut: exap
+    categories:
+      - science
+      - scientific publications
+    disabled: false
+    results_per_page: 16
+    timeout: 15
   - name: federal register
     engine: json_engine
     shortcut: fr

@@ -16,6 +16,13 @@ def test_searxng_service_is_pinned_and_loopback_only() -> None:
     assert 'openssl rand -hex 32' in service
     assert '--env SEARXNG_SECRET ' in service
     assert '--env SEARXNG_SECRET=' not in service
+    assert "EnvironmentFile=%h/.env" in service
+    assert "--env EXA_API_KEY " in service
+    assert "--env EXA_API_KEY=" not in service
+    assert (
+        "--volume %h/.config/hound/searxng-exa.py:"
+        "/usr/local/searxng/searx/engines/exa.py:ro"
+    ) in service
 
 
 def test_operational_overlay_enables_pulse_routes_and_json() -> None:
@@ -27,4 +34,13 @@ def test_operational_overlay_enables_pulse_routes_and_json() -> None:
     assert settings["use_default_settings"] is True
     assert "json" in settings["search"]["formats"]
     assert engines["arxiv"]["disabled"] is False
+    assert engines["exa publications"] == {
+        "name": "exa publications",
+        "engine": "exa",
+        "shortcut": "exap",
+        "categories": ["science", "scientific publications"],
+        "disabled": False,
+        "results_per_page": 16,
+        "timeout": 15,
+    }
     assert engines["federal register"]["disabled"] is False
