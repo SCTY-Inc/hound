@@ -16,6 +16,21 @@ def test_overlay_uses_upstream_defaults_and_enables_json() -> None:
     assert "json" in settings["search"]["formats"]
 
 
+def test_example_overlay_carries_the_reviewed_arxiv_timeout() -> None:
+    """The 2026-07-23 pressure test found arXiv failing on the upstream three
+    second timeout. The operational overlay raised it to fifteen; the example an
+    operator copies must not ship the known-broken value."""
+    example = yaml.safe_load(SETTINGS.read_text(encoding="utf-8"))
+    operational = yaml.safe_load(
+        (ROOT / "ops" / "searxng" / "settings.yml").read_text(encoding="utf-8")
+    )
+    engines = {engine["name"]: engine for engine in example["engines"]}
+    reviewed = {engine["name"]: engine for engine in operational["engines"]}
+
+    assert engines["arxiv"] == {"name": "arxiv", "disabled": False, "timeout": 15}
+    assert engines["arxiv"] == reviewed["arxiv"]
+
+
 def test_federal_register_is_a_native_government_search_engine() -> None:
     settings = yaml.safe_load(SETTINGS.read_text(encoding="utf-8"))
     engines = {engine["name"]: engine for engine in settings["engines"]}

@@ -6,6 +6,9 @@ search:
     - json
 
 engines:
+  - name: arxiv
+    disabled: false
+    timeout: 15
   - name: exa publications
     engine: exa
     shortcut: exap
