@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hound_cli import cli
 
 
@@ -268,3 +270,39 @@ def test_invalid_json_returns_a_machine_readable_error(
     assert code == 2
     assert stdout == ""
     assert json.loads(stderr)["schema_version"] == "hound.error.v1"
+
+
+def test_installed_tool_matches_this_source_tree() -> None:
+    """The `hound` on PATH is an installed copy, not this checkout.
+
+    Consumers invoke the installed binary -- `pulse-daily` calls
+    /home/deploy/.local/bin/hound -- so editing src/ changes nothing until
+    `uv tool install --force .` runs. On 2026-07-26 a snapshot fix measured at
+    20.5s -> 2.5s was committed, verified against this tree, and had no effect on
+    the lane for a full run because the installed copy was three days stale.
+    Silent divergence between source and runtime is the defect; this makes it
+    loud. Skips when no installed copy exists, so a fresh clone still passes.
+    """
+    import hashlib
+    import shutil
+
+    binary = shutil.which("hound")
+    if binary is None:
+        pytest.skip("no installed hound on PATH")
+
+    candidates = list(
+        Path("/home/deploy/.local/share/uv/tools/evidence-hound/lib").glob(
+            "python*/site-packages/hound_cli/runtime.py"
+        )
+    )
+    if not candidates:
+        pytest.skip("installed layout not recognized")
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    source = Path(__file__).parents[1] / "src" / "hound_cli" / "runtime.py"
+    assert digest(candidates[0]) == digest(source), (
+        "installed hound differs from this source tree -- "
+        "run `uv tool install --force .` or consumers keep running the old code"
+    )

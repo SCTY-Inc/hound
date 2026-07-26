@@ -20,6 +20,14 @@
       ]
     }
   },
+  "ignored_snapshot_excludes": [
+    ".pytest_cache",
+    "dist",
+    "examples/__pycache__",
+    "examples/family_suv_watch/__pycache__",
+    "examples/searxng/__pycache__",
+    "tests/__pycache__"
+  ],
   "timeouts_seconds": {
     "web.search": 30
   }
