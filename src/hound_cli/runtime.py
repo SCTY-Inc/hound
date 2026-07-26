@@ -391,11 +391,18 @@ def snapshot_repo(
     root = _git_root(repo)
     snapshot: dict[str, str] = {}
     paths = set(_listed_paths(root, "--cached", "--others", "--exclude-standard"))
-    excluded = tuple(PurePosixPath(value.replace("\\", "/")) for value in ignored_snapshot_excludes)
+    # Prefix-match on the raw string rather than building a PurePosixPath per
+    # entry and walking its .parents. This runs once per ignored path, and a
+    # working tree carrying node_modules and virtualenvs has tens of thousands:
+    # measured on gc-web, 65,550 ignored paths against 24 excludes cost 20.9s
+    # via .parents and 0.01s here, for identical output. Two snapshots bracket
+    # every adapter call, so that difference is ~42s per captured source.
+    exact = {_normalized_exclude(value) for value in ignored_snapshot_excludes}
+    excluded = tuple(f"{value}/" for value in exact)
     paths.update(
         relative
         for relative in _listed_paths(root, "--others", "--ignored", "--exclude-standard")
-        if not _path_is_within_any(PurePosixPath(relative), excluded)
+        if relative not in exact and not relative.startswith(excluded)
     )
     for relative in sorted(paths):
         path = root / relative
@@ -406,6 +413,11 @@ def snapshot_repo(
     snapshot[".git/hound-integrity-state"] = _git_integrity_state(root)
     snapshot[".git/hound-sensitive-state"] = _git_sensitive_state(root)
     return snapshot
+
+
+def _normalized_exclude(value: str) -> str:
+    """An exclude as a posix path string, without a trailing separator."""
+    return value.replace("\\", "/").rstrip("/")
 
 
 def _path_is_within_any(path: PurePosixPath, prefixes: Iterable[PurePosixPath]) -> bool:

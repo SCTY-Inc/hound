@@ -1040,3 +1040,28 @@ def test_write_json_atomic_replaces_the_complete_document(tmp_path: Path) -> Non
         "version": 2,
     }
     assert [entry.name for entry in path.parent.iterdir()] == ["latest.json"]
+
+
+def test_snapshot_excludes_match_path_semantics_not_string_prefixes(tmp_path: Path) -> None:
+    """Prefix matching must not swallow a sibling whose name merely starts the same.
+
+    snapshot_repo filters ignored paths by string prefix because building a
+    PurePosixPath per entry and walking its .parents cost 20.9s against 0.01s on
+    a real working tree (65,550 ignored paths, 24 excludes) -- and two snapshots
+    bracket every adapter call. The speed is only safe if it still means "within
+    this directory", so `.venv-old/` must survive an exclude of `.venv`.
+    """
+    repo = _repo(tmp_path)
+    (repo / ".gitignore").write_text(".venv\n.venv-old\ncache\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore")
+
+    for directory in (".venv", ".venv-old", "cache"):
+        (repo / directory).mkdir()
+        (repo / directory / "f.txt").write_text(directory, encoding="utf-8")
+
+    snapshot = snapshot_repo(repo, ignored_snapshot_excludes=[".venv", "cache/"])
+
+    assert ".venv/f.txt" not in snapshot, "excluded directory must be skipped"
+    assert "cache/f.txt" not in snapshot, "a trailing separator must not change meaning"
+    assert ".venv-old/f.txt" in snapshot, ".venv must not swallow the .venv-old sibling"
