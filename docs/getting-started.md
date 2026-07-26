@@ -79,7 +79,10 @@ Use either `engines` or `categories`. SearXNG options also support `language`,
 bounded `max_pages` (`1` through `5`). Pass routing through `options`; the
 adapter rejects SearXNG bang, language-prefix, and timeout syntax hidden inside
 the query. Hound checks `/config` before search so a missing or disabled route
-fails visibly.
+fails visibly. A search that returns no leads while any requested engine was
+unresponsive also fails, so a broken route is never reported as an empty
+result. Engine failures alongside surviving leads stay a success and are
+reported at `routing.unresponsive_engines` for the caller to judge.
 
 The command returns compact leads and writes the exact adapter response plus its
 request, adapter identity, hashes, and normalized output under `.hound/web/`.

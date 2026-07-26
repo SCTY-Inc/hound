@@ -283,6 +283,9 @@ def search(
             category = item.get("category")
             if isinstance(category, str):
                 metadata["category"] = category
+            published_date = item.get("publishedDate")
+            if isinstance(published_date, str) and published_date:
+                metadata["publishedDate"] = published_date[:200]
             content = item.get("content")
             if isinstance(content, str) and content:
                 metadata["snippet"] = content[:4_000]
@@ -303,6 +306,25 @@ def search(
                 break
         if len(leads_by_url) >= search_input["limit"] or not results:
             break
+
+    if not leads_by_url:
+        # A category or default route requests every engine carrying it, so any
+        # failure is implicated; an explicit route is implicated only by its own
+        # engines. Either way, zero leads plus a failure is indistinguishable
+        # from zero matches, so refuse to report it as an empty success.
+        requested = {engine.casefold() for engine in selected_engines}
+        implicated = [
+            failure["engine"]
+            for failure in unresponsive
+            if not requested or failure["engine"].casefold() in requested
+        ]
+        if implicated:
+            raise _provenance_error(
+                "SearXNG returned no leads while requested engines were unresponsive: "
+                f"{', '.join(implicated)}",
+                config_exchange,
+                pages,
+            )
 
     raw_body = _raw_envelope(config_exchange, pages)
     return {

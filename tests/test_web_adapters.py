@@ -24,6 +24,7 @@ def test_searxng_normalizes_bounded_candidates_with_engine_attribution() -> None
                     "engines": ["brave", "duckduckgo"],
                     "score": 8.5,
                     "category": "general",
+                    "publishedDate": "2026-07-20T09:00:00Z",
                 }
             ],
             "unresponsive_engines": [["google", "timeout"]],
@@ -95,11 +96,127 @@ def test_searxng_normalizes_bounded_candidates_with_engine_attribution() -> None
             "metadata": {
                 "category": "general",
                 "engines": ["brave", "duckduckgo"],
+                "publishedDate": "2026-07-20T09:00:00Z",
                 "rank": 1,
                 "score": 8.5,
                 "snippet": "One-owner SUV",
             },
         }
+    ]
+
+
+_ROUTING_CONFIG = json.dumps(
+    {
+        "categories": ["general", "news"],
+        "engines": [
+            {"categories": ["general", "news"], "enabled": True, "name": "brave"},
+            {"categories": ["general", "news"], "enabled": True, "name": "google cse"},
+        ],
+    },
+    separators=(",", ":"),
+).encode()
+
+
+def test_searxng_fails_when_any_requested_engine_is_unresponsive_without_leads() -> None:
+    failed_page = json.dumps(
+        {
+            "results": [],
+            "unresponsive_engines": [["brave", "too many requests"]],
+        },
+        separators=(",", ":"),
+    ).encode()
+    responses = iter([(200, _ROUTING_CONFIG), (200, failed_page)])
+
+    with pytest.raises(AdapterError, match="no leads while requested engines") as caught:
+        searxng.search(
+            {
+                "query": "caregiver support",
+                "options": {"engines": ["brave", "google cse"]},
+            },
+            env={"SEARXNG_ENDPOINT": "http://127.0.0.1:8080"},
+            transport=lambda **_: next(responses),
+        )
+
+    assert "brave" in str(caught.value)
+    raw = json.loads(caught.value.raw)
+    assert base64.b64decode(raw["config"]["body_base64"]) == _ROUTING_CONFIG
+    assert base64.b64decode(raw["pages"][0]["body_base64"]) == failed_page
+    assert caught.value.requests == 2
+
+
+def test_searxng_fails_when_a_category_route_returns_nothing_after_failures() -> None:
+    failed_page = json.dumps(
+        {
+            "results": [],
+            "unresponsive_engines": [["brave", "timeout"]],
+        },
+        separators=(",", ":"),
+    ).encode()
+    responses = iter([(200, _ROUTING_CONFIG), (200, failed_page)])
+
+    with pytest.raises(AdapterError, match="no leads while requested engines") as caught:
+        searxng.search(
+            {
+                "query": "caregiver support",
+                "options": {"categories": ["news"]},
+            },
+            env={"SEARXNG_ENDPOINT": "http://127.0.0.1:8080"},
+            transport=lambda **_: next(responses),
+        )
+
+    assert base64.b64decode(json.loads(caught.value.raw)["pages"][0]["body_base64"]) == failed_page
+
+
+def test_searxng_ignores_failures_from_engines_the_route_did_not_request() -> None:
+    failed_page = json.dumps(
+        {
+            "results": [],
+            "unresponsive_engines": [["google cse", "timeout"]],
+        },
+        separators=(",", ":"),
+    ).encode()
+    responses = iter([(200, _ROUTING_CONFIG), (200, failed_page)])
+
+    data = searxng.search(
+        {"query": "caregiver support", "options": {"engines": ["brave"]}},
+        env={"SEARXNG_ENDPOINT": "http://127.0.0.1:8080"},
+        transport=lambda **_: next(responses),
+    )
+
+    assert data["output"]["leads"] == []
+    assert data["output"]["routing"]["unresponsive_engines"] == [
+        {"engine": "google cse", "error": "timeout"}
+    ]
+
+
+def test_searxng_keeps_partial_engine_failure_visible_when_leads_survive() -> None:
+    partial_page = json.dumps(
+        {
+            "results": [
+                {
+                    "url": "https://example.test/caregiver",
+                    "title": "Caregiver support",
+                    "engines": ["google cse"],
+                }
+            ],
+            "unresponsive_engines": [["brave", "too many requests"]],
+        },
+        separators=(",", ":"),
+    ).encode()
+    responses = iter([(200, _ROUTING_CONFIG), (200, partial_page)])
+
+    data = searxng.search(
+        {
+            "query": "caregiver support",
+            "options": {"engines": ["brave", "google cse"]},
+        },
+        env={"SEARXNG_ENDPOINT": "http://127.0.0.1:8080"},
+        transport=lambda **_: next(responses),
+    )
+
+    assert [lead["url"] for lead in data["output"]["leads"]] == ["https://example.test/caregiver"]
+    assert data["output"]["routing"]["unresponsive_engines"] == [
+        {"engine": "brave", "error": "too many requests"}
     ]
 
 
