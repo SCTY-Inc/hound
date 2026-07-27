@@ -20,15 +20,18 @@ promise automatic rollback.
 
 A write plan binds the Hound version and source hash, canonical manifest,
 operation input and cutoff date, allowlisted environment digest, Git HEAD and
-working state, expected writes, and declared scopes. Execution repeats planning
-and rejects any drift. Human approval, when required, is bound to the exact plan
-ID and write-scope hash.
+working state, exact expected file bytes and POSIX modes, and declared scopes.
+Execution repeats planning and rejects any drift. Human approval, when required,
+is bound to the exact plan ID and write-scope hash. Legacy drivers may still use
+path-only `expected_writes`, which provides weaker postcondition evidence.
 
 Read, check, and planning calls snapshot the owner repository before and after
-the driver invocation and fail if the driver mutates it. Execution records the
-manifest, plan, request, approval, result, and strict hash index in a create-only
-run directory. `hound verify` independently checks those records and their
-cross-document bindings.
+the driver invocation and fail if the driver mutates it. `hound invoke` returns
+a self-hashed receipt binding the request, response, manifest, repository,
+environment, and kernel; a saved invocation JSON is independently checkable
+with `hound verify`. Execution records the manifest, plan, request, approval,
+result, and strict hash index in a create-only run directory. `hound verify`
+also checks those records and their cross-document bindings.
 
 Approval files, capture IDs, and run indexes are local workflow witnesses, not
 digital signatures. An attacker who can coherently rewrite all local records can

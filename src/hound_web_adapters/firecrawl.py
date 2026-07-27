@@ -12,8 +12,8 @@ from typing import Any
 from urllib.parse import quote
 
 from hound_cli.contracts import canonical_json
-from hound_cli.evidence import EvidenceError, validate_public_url
-from hound_cli.web import ADAPTER_SCHEMA, EXTRACT_SCHEMA, validate_web_input
+from hound_research.evidence import EvidenceError, validate_public_url
+from hound_research.web import ADAPTER_SCHEMA, EXTRACT_SCHEMA, validate_web_input
 from ._http import AdapterError, Transport, json_object, request, service_url
 
 

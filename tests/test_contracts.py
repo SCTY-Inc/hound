@@ -52,17 +52,12 @@ def test_validate_manifest_accepts_complete_manifest():
     assert validate_manifest(value) == value
 
 
-def test_validate_manifest_accepts_complete_source_composition():
+def test_validate_manifest_accepts_opaque_extensions():
     value = manifest(
-        capabilities={
-            operation: {"effect": "read", "gate": "none"}
-            for operation in ("source.discover", "source.capture", "source.inspect")
-        },
-        source={
-            "schema_version": "hound.source.v2",
-            "adapters": {
-                "search": "../adapters/search.json",
-                "extract": "../adapters/extract.json",
+        extensions={
+            "example": {
+                "schema_version": "example.v1",
+                "settings": {"policy": "owner-defined"},
             },
         },
     )
@@ -70,7 +65,7 @@ def test_validate_manifest_accepts_complete_source_composition():
     assert validate_manifest(value) == value
 
 
-def test_validate_manifest_rejects_partial_source_composition():
+def test_validate_manifest_keeps_legacy_source_metadata_opaque():
     value = manifest(
         capabilities={"source.discover": {"effect": "read", "gate": "none"}},
         source={
@@ -79,8 +74,7 @@ def test_validate_manifest_rejects_partial_source_composition():
         },
     )
 
-    with pytest.raises(ContractError, match="requires discover, capture, and inspect"):
-        validate_manifest(value)
+    assert validate_manifest(value) == value
 
 
 @pytest.mark.parametrize("locator", [".", "..", "../..", "../owner-repo"])
@@ -221,7 +215,7 @@ def test_load_manifest_wraps_read_errors_as_contract_errors(tmp_path):
 
 @pytest.mark.parametrize(
     "outcome",
-    ["planned", "completed", "no-change", "no-edition", "held", "failed"],
+    ["planned", "completed", "no-change", "no-op", "no-edition", "held", "failed"],
 )
 def test_validate_response_accepts_every_outcome(outcome):
     value = response(

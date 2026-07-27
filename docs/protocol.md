@@ -18,8 +18,11 @@ compact separators, UTF-8, finite numbers, and SHA-256 hashes.
 - `capabilities`: operation keys mapped to `effect: read|write` and
   `gate: none|human`; each capability may add an `env_allowlist`.
 
-Optional fields are `run_root`, `source`, `write_scopes`,
-`ignored_snapshot_excludes`, `timeouts_seconds`, and `env_allowlist`. The top-
+Optional fields are `run_root`, `extensions`, `write_scopes`,
+`ignored_snapshot_excludes`, `timeouts_seconds`, and `env_allowlist`. Extension
+metadata is opaque to the kernel. The legacy `source` field remains accepted for
+pre-0.4 research manifests but is validated by the research extension, not the
+kernel. The top-
 level environment allowlist is global; a driver operation receives its union
 with that capability's allowlist. Driver processes receive a fixed system
 `PATH`; `PATH` cannot be allowlisted. The owner Git repository is the read trust
@@ -60,10 +63,18 @@ includes `plan_id` and `driver_plan`.
 }
 ```
 
-Allowed outcomes are `planned`, `completed`, `no-change`, `no-edition`, `held`,
-and `failed`; `ok` must agree with the outcome. A plan response places its
-owner-specific deterministic proposal in `data`; `expected_writes` is the one
-standardized planning field.
+Allowed outcomes are `planned`, `completed`, `no-change`, `no-op`, `held`, and
+`failed`; `ok` must agree with the outcome. `no-edition` remains accepted for
+pre-0.4 domain drivers. A plan response places its
+owner-specific deterministic proposal in `data`.
+
+New drivers declare `expected_effects`, an array of
+`{path, mode, before_sha256, after_sha256}` objects. Creation has a null before
+hash, update has both hashes, and deletion has a null after hash and mode.
+SHA-256 covers exact regular-file bytes; `mode` is the final four-digit POSIX
+permission mode. Hound validates before hashes during planning and after hashes
+and modes following execution. `expected_writes` remains a path-only compatibility field for
+pre-0.4 drivers; a plan cannot contain both forms.
 
 ## Plan and approval
 
@@ -93,6 +104,16 @@ byte equivalent.
 operation, and write-scope hash. An optional timezone-aware `expires_at` is
 enforced. Approval artifacts are local workflow witnesses, not digital signatures.
 
+## Read invocation record
+
+`hound invoke` returns `hound.invoke.result.v1`. The driver response remains at
+the top level for simple consumers, while `receipt` binds the exact manifest,
+repository fingerprint, allowlisted-environment digest, kernel identity,
+request, and response. The receipt includes canonical request and response
+hashes and a self-hash. Save the JSON and run `hound verify <invoke.json>` to
+check its structure and internal bindings. As with execution records, an
+external digest anchor is required to establish authenticity.
+
 ## Run record
 
 Each execution creates one directory named by its plan ID. It contains the
@@ -107,7 +128,7 @@ record. These are local witnesses rather than signatures. Verification
 establishes strict internal consistency; authenticity requires an external
 digest anchor controlled outside the owner filesystem.
 
-## Evidence, adapters, and source composition
+## Optional research extension
 
 `hound.lead.v1` is always `not-evidence`. `hound.capture.v1` addresses raw
 bytes by SHA-256, binds retrieval provenance in a distinct capture ID, and uses
@@ -121,11 +142,13 @@ An owner opts into source composition with one top-level object:
 
 ```json
 {
-  "source": {
-    "schema_version": "hound.source.v2",
-    "adapters": {
-      "search": "adapters/search.json",
-      "extract": "adapters/extract.json"
+  "extensions": {
+    "research": {
+      "schema_version": "hound.source.v2",
+      "adapters": {
+        "search": "adapters/search.json",
+        "extract": "adapters/extract.json"
+      }
     }
   }
 }
@@ -149,16 +172,17 @@ evidence by itself.
 
 ## Web adapter protocol
 
-Hound exposes three web operations: `web.search`, `web.extract`, and
+The research extension exposes three web operations: `web.search`, `web.extract`, and
 `web.interact`. An adapter is an ordinary reviewed `hound.driver.v1` executable
 that declares one of those read capabilities. The existing driver subprocess,
 environment allowlist, timeout, output bound, mutation check, and process cleanup
 are the adapter boundary; there is no second plugin runtime.
 
-The corresponding agent-facing commands are `hound search`, `hound extract`, and
-`hound interact`. Provider implementations live in the separate
-`hound_web_adapters` package namespace, so changing one does not alter guarded-
-write kernel identity. Each command accepts an explicit adapter manifest and
+The corresponding agent-facing commands are `hound-research search`,
+`hound-research extract`, and `hound-research interact`. Research records live
+in `hound_research` and provider implementations in `hound_web_adapters`, so
+changing either does not alter guarded-write kernel identity. Each command
+accepts an explicit adapter manifest and
 invokes only its matching capability. Hound never selects or escalates adapters
 implicitly.
 
@@ -232,7 +256,7 @@ are truncated to 12,000 characters, links to 100 entries, and screenshot bytes
 are omitted. The complete validated output remains in the immutable
 `output.json` record and can be read explicitly.
 
-`hound verify` recognizes web records and checks their file set, hashes,
+`hound-research verify` checks web records' file sets, hashes,
 record ID, raw-body digest, output digest, adapter-manifest binding, request and
 operation agreement, derivation metadata, and directory name. Search records are
 never evidence. Firecrawl markdown and Camofox observations remain explicitly

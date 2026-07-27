@@ -28,6 +28,7 @@ _MANIFEST_OPTIONAL = {
     "ignored_snapshot_excludes",
     "timeouts_seconds",
     "env_allowlist",
+    "extensions",
     "source",
 }
 _RESPONSE_REQUIRED = {"schema_version", "ok", "outcome"}
@@ -38,7 +39,7 @@ _RESPONSE_OPTIONAL = {
     "proofs",
     "diagnostics",
 }
-_OUTCOMES = {"planned", "completed", "no-change", "no-edition", "held", "failed"}
+_OUTCOMES = {"planned", "completed", "no-change", "no-op", "no-edition", "held", "failed"}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -147,23 +148,14 @@ def validate_manifest(obj: Any) -> dict[str, Any]:
                 capability["env_allowlist"],
                 f"manifest.capabilities.{operation}.env_allowlist",
             )
+    if "extensions" in obj:
+        extensions = obj["extensions"]
+        _require_object(extensions, "manifest.extensions")
+        for name, value in extensions.items():
+            _require_identifier(name, "manifest.extensions name")
+            _require_object(value, f"manifest.extensions.{name}")
     if "source" in obj:
-        source = obj["source"]
-        _require_object(source, "manifest.source")
-        _require_fields(source, {"schema_version", "adapters"}, set(), "manifest.source")
-        if source["schema_version"] != "hound.source.v2":
-            raise ContractError("manifest.source.schema_version must be 'hound.source.v2'")
-        adapters = source["adapters"]
-        if not isinstance(adapters, dict) or not adapters:
-            raise ContractError("manifest.source.adapters must be a non-empty object")
-        for alias, locator in adapters.items():
-            _require_identifier(alias, "manifest.source adapter alias")
-            _require_repo_locator(locator, f"manifest.source.adapters.{alias}")
-        source_capabilities = {"source.discover", "source.capture", "source.inspect"}
-        if not source_capabilities.issubset(capabilities):
-            raise ContractError("hound.source.v2 requires discover, capture, and inspect")
-        if any(capabilities[name]["effect"] != "read" for name in source_capabilities):
-            raise ContractError("hound.source.v2 capabilities must use effect 'read'")
+        _require_object(obj["source"], "manifest.source")
 
     if "run_root" in obj:
         _require_relative_path(obj["run_root"], "manifest.run_root")

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hound_cli import cli
+from hound_research import cli as research_cli
 
 
 def run_cli(*args: str):
@@ -16,6 +17,17 @@ def run_cli(*args: str):
     stderr = StringIO()
     with redirect_stdout(stdout), redirect_stderr(stderr):
         code = cli.main(list(args))
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def run_research_cli(*args: str):
+    from io import StringIO
+    from contextlib import redirect_stderr, redirect_stdout
+
+    stdout = StringIO()
+    stderr = StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        code = research_cli.main(list(args))
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -33,14 +45,20 @@ def test_help_exposes_primitives_not_owner_domain_names(capsys) -> None:
         "approve",
         "execute",
         "verify",
+    ):
+        assert command in output
+    for removed in (
         "source",
         "search",
         "extract",
         "interact",
         "capture",
+        "provider",
+        "corpus",
+        "edition",
+        "approval",
+        "run",
     ):
-        assert command in output
-    for removed in ("provider", "corpus", "edition", "approval", "run"):
         assert f"  {removed}" not in output
 
 
@@ -62,7 +80,40 @@ def test_invoke_runs_an_arbitrary_declared_read_capability(
     assert code == 0
     assert stderr == ""
     result = json.loads(stdout)
+    assert result["schema_version"] == "hound.invoke.result.v1"
     assert result["data"] == {"operation": "corpus.status", "echo": {"value": "x"}}
+    assert result["receipt"]["request"]["operation"] == "corpus.status"
+    assert len(result["receipt"]["receipt_id"]) == 64
+
+
+def test_saved_invoke_result_is_verifiable_and_tamper_evident(
+    driver_repo: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _, manifest_path = driver_repo
+    code, stdout, _ = run_cli(
+        "invoke",
+        "--driver",
+        str(manifest_path),
+        "--operation",
+        "corpus.status",
+        "--json",
+        '{"value":"x"}',
+    )
+    assert code == 0
+    record = tmp_path / "invoke.json"
+    record.write_text(stdout, encoding="utf-8")
+
+    verified, output, _ = run_cli("verify", str(record))
+    assert verified == 0
+    assert json.loads(output)["valid"] is True
+
+    value = json.loads(stdout)
+    value["data"]["echo"]["value"] = "tampered"
+    record.write_text(json.dumps(value), encoding="utf-8")
+    rejected, _, error = run_cli("verify", str(record))
+    assert rejected == 1
+    assert "response_sha256" in json.loads(error)["error"]
 
 
 def test_invoke_rejects_write_capabilities(
@@ -154,7 +205,7 @@ def test_plan_requires_an_output_path_and_cutoff(
     assert "required" in json.loads(stderr)["error"]
 
 
-def test_source_command_uses_source_v2_composition(
+def test_research_source_command_uses_source_v2_composition(
     driver_repo: tuple[Path, Path], monkeypatch
 ) -> None:
     _, manifest_path = driver_repo
@@ -164,9 +215,9 @@ def test_source_command_uses_source_v2_composition(
         seen.append((path, payload))
         return {"ok": True, "outcome": "completed", "as_of": as_of}
 
-    monkeypatch.setattr(cli, "discover_sources", discover)
+    monkeypatch.setattr(research_cli, "discover_sources", discover)
 
-    code, stdout, _ = run_cli(
+    code, stdout, _ = run_research_cli(
         "source",
         "discover",
         "--driver",
@@ -182,7 +233,7 @@ def test_source_command_uses_source_v2_composition(
     assert seen == [(manifest_path.resolve(), {"date": "2026-07-21"})]
 
 
-def test_web_commands_require_explicit_adapter_and_preserve_record_root(
+def test_research_web_commands_require_explicit_adapter_and_preserve_record_root(
     driver_repo: tuple[Path, Path], tmp_path: Path, monkeypatch
 ) -> None:
     _, manifest_path = driver_repo
@@ -192,10 +243,10 @@ def test_web_commands_require_explicit_adapter_and_preserve_record_root(
         seen.append((adapter, verb, payload, record_root))
         return {"ok": True, "outcome": "completed", "record_id": "a" * 64}
 
-    monkeypatch.setattr(cli, "run_web", run_web)
+    monkeypatch.setattr(research_cli, "run_web", run_web)
     record_root = tmp_path / "records"
 
-    code, _, _ = run_cli(
+    code, _, _ = run_research_cli(
         "search",
         "--adapter",
         str(manifest_path),
@@ -216,12 +267,12 @@ def test_web_commands_require_explicit_adapter_and_preserve_record_root(
     ]
 
 
-def test_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
+def test_research_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
     body = tmp_path / "body.bin"
     body.write_bytes(b"source bytes")
     root = tmp_path / "captures"
 
-    stored, stdout, _ = run_cli(
+    stored, stdout, _ = run_research_cli(
         "capture",
         "store",
         "--root",
@@ -240,7 +291,7 @@ def test_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
     assert stored == 0
     capture_id = json.loads(stdout)["capture_id"]
 
-    verified, stdout, _ = run_cli(
+    verified, stdout, _ = run_research_cli(
         "capture",
         "verify",
         "--root",
@@ -272,17 +323,24 @@ def test_invalid_json_returns_a_machine_readable_error(
     assert json.loads(stderr)["schema_version"] == "hound.error.v1"
 
 
-def test_installed_tool_matches_this_source_tree() -> None:
-    """The `hound` on PATH is an installed copy, not this checkout.
+def test_verify_error_names_failed_checks(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    from hound_cli.orchestrator import execute_plan, make_plan
 
-    Consumers invoke the installed binary -- `pulse-daily` calls
-    /home/deploy/.local/bin/hound -- so editing src/ changes nothing until
-    `uv tool install --force .` runs. On 2026-07-26 a snapshot fix measured at
-    20.5s -> 2.5s was committed, verified against this tree, and had no effect on
-    the lane for a full run because the installed copy was three days stale.
-    Silent divergence between source and runtime is the defect; this makes it
-    loud. Skips when no installed copy exists, so a fresh clone still passes.
-    """
+    plan = make_plan(manifest_path, "edition.build", {"value": "x"}, as_of="2026-07-21")
+    result = execute_plan(manifest_path, plan)
+    (Path(result["run_dir"]) / "unexpected.txt").write_text("tampered\n", encoding="utf-8")
+
+    code, _, stderr = run_cli("verify", result["run_dir"])
+
+    assert code == 1
+    assert "unexpected.txt" in json.loads(stderr)["error"]
+
+
+def test_installed_tool_matches_this_source_tree() -> None:
+    """An installed command must match every shipped Python package."""
     import hashlib
     import shutil
 
@@ -292,17 +350,27 @@ def test_installed_tool_matches_this_source_tree() -> None:
 
     candidates = list(
         Path("/home/deploy/.local/share/uv/tools/evidence-hound/lib").glob(
-            "python*/site-packages/hound_cli/runtime.py"
+            "python*/site-packages"
         )
     )
     if not candidates:
         pytest.skip("installed layout not recognized")
 
-    def digest(path: Path) -> str:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+    def package_digest(root: Path, package: str) -> dict[str, str]:
+        return {
+            path.relative_to(root / package).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((root / package).glob("*.py"))
+        }
 
-    source = Path(__file__).parents[1] / "src" / "hound_cli" / "runtime.py"
-    assert digest(candidates[0]) == digest(source), (
+    source_root = Path(__file__).parents[1] / "src"
+    installed_root = candidates[0]
+    packages = ("hound_cli", "hound_research", "hound_web_adapters")
+    assert {
+        package: package_digest(installed_root, package) for package in packages
+    } == {
+        package: package_digest(source_root, package) for package in packages
+    }, (
         "installed hound differs from this source tree -- "
-        "run `uv tool install --force .` or consumers keep running the old code"
+        "run `uv tool install --force --refresh-package evidence-hound .` "
+        "or consumers keep running the old code"
     )

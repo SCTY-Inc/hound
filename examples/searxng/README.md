@@ -31,7 +31,7 @@ curl -fsS http://127.0.0.1:8080/config | jq \
       or .name == "exa publications"
     )'
 
-SEARXNG_ENDPOINT=http://127.0.0.1:8080 hound search \
+SEARXNG_ENDPOINT=http://127.0.0.1:8080 hound-research search \
   --adapter adapters/searxng/hound-driver.json \
   --json '{
     "query":"caregiving intervention outcomes",

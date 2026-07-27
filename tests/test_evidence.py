@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hound_cli.evidence import (
+from hound_research.evidence import (
     EvidenceError,
     enforce_budget,
     make_lead,

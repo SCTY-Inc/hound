@@ -42,12 +42,17 @@ Then invoke the declared read capability:
 ```bash
 uv run hound invoke \
   --driver examples/status/hound-driver.json \
-  --operation corpus.status \
-  --input examples/status/request.json
+  --operation status.read \
+  --input examples/status/request.json \
+  | tee /tmp/hound-invoke.json
+
+uv run hound verify /tmp/hound-invoke.json
 ```
 
-Both commands emit one compact JSON object on stdout. The status response echoes
-the example request through the repository-owned driver.
+Each command emits one compact JSON object on stdout. The status response echoes
+the example request through the repository-owned driver and carries a
+self-hashed receipt that binds the request, response, manifest, repository,
+environment, and Hound kernel.
 
 ## Check the web adapters
 
@@ -65,7 +70,7 @@ trusted instance whose JSON format is enabled:
 
 ```bash
 export SEARXNG_ENDPOINT=http://127.0.0.1:8080
-uv run hound search \
+uv run hound-research search \
   --adapter adapters/searxng/hound-driver.json \
   --json '{
     "query":"family caregiver benefits",
@@ -86,7 +91,8 @@ reported at `routing.unresponsive_engines` for the caller to judge.
 
 The command returns compact leads and writes the exact adapter response plus its
 request, adapter identity, hashes, and normalized output under `.hound/web/`.
-Use `hound extract` only after selecting a known URL. Use `hound interact` only
+Use `hound-research extract` only after selecting a known URL. Use
+`hound-research interact` only
 when static extraction cannot operate the page.
 
 ## Use the composed source lifecycle
@@ -96,14 +102,14 @@ source read capabilities plus one top-level `hound.source.v2` adapter map. Run
 them in order:
 
 ```bash
-hound source discover --driver research/hound-driver.json --input request.json \
+hound-research source discover --driver research/hound-driver.json --input request.json \
   > /tmp/discovery-response.json
 jq '{schema_version:"hound.source.capture.input.v2", discovery:.data, owner_input:{}}' \
   /tmp/discovery-response.json > /tmp/capture-input.json
-hound source capture --driver research/hound-driver.json \
+hound-research source capture --driver research/hound-driver.json \
   --input /tmp/capture-input.json > /tmp/capture-response.json
 jq '{capture_set:.data}' /tmp/capture-response.json > /tmp/inspect-input.json
-hound source inspect --driver research/hound-driver.json \
+hound-research source inspect --driver research/hound-driver.json \
   --input /tmp/inspect-input.json
 ```
 
@@ -111,7 +117,7 @@ Replace the empty `owner_input` when the owner driver needs ranking or selection
 parameters. Discovery creates immutable search records and exact lead IDs.
 Capture extracts only owner-selected record/lead references through the named
 adapter. Inspect verifies both parent and extract records before the owner
-interprets them. Direct `hound extract` calls must declare
+interprets them. Direct `hound-research extract` calls must declare
 `lineage:{"kind":"direct"}`; discovered URLs use search record and lead IDs
 instead.
 See [Protocol v1](protocol.md) for the exact versioned payloads.

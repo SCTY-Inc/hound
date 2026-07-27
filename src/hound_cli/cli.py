@@ -10,19 +10,17 @@ from typing import Any, Sequence
 
 from . import __version__
 from .contracts import ContractError
-from .evidence import EvidenceError, store_capture, verify_capture
 from .orchestrator import (
     HoundError,
     check_driver,
     create_approval,
     execute_plan,
-    invoke_read,
+    invoke_read_with_receipt,
     make_plan,
+    verify_invocation,
     verify_run,
 )
 from .runtime import RuntimeErrorHound, write_json_create_only
-from .source import capture_sources, discover_sources, inspect_sources
-from .web import WebError, run_web, verify_web_run
 
 
 class _HoundArgumentParser(argparse.ArgumentParser):
@@ -82,7 +80,7 @@ def _driver_arguments(parser: argparse.ArgumentParser, *, operation: bool = True
 def build_parser() -> argparse.ArgumentParser:
     parser = _HoundArgumentParser(
         prog="hound",
-        description="Bounded research and evidence operations.",
+        description="Plan-bound capability execution for Git repositories.",
     )
     parser.add_argument("--version", action="version", version=f"hound {__version__}")
     top = parser.add_subparsers(dest="command", required=True)
@@ -120,48 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--output", required=True)
     approve.set_defaults(handler=_handle_approve)
 
-    verify = top.add_parser("verify", help="Verify an immutable web or write record")
+    verify = top.add_parser("verify", help="Verify an execution or invocation record")
     verify.add_argument("record")
     verify.set_defaults(handler=_handle_verify)
-
-    source = top.add_parser("source", help="Compose source records from web adapters")
-    source_sub = source.add_subparsers(dest="source_command", required=True)
-    for verb in ("discover", "capture", "inspect"):
-        operation = source_sub.add_parser(verb, help=f"Run source.{verb}")
-        _driver_arguments(operation, operation=False)
-        _input_arguments(operation)
-        operation.add_argument("--as-of", help="Optional owner data cutoff")
-        operation.set_defaults(handler=_handle_source, source_verb=verb)
-
-    for verb in ("search", "extract", "interact"):
-        web = top.add_parser(verb, help=f"Run one bounded web {verb} adapter")
-        web.add_argument(
-            "--adapter", required=True, help="Path to a hound.driver.v1 adapter manifest"
-        )
-        _input_arguments(web)
-        web.add_argument("--as-of", help="Optional owner data cutoff")
-        web.add_argument(
-            "--record-root",
-            default=".hound/web",
-            help="Directory for immutable web provenance records",
-        )
-        web.set_defaults(handler=_handle_web, web_verb=verb)
-
-    capture = top.add_parser("capture", help="Store or verify immutable origin bytes")
-    capture_sub = capture.add_subparsers(dest="capture_command", required=True)
-    capture_store = capture_sub.add_parser("store", help="Store raw bytes by content hash")
-    capture_store.add_argument("--root", required=True)
-    capture_store.add_argument("--provider", required=True)
-    capture_store.add_argument("--source-url", required=True)
-    capture_store.add_argument("--body", required=True, help="Path to raw source bytes")
-    capture_store.add_argument("--media-type", required=True)
-    capture_store.add_argument("--retrieved-at", required=True)
-    capture_store.add_argument("--metadata-json", help="Optional JSON metadata object")
-    capture_store.set_defaults(handler=_handle_capture_store)
-    capture_verify = capture_sub.add_parser("verify", help="Verify a capture manifest and blob")
-    capture_verify.add_argument("--root", required=True)
-    capture_verify.add_argument("--capture-id", required=True)
-    capture_verify.set_defaults(handler=_handle_capture_verify)
     return parser
 
 
@@ -170,12 +129,17 @@ def _handle_driver_check(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _handle_invoke(args: argparse.Namespace) -> dict[str, Any]:
-    return invoke_read(
+    response, receipt = invoke_read_with_receipt(
         Path(args.driver).resolve(),
         args.operation,
         _payload(args),
         as_of=args.as_of,
     )
+    return {
+        "schema_version": "hound.invoke.result.v1",
+        **{key: value for key, value in response.items() if key != "schema_version"},
+        "receipt": receipt,
+    }
 
 
 def _handle_plan(args: argparse.Namespace) -> dict[str, Any]:
@@ -207,66 +171,12 @@ def _handle_approve(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _handle_verify(args: argparse.Namespace) -> dict[str, Any]:
-    record = Path(args.record)
-    index = _read_json(record / "index.json")
-    result = (
-        verify_web_run(record)
-        if index.get("schema_version") == "hound.web.run.index.v1"
-        else verify_run(record)
-    )
+    path = Path(args.record)
+    result = verify_invocation(path) if path.is_file() else verify_run(path)
     if not result["valid"]:
-        raise HoundError("record verification failed")
+        failures = ", ".join(result.get("failures", [])) or "unknown failure"
+        raise HoundError(f"record verification failed: {failures}")
     return result
-
-
-def _handle_source(args: argparse.Namespace) -> dict[str, Any]:
-    handlers = {
-        "discover": discover_sources,
-        "capture": capture_sources,
-        "inspect": inspect_sources,
-    }
-    return handlers[args.source_verb](
-        Path(args.driver).resolve(),
-        _payload(args),
-        as_of=args.as_of,
-    )
-
-
-def _handle_web(args: argparse.Namespace) -> dict[str, Any]:
-    return run_web(
-        Path(args.adapter).resolve(),
-        args.web_verb,
-        _payload(args),
-        record_root=Path(args.record_root).resolve(),
-        as_of=args.as_of,
-    )
-
-
-def _handle_capture_store(args: argparse.Namespace) -> dict[str, Any]:
-    try:
-        body = Path(args.body).read_bytes()
-    except OSError as exc:
-        raise HoundError(f"cannot read capture body {args.body}: {exc}", exit_code=2) from exc
-    metadata = (
-        _json_object(args.metadata_json, source="--metadata-json") if args.metadata_json else None
-    )
-    return store_capture(
-        args.root,
-        provider=args.provider,
-        source_url=args.source_url,
-        body=body,
-        media_type=args.media_type,
-        retrieved_at=args.retrieved_at,
-        metadata=metadata,
-    )
-
-
-def _handle_capture_verify(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        "schema_version": "hound.capture.verification.v1",
-        "capture_id": args.capture_id,
-        "valid": verify_capture(args.root, args.capture_id),
-    }
 
 
 def _exit_for_result(result: dict[str, Any]) -> int:
@@ -288,7 +198,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HoundError as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return exc.exit_code
-    except (ContractError, RuntimeErrorHound, EvidenceError, WebError) as exc:
+    except (ContractError, RuntimeErrorHound) as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return 2 if isinstance(exc, ContractError) else 1
     except KeyboardInterrupt:

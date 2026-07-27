@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import stat
 from typing import Any
 
@@ -41,6 +42,10 @@ class HoundError(Exception):
     def __init__(self, message: str, *, exit_code: int = 1) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_FILE_MODE = re.compile(r"0[0-7]{3}\Z")
 
 
 def _owner_repo(manifest: dict[str, Any], manifest_path: Path) -> Path:
@@ -104,6 +109,9 @@ def _scope_contains(scope: str, path: str) -> bool:
 
 
 def _validated_expected_writes(data: dict[str, Any], scopes: list[str]) -> list[str]:
+    effects = _validated_expected_effects(data, scopes)
+    if effects is not None:
+        return [effect["path"] for effect in effects]
     raw = data.get("expected_writes", [])
     if not isinstance(raw, list):
         raise HoundError("driver plan expected_writes must be a list", exit_code=2)
@@ -115,6 +123,97 @@ def _validated_expected_writes(data: dict[str, Any], scopes: list[str]) -> list[
                 exit_code=2,
             )
     return writes
+
+
+def _validated_expected_effects(
+    data: dict[str, Any], scopes: list[str]
+) -> list[dict[str, Any]] | None:
+    if "expected_effects" not in data:
+        return None
+    if "expected_writes" in data:
+        raise HoundError(
+            "driver plan must use either expected_effects or expected_writes, not both",
+            exit_code=2,
+        )
+    raw = data["expected_effects"]
+    if not isinstance(raw, list):
+        raise HoundError("driver plan expected_effects must be a list", exit_code=2)
+    effects: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "mode",
+            "before_sha256",
+            "after_sha256",
+        }:
+            raise HoundError("driver plan contains a malformed expected effect", exit_code=2)
+        path = _expected_write_path(item["path"])
+        mode = item["mode"]
+        before = item["before_sha256"]
+        after = item["after_sha256"]
+        if before is not None and (not isinstance(before, str) or not _SHA256.fullmatch(before)):
+            raise HoundError("expected effect before_sha256 must be null or SHA-256", exit_code=2)
+        if after is not None and (not isinstance(after, str) or not _SHA256.fullmatch(after)):
+            raise HoundError("expected effect after_sha256 must be null or SHA-256", exit_code=2)
+        if before is None and after is None:
+            raise HoundError("expected effect must create, update, or delete a file", exit_code=2)
+        if after is None:
+            if mode is not None:
+                raise HoundError("deleted expected effect mode must be null", exit_code=2)
+        elif not isinstance(mode, str) or not _FILE_MODE.fullmatch(mode):
+            raise HoundError("expected effect mode must be a four-digit POSIX mode", exit_code=2)
+        if not any(_scope_contains(scope, path) for scope in scopes):
+            raise HoundError(f"driver planned a write outside declared scopes: {path}", exit_code=2)
+        effects.append(
+            {
+                "path": path,
+                "mode": mode,
+                "before_sha256": before,
+                "after_sha256": after,
+            }
+        )
+    if len({effect["path"] for effect in effects}) != len(effects):
+        raise HoundError("driver plan contains duplicate expected effect paths", exit_code=2)
+    return sorted(effects, key=lambda effect: effect["path"])
+
+
+def _file_state(repo: Path, relative: str) -> tuple[str | None, str | None]:
+    path = repo / relative
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise HoundError(f"cannot resolve exact effect path: {relative}", exit_code=2) from exc
+    if not resolved.is_relative_to(repo):
+        raise HoundError(
+            f"exact effect path must remain inside owner repository: {relative}",
+            exit_code=2,
+        )
+    if not path.exists():
+        return None, None
+    if path.is_symlink() or not path.is_file():
+        raise HoundError(f"exact effects support regular files only: {relative}", exit_code=2)
+    try:
+        return (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            f"{stat.S_IMODE(path.stat().st_mode):04o}",
+        )
+    except OSError as exc:
+        raise HoundError(f"cannot hash exact effect path: {relative}", exit_code=2) from exc
+
+
+def _validate_effects_against_repo(
+    data: dict[str, Any], scopes: list[str], repo: Path
+) -> None:
+    effects = _validated_expected_effects(data, scopes)
+    if effects is None:
+        return
+    for effect in effects:
+        before_sha256, _ = _file_state(repo, effect["path"])
+        if before_sha256 != effect["before_sha256"]:
+            raise HoundError(
+                f"expected effect before_sha256 does not match repository: {effect['path']}",
+                exit_code=2,
+            )
 
 
 def _invoke_nonmutating_driver_with_receipt(
@@ -182,6 +281,16 @@ def _plan_without_id(plan: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if key != "plan_id"}
 
 
+def _driver_failure(message: str, response: dict[str, Any]) -> str:
+    diagnostics = response.get("diagnostics", [])
+    if not diagnostics:
+        return message
+    detail = canonical_json(diagnostics)
+    if len(detail) > 2048:
+        detail = detail[:2045] + "..."
+    return f"{message}: {detail}"
+
+
 def _validate_plan(plan: dict[str, Any]) -> None:
     if not isinstance(plan, dict) or plan.get("schema_version") not in {
         "hound.plan.v1",
@@ -196,7 +305,7 @@ def _validate_plan(plan: dict[str, Any]) -> None:
             proposal = validate_response(plan.get("proposal"))
         except ContractError as error:
             raise HoundError("plan proposal is malformed", exit_code=2) from error
-        if proposal["outcome"] not in {"planned", "no-change", "no-edition"}:
+        if proposal["outcome"] not in {"planned", "no-change", "no-op", "no-edition"}:
             raise HoundError("plan proposal has an invalid outcome", exit_code=2)
         data = proposal.get("data")
         if not isinstance(data, dict):
@@ -216,6 +325,14 @@ def _plan_expected_writes(plan: dict[str, Any]) -> list[str]:
             _plan_proposal(plan)["data"], plan.get("write_scopes", [])
         )
     return plan["expected_writes"]
+
+
+def _plan_expected_effects(plan: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if plan.get("schema_version") != "hound.plan.v2":
+        return None
+    return _validated_expected_effects(
+        _plan_proposal(plan)["data"], plan.get("write_scopes", [])
+    )
 
 
 def make_plan(
@@ -260,8 +377,8 @@ def make_plan(
     ):
         raise HoundError("driver environment changed while planning", exit_code=2)
     if not response["ok"]:
-        raise HoundError("driver reported failure while planning")
-    if response["outcome"] not in {"planned", "no-change", "no-edition"}:
+        raise HoundError(_driver_failure("driver reported failure while planning", response))
+    if response["outcome"] not in {"planned", "no-change", "no-op", "no-edition"}:
         raise HoundError(f"driver returned non-plan outcome: {response['outcome']}")
 
     scopes = sorted(manifest.get("write_scopes", []))
@@ -269,6 +386,7 @@ def make_plan(
     if not isinstance(driver_data, dict):
         raise HoundError("driver plan data must be an object", exit_code=2)
     _validated_expected_writes(driver_data, scopes)
+    _validate_effects_against_repo(driver_data, scopes, repo)
     body: dict[str, Any] = {
         "schema_version": "hound.plan.v2",
         "driver_id": manifest["id"],
@@ -485,7 +603,7 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
         "changed_paths",
         "driver_response",
     }
-    optional = {"error", "data"}
+    optional = {"error", "data", "effects"}
     schema = result.get("schema_version")
     if schema == "hound.run.result.v1":
         required.add("run_dir")
@@ -497,7 +615,8 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
         result["plan_id"] != plan.get("plan_id")
         or (schema == "hound.run.result.v1" and result["run_dir"] != str(root))
         or not isinstance(result["ok"], bool)
-        or result["outcome"] not in {"completed", "no-change", "no-edition", "held", "failed"}
+        or result["outcome"]
+        not in {"completed", "no-change", "no-op", "no-edition", "held", "failed"}
     ):
         return False
     changed = result["changed_paths"]
@@ -514,6 +633,13 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
         except ContractError:
             return False
     if result["ok"]:
+        expected_effects = _plan_expected_effects(plan)
+        expected_changed = _plan_expected_writes(plan)
+        if (
+            plan.get("schema_version") == "hound.plan.v1"
+            and result["outcome"] in {"no-change", "no-op", "no-edition"}
+        ):
+            expected_changed = []
         if (
             result["outcome"] == "failed"
             or "error" in result
@@ -521,7 +647,12 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
             or not response["ok"]
             or response["outcome"] != result["outcome"]
             or result.get("data") != response.get("data", {})
-            or changed != _plan_expected_writes(plan)
+            or changed != expected_changed
+            or (
+                expected_effects is not None
+                and result.get("effects") != expected_effects
+            )
+            or (expected_effects is None and "effects" in result)
         ):
             return False
     elif (
@@ -532,6 +663,19 @@ def _result_matches_plan(result: object, plan: dict[str, Any], root: Path) -> bo
     ):
         return False
     return True
+
+
+def _recorded_manifest_matches(manifest: object, plan: dict[str, Any]) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+    try:
+        if plan.get("schema_version") == "hound.plan.v2":
+            validate_manifest(manifest)
+        else:
+            canonical_json(manifest)
+    except (ContractError, ValueError):
+        return False
+    return canonical_hash(manifest) == plan.get("driver_manifest_sha256")
 
 
 def execute_plan(
@@ -697,6 +841,22 @@ def _execute_plan_locked(
     changed = changed_paths(before, after)
     in_scope, violations = paths_within_scopes(repo, changed, plan["write_scopes"])
     expected = _plan_expected_writes(plan)
+    expected_effects = _plan_expected_effects(plan)
+    observed_effects: list[dict[str, Any]] | None = None
+    effect_error: str | None = None
+    if expected_effects is not None:
+        try:
+            observed_effects = [
+                {
+                    **effect,
+                    "after_sha256": state[0],
+                    "mode": state[1],
+                }
+                for effect in expected_effects
+                for state in [_file_state(repo, effect["path"])]
+            ]
+        except HoundError as exc:
+            effect_error = str(exc)
     unexpected = [
         item for item in changed if not _actual_matches_expected(item, expected)
     ]
@@ -714,20 +874,30 @@ def _execute_plan_locked(
         error = f"driver modified protected run record: {', '.join(altered_records)}"
     elif not in_scope:
         error = f"driver wrote outside declared scopes: {', '.join(violations)}"
+    elif effect_error is not None:
+        error = effect_error
     elif unexpected:
         error = f"driver wrote outside its approved plan: {', '.join(unexpected)}"
     elif missing:
         error = f"driver did not produce its approved writes: {', '.join(missing)}"
+    elif expected_effects is not None and observed_effects != expected_effects:
+        mismatched = [
+            expected_effect["path"]
+            for expected_effect, observed_effect in zip(expected_effects, observed_effects)
+            if expected_effect != observed_effect
+        ]
+        error = f"driver produced bytes different from approved effect: {', '.join(mismatched)}"
     elif response is not None and response["outcome"] not in {
         "completed",
         "no-change",
+        "no-op",
         "no-edition",
         "held",
         "failed",
     }:
         error = f"driver returned invalid outcome for execute mode: {response['outcome']}"
     elif response is not None and (not response["ok"] or response["outcome"] == "failed"):
-        error = "driver reported failure"
+        error = _driver_failure("driver reported failure", response)
     else:
         error = None
 
@@ -740,6 +910,8 @@ def _execute_plan_locked(
         "changed_paths": changed,
         "driver_response": response,
     }
+    if observed_effects is not None:
+        result["effects"] = observed_effects
     if error:
         result["error"] = error
     elif response is not None:
@@ -813,10 +985,8 @@ def verify_run(run_dir: str | Path) -> dict[str, Any]:
         fail("index.plan_id")
 
     try:
-        manifest = validate_manifest(
-            json.loads((root / "driver-manifest.json").read_text(encoding="utf-8"))
-        )
-        if canonical_hash(manifest) != plan.get("driver_manifest_sha256"):
+        manifest = json.loads((root / "driver-manifest.json").read_text(encoding="utf-8"))
+        if not _recorded_manifest_matches(manifest, plan):
             fail("driver-manifest.json")
     except (OSError, json.JSONDecodeError, ValueError):
         fail("driver-manifest.json")
@@ -858,6 +1028,148 @@ def verify_run(run_dir: str | Path) -> dict[str, Any]:
         "schema_version": "hound.run.verification.v1",
         "valid": valid,
         "plan_id": index.get("plan_id"),
+        "failures": sorted(failures),
+    }
+
+
+def verify_invocation(record_path: str | Path) -> dict[str, Any]:
+    """Verify a saved read-invocation result and its self-hashed receipt."""
+
+    path = Path(record_path).resolve()
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HoundError(f"cannot read invocation record: {exc}", exit_code=2) from exc
+
+    failures: list[str] = []
+
+    def fail(label: str) -> None:
+        if label not in failures:
+            failures.append(label)
+
+    if not isinstance(result, dict):
+        fail("result")
+        result = {}
+    if result.get("schema_version") != "hound.invoke.result.v1":
+        fail("schema_version")
+
+    response_fields = {
+        "ok",
+        "outcome",
+        "data_schema",
+        "data",
+        "artifacts",
+        "proofs",
+        "diagnostics",
+    }
+    unknown = set(result) - response_fields - {"schema_version", "receipt"}
+    if unknown:
+        fail("result.fields")
+    response = {
+        "schema_version": "hound.driver.response.v1",
+        **{key: result[key] for key in response_fields if key in result},
+    }
+    try:
+        validate_response(response)
+    except ContractError:
+        fail("response")
+
+    receipt = result.get("receipt")
+    receipt_fields = {
+        "schema_version",
+        "manifest",
+        "manifest_sha256",
+        "repository",
+        "environment_sha256",
+        "kernel",
+        "request",
+        "request_sha256",
+        "response_sha256",
+        "receipt_id",
+    }
+    if not isinstance(receipt, dict):
+        fail("receipt")
+        receipt = {}
+    elif set(receipt) != receipt_fields:
+        fail("receipt.fields")
+
+    if receipt.get("schema_version") != "hound.invocation.receipt.v1":
+        fail("receipt.schema_version")
+    manifest = receipt.get("manifest")
+    try:
+        validate_manifest(manifest)
+    except ContractError:
+        fail("manifest")
+    try:
+        if receipt.get("manifest_sha256") != canonical_hash(manifest):
+            fail("manifest_sha256")
+    except ContractError:
+        fail("manifest_sha256")
+
+    request = receipt.get("request")
+    if not isinstance(request, dict):
+        fail("request")
+    else:
+        required_request = {"schema_version", "mode", "operation", "input"}
+        if (
+            not required_request.issubset(request)
+            or set(request) - required_request - {"as_of"}
+            or request.get("schema_version") != "hound.driver.request.v1"
+            or request.get("mode") != "read"
+            or not isinstance(request.get("operation"), str)
+            or not request.get("operation")
+            or not isinstance(request.get("input"), dict)
+            or ("as_of" in request and not isinstance(request["as_of"], str))
+        ):
+            fail("request")
+    try:
+        if receipt.get("request_sha256") != canonical_hash(request):
+            fail("request_sha256")
+    except ContractError:
+        fail("request_sha256")
+    try:
+        if receipt.get("response_sha256") != canonical_hash(response):
+            fail("response_sha256")
+    except ContractError:
+        fail("response_sha256")
+
+    repository = receipt.get("repository")
+    if (
+        not isinstance(repository, dict)
+        or set(repository) != {"head", "fingerprint_sha256"}
+        or not isinstance(repository.get("head"), str)
+        or not repository.get("head")
+        or not isinstance(repository.get("fingerprint_sha256"), str)
+        or not _SHA256.fullmatch(repository["fingerprint_sha256"])
+    ):
+        fail("repository")
+    environment_sha256 = receipt.get("environment_sha256")
+    if not isinstance(environment_sha256, str) or not _SHA256.fullmatch(environment_sha256):
+        fail("environment_sha256")
+    kernel = receipt.get("kernel")
+    if (
+        not isinstance(kernel, dict)
+        or set(kernel) != {"version", "sha256", "dependencies"}
+        or not isinstance(kernel.get("version"), str)
+        or not kernel.get("version")
+        or not isinstance(kernel.get("sha256"), str)
+        or not _SHA256.fullmatch(kernel["sha256"])
+        or kernel.get("dependencies") != {}
+    ):
+        fail("kernel")
+
+    if isinstance(receipt, dict):
+        receipt_body = {key: value for key, value in receipt.items() if key != "receipt_id"}
+        try:
+            if receipt.get("receipt_id") != canonical_hash(receipt_body):
+                fail("receipt_id")
+        except ContractError:
+            fail("receipt_id")
+
+    return {
+        "schema_version": "hound.invocation.verification.v1",
+        "valid": not failures,
+        "receipt_id": receipt.get("receipt_id"),
         "failures": sorted(failures),
     }
 

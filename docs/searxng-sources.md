@@ -299,7 +299,7 @@ follow:
    `selected_engines`. A category search where every engine fails returns zero
    leads and no error.
 3. **Unrouted search has no guard either.** gc-intel and gc-wiki call
-   `hound search` with only `query` and `limit`, so SearXNG runs the default
+   `hound-research search` with only `query` and `limit`, so SearXNG runs the default
    `general` set. Measured today, that set is `exa web` and `google cse`
    answering while `brave`, `duckduckgo` and `startpage` are all blocked. If
    `google cse` were suspended, both lanes would quietly fall back to `exa web`
@@ -392,7 +392,7 @@ Knowing the boundary is the point of the map.
 Search one source at a time with:
 
 ```bash
-SEARXNG_ENDPOINT=http://127.0.0.1:8888 hound search \
+SEARXNG_ENDPOINT=http://127.0.0.1:8888 hound-research search \
   --adapter adapters/searxng/hound-driver.json \
   --json '{
     "query":"caregiver intervention outcomes",

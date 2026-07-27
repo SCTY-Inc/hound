@@ -43,11 +43,13 @@ def driver_repo(tmp_path: Path, fake_driver_path: Path) -> tuple[Path, Path]:
             "corpus.apply": {"effect": "write", "gate": "human"},
             "edition.build": {"effect": "write", "gate": "none"},
         },
-        "source": {
-            "schema_version": "hound.source.v2",
-            "adapters": {
-                "search": "hound-driver.json",
-                "extract": "hound-driver.json",
+        "extensions": {
+            "research": {
+                "schema_version": "hound.source.v2",
+                "adapters": {
+                    "search": "hound-driver.json",
+                    "extract": "hound-driver.json",
+                },
             },
         },
         "run_root": ".hound/runs",

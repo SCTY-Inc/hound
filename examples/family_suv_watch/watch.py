@@ -10,8 +10,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from hound_cli.evidence import EvidenceError, validate_public_url
-from hound_cli.web import run_web
+from hound_research.evidence import EvidenceError, validate_public_url
+from hound_research.web import run_web
 
 
 WebRunner = Callable[..., dict[str, Any]]

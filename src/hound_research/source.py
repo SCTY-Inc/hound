@@ -6,9 +6,10 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .contracts import load_manifest
+from hound_cli.contracts import load_manifest
+from hound_cli.orchestrator import HoundError, invoke_read
+
 from .evidence import EvidenceError
-from .orchestrator import HoundError, invoke_read
 from .web import run_web, verify_web_run
 
 
@@ -52,17 +53,47 @@ def _integer(value: object, label: str, *, maximum: int) -> int:
 def _manifest_context(manifest_path: str | Path) -> tuple[Path, dict[str, Any], Path, Path]:
     path = Path(manifest_path).resolve()
     manifest = load_manifest(path)
-    source = manifest.get("source")
-    if not isinstance(source, dict) or source.get("schema_version") != "hound.source.v2":
+    source = _source_config(manifest)
+    if source is None:
         raise HoundError("driver does not declare hound.source.v2 composition", exit_code=2)
+    operations = ("source.discover", "source.capture", "source.inspect")
+    capabilities = manifest["capabilities"]
+    if any(
+        not isinstance(capabilities.get(operation), dict)
+        or capabilities[operation].get("effect") != "read"
+        or capabilities[operation].get("gate") != "none"
+        for operation in operations
+    ):
+        raise HoundError("hound.source.v2 requires read-only discover, capture, and inspect")
     repo = (path.parent / manifest["owner"]["repo"]).resolve()
     return path, manifest, repo, repo / ".hound" / "web"
+
+
+def _source_config(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    value = manifest.get("source")
+    if value is None:
+        extensions = manifest.get("extensions", {})
+        value = extensions.get("research") if isinstance(extensions, dict) else None
+    if not isinstance(value, dict) or set(value) != {"schema_version", "adapters"}:
+        return None
+    if value.get("schema_version") != "hound.source.v2":
+        return None
+    adapters = value.get("adapters")
+    if (
+        not isinstance(adapters, dict)
+        or not adapters
+        or any(not isinstance(alias, str) or not isinstance(path, str) for alias, path in adapters.items())
+    ):
+        return None
+    return value
 
 
 def _adapter_path(path: Path, manifest: dict[str, Any], alias: object) -> Path:
     if not isinstance(alias, str):
         raise EvidenceError("source adapter alias must be a string")
-    adapters = manifest["source"]["adapters"]
+    source = _source_config(manifest)
+    assert source is not None
+    adapters = source["adapters"]
     locator = adapters.get(alias)
     if not isinstance(locator, str):
         raise EvidenceError(f"source adapter alias is not declared: {alias!r}")

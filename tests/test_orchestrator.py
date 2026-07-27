@@ -45,17 +45,155 @@ def test_plan_is_deterministic_and_bound_to_repo(driver_repo: tuple[Path, Path])
     assert not {"driver_plan", "driver_outcome", "planning_response", "expected_writes"} & set(
         first
     )
-    assert first["kernel"]["version"] == "0.3.0"
+    assert first["kernel"]["version"] == "0.4.0"
     assert first["kernel"]["dependencies"] == {}
     assert len(first["kernel"]["sha256"]) == 64
+
+
+def test_exact_effects_bind_and_verify_created_bytes(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {"value": "bound", "exact_effects": True},
+        as_of="2026-07-17",
+    )
+
+    effect = plan["proposal"]["data"]["expected_effects"][0]
+    assert effect == {
+        "path": "output/result.json",
+        "mode": "0600",
+        "before_sha256": None,
+        "after_sha256": hashlib.sha256(b'{"value": "bound"}\n').hexdigest(),
+    }
+
+    result = execute_plan(manifest_path, plan)
+
+    assert result["effects"] == [effect]
+    assert verify_run(result["run_dir"])["valid"] is True
+    assert hashlib.sha256((repo / effect["path"]).read_bytes()).hexdigest() == effect[
+        "after_sha256"
+    ]
+
+
+def test_plan_rejects_exact_effect_with_wrong_before_hash(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    target = repo / "output" / "result.json"
+    target.parent.mkdir()
+    target.write_text('{"value": "old"}\n', encoding="utf-8")
+
+    with pytest.raises(HoundError, match="before_sha256"):
+        make_plan(
+            manifest_path,
+            "edition.build",
+            {"exact_effects": True, "wrong_before_hash": True},
+            as_of="2026-07-17",
+        )
+
+
+def test_exact_effect_rejects_parent_symlink_escape(
+    driver_repo: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    repo, manifest_path = driver_repo
+    (repo / "output").symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    with pytest.raises(HoundError, match="inside owner repository"):
+        make_plan(
+            manifest_path,
+            "edition.build",
+            {"exact_effects": True},
+            as_of="2026-07-17",
+        )
+
+
+def test_execute_rejects_bytes_that_differ_from_exact_effect(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {"exact_effects": True, "wrong_after_hash": True},
+        as_of="2026-07-17",
+    )
+
+    with pytest.raises(HoundError, match="approved effect"):
+        execute_plan(manifest_path, plan)
+
+    run_dir = repo / ".hound" / "runs" / plan["plan_id"]
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["outcome"] == "failed"
+    assert result["effects"][0]["after_sha256"] != "0" * 64
+    assert verify_run(run_dir)["valid"] is True
+
+
+def test_execute_rejects_mode_that_differs_from_exact_effect(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    repo, manifest_path = driver_repo
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {"exact_effects": True, "execute_mode": "0755"},
+        as_of="2026-07-17",
+    )
+
+    with pytest.raises(HoundError, match="approved effect"):
+        execute_plan(manifest_path, plan)
+
+    run_dir = repo / ".hound" / "runs" / plan["plan_id"]
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["effects"][0]["mode"] == "0755"
+    assert verify_run(run_dir)["valid"] is True
+
+
+def test_exact_effect_path_escape_is_finalized_as_a_failed_run(
+    driver_repo: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    repo, manifest_path = driver_repo
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {"exact_effects": True, "effect_symlink_target": str(outside)},
+        as_of="2026-07-17",
+    )
+
+    with pytest.raises(HoundError, match="outside declared scopes"):
+        execute_plan(manifest_path, plan)
+
+    run_dir = repo / ".hound" / "runs" / plan["plan_id"]
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["outcome"] == "failed"
+    assert verify_run(run_dir)["valid"] is True
 
 
 def test_kernel_identity_binds_core_but_not_provider_implementations() -> None:
     source_root = Path(orchestrator.__file__).parent
     digest = hashlib.sha256()
     source_paths = sorted(source_root.glob("*.py"))
-    assert any(path.name == "web.py" for path in source_paths)
+    assert {path.name for path in source_paths} == {
+        "__init__.py",
+        "_supervisor.py",
+        "cli.py",
+        "contracts.py",
+        "orchestrator.py",
+        "runtime.py",
+        "safety.py",
+    }
     assert all(path.parent == source_root for path in source_paths)
+    assert all(
+        "hound_research" not in path.read_text(encoding="utf-8")
+        and "hound_web_adapters" not in path.read_text(encoding="utf-8")
+        for path in source_paths
+    )
     for source in source_paths:
         digest.update(source.name.encode("utf-8"))
         digest.update(b"\0")
@@ -85,13 +223,40 @@ def test_plan_rejects_repository_root_as_an_expected_write(
 def test_plan_requires_driver_ok(driver_repo: tuple[Path, Path]) -> None:
     _, manifest_path = driver_repo
 
-    with pytest.raises(HoundError, match="reported failure"):
+    with pytest.raises(HoundError, match="review blocked"):
         make_plan(
             manifest_path,
             "corpus.apply",
-            {"plan_ok": False},
+            {
+                "plan_ok": False,
+                "plan_diagnostics": [
+                    {"level": "error", "message": "review blocked"}
+                ],
+            },
             as_of="2026-07-17",
         )
+
+
+def test_execute_surfaces_driver_diagnostics(
+    driver_repo: tuple[Path, Path],
+) -> None:
+    _, manifest_path = driver_repo
+    plan = make_plan(
+        manifest_path,
+        "edition.build",
+        {
+            "expected_writes": [],
+            "skip_write": True,
+            "execute_fail": True,
+            "execute_diagnostics": [
+                {"level": "error", "message": "upstream rejected candidate"}
+            ],
+        },
+        as_of="2026-07-17",
+    )
+
+    with pytest.raises(HoundError, match="upstream rejected candidate"):
+        execute_plan(manifest_path, plan)
 
 
 def test_plan_requires_object_driver_data(driver_repo: tuple[Path, Path]) -> None:
@@ -518,7 +683,7 @@ def test_kernel_drift_invalidates_plan(
     monkeypatch.setattr(
         orchestrator,
         "_kernel_identity",
-        lambda: {"version": "0.3.0", "sha256": "0" * 64},
+        lambda: {"version": "0.4.0", "sha256": "0" * 64},
     )
 
     with pytest.raises(HoundError, match="kernel"):
@@ -804,6 +969,60 @@ def test_run_verification_rejects_rehashed_manifest_tampering(
     verification = verify_run(run_dir)
     assert verification["valid"] is False
     assert "driver-manifest.json" in verification["failures"]
+
+
+def test_historical_manifest_verification_uses_its_recorded_contract() -> None:
+    manifest = {
+        "schema_version": "hound.driver.v1",
+        "id": "historical",
+        "protocol": "hound.protocol.v1",
+        "owner": {"repo": "."},
+        "exec": ["driver"],
+        "capabilities": {"write": {"effect": "write", "gate": "none"}},
+        "capture_root": ".hound/captures",
+        "ignored_snapshot_excludes": None,
+    }
+    plan = {
+        "schema_version": "hound.plan.v1",
+        "driver_manifest_sha256": orchestrator.canonical_hash(manifest),
+    }
+
+    assert orchestrator._recorded_manifest_matches(manifest, plan) is True
+    assert orchestrator._recorded_manifest_matches(
+        manifest, {**plan, "schema_version": "hound.plan.v2"}
+    ) is False
+
+
+def test_historical_no_change_result_can_supersede_planned_write(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "schema_version": "hound.driver.response.v1",
+        "ok": True,
+        "outcome": "no-change",
+        "data_schema": "historical.result.v1",
+        "data": {"written": []},
+        "artifacts": [],
+        "proofs": [],
+        "diagnostics": [],
+    }
+    plan = {
+        "schema_version": "hound.plan.v1",
+        "plan_id": "a" * 64,
+        "expected_writes": ["output/result.json"],
+    }
+    result = {
+        "schema_version": "hound.run.result.v1",
+        "plan_id": plan["plan_id"],
+        "run_dir": str(tmp_path),
+        "outcome": "no-change",
+        "ok": True,
+        "changed_paths": [],
+        "driver_response": response,
+        "data": response["data"],
+    }
+
+    assert orchestrator._result_matches_plan(result, plan, tmp_path) is True
 
 
 def test_run_verification_rejects_rehashed_forged_result(

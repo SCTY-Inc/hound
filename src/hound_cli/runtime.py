@@ -140,7 +140,7 @@ def run_driver_with_receipt(
         _driver_environment_names(persisted, operation), selected_environment
     )
     fingerprint = repo_fingerprint(repo)
-    receipt = {
+    receipt_body = {
         "schema_version": "hound.invocation.receipt.v1",
         "manifest": persisted,
         "manifest_sha256": canonical_hash(persisted),
@@ -230,6 +230,14 @@ def run_driver_with_receipt(
         contains_credential(item, credential_forms) for item in decoded_outputs(validated)
     ):
         raise RuntimeErrorHound("driver output contained allowlisted credential material")
+    receipt_body.update(
+        {
+            "request": request,
+            "request_sha256": canonical_hash(request),
+            "response_sha256": canonical_hash(validated),
+        }
+    )
+    receipt = {**receipt_body, "receipt_id": canonical_hash(receipt_body)}
     return validated, receipt
 
 
@@ -394,9 +402,9 @@ def snapshot_repo(
     # Prefix-match on the raw string rather than building a PurePosixPath per
     # entry and walking its .parents. This runs once per ignored path, and a
     # working tree carrying node_modules and virtualenvs has tens of thousands:
-    # measured on gc-web, 65,550 ignored paths against 24 excludes cost 20.9s
-    # via .parents and 0.01s here, for identical output. Two snapshots bracket
-    # every adapter call, so that difference is ~42s per captured source.
+    # Measured on a dependency-heavy owner repo, 65,550 ignored paths against
+    # 24 excludes cost 20.9s via .parents and 0.01s here for identical output.
+    # Two snapshots bracket every driver call.
     exact = {_normalized_exclude(value) for value in ignored_snapshot_excludes}
     excluded = tuple(f"{value}/" for value in exact)
     paths.update(

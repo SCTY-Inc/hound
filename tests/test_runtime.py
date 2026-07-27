@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from hound_cli.contracts import canonical_hash
 from hound_cli.runtime import (
     RuntimeErrorHound,
     changed_paths,
@@ -146,6 +147,10 @@ def test_run_driver_receipt_binds_the_executed_manifest_repo_and_environment(
         "fingerprint_sha256": fingerprint["fingerprint_sha256"],
     }
     assert receipt["environment_sha256"]
+    assert receipt["request"] == {}
+    assert len(receipt["request_sha256"]) == 64
+    assert receipt["response_sha256"] == canonical_hash(response)
+    assert len(receipt["receipt_id"]) == 64
 
 
 def test_run_driver_uses_argv_and_treats_shell_metacharacters_literally(

@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hound_cli.contracts import canonical_json
-from hound_cli.web import WebError
+from hound_research.web import WebError
 
 from . import camofox, firecrawl, searxng
 from ._http import AdapterError

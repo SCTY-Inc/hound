@@ -10,6 +10,13 @@ cd hound
 uv sync --locked
 ```
 
+Refresh the operator-installed command after source changes, including when the
+package version has not changed:
+
+```bash
+uv tool install --force --refresh-package evidence-hound .
+```
+
 Hound's kernel and first-party adapter bundle use the Python standard library.
 Pytest and PyYAML are development dependencies; PyYAML validates the SearXNG
 settings overlay. SearXNG, Firecrawl, and Camofox remain separate services
@@ -33,9 +40,9 @@ uv pip install --python /tmp/hound-smoke/bin/python dist/*.whl
 ```
 
 The wheel and source distribution must contain the kernel beneath
-`src/hound_cli` and the provider implementations beneath
-`src/hound_web_adapters`. Guarded-write kernel identity intentionally excludes
-the latter.
+`src/hound_cli`, optional research records beneath `src/hound_research`, and
+provider implementations beneath `src/hound_web_adapters`. Guarded-write kernel
+identity intentionally excludes both extension packages.
 
 ## Change a protocol boundary
 

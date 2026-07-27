@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from hound_cli.contracts import canonical_hash, canonical_json
-from hound_cli.web import WebError, run_web, verify_web_run
+from hound_research.web import WebError, run_web, verify_web_run
 
 
 def _raw(value: object) -> tuple[str, str]:
@@ -121,7 +121,7 @@ def test_web_record_uses_the_manifest_and_state_from_the_completed_invocation(
         "kernel": {"version": "0.3.0", "sha256": "d" * 64, "dependencies": {}},
     }
     monkeypatch.setattr(
-        "hound_cli.web.invoke_read_with_receipt",
+        "hound_research.web.invoke_read_with_receipt",
         lambda *_args, **_kwargs: (response, receipt),
     )
 

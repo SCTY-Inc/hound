@@ -1,23 +1,30 @@
 {
   "schema_version": "hound.driver.v1",
-  "id": "example-status",
+  "id": "config-migration",
   "protocol": "hound.protocol.v1",
   "owner": {
-    "repo": "../.."
+    "repo": "."
   },
   "exec": [
     "python3",
-    "examples/status/driver.py"
+    "driver.py"
   ],
   "capabilities": {
-    "status.read": {
+    "config.inspect": {
       "effect": "read",
       "gate": "none"
+    },
+    "config.migrate": {
+      "effect": "write",
+      "gate": "human"
     }
   },
   "run_root": ".hound/runs",
+  "write_scopes": [
+    "config.json"
+  ],
   "timeouts_seconds": {
-    "default": 30
+    "default": 10
   },
   "env_allowlist": []
 }

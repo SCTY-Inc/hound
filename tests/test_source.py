@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 
 from hound_cli.contracts import canonical_json
-from hound_cli.evidence import EvidenceError
-from hound_cli.source import capture_sources, discover_sources, inspect_sources
-from hound_cli.web import verify_web_run
+from hound_research.evidence import EvidenceError
+from hound_research.source import capture_sources, discover_sources, inspect_sources
+from hound_research.web import verify_web_run
 
 
 def _raw(value: object) -> tuple[str, str]:

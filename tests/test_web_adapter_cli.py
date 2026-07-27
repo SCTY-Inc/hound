@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from hound_cli.orchestrator import check_driver
-from hound_cli.web import run_web, verify_web_run
+from hound_research.web import run_web, verify_web_run
 
 
 ROOT = Path(__file__).parents[1]

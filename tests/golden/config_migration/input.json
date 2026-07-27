@@ -1,0 +1,6 @@
+{
+  "target": {
+    "feature": "bounded",
+    "version": 2
+  }
+}

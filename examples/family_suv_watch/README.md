@@ -67,7 +67,7 @@ When `browser-review.json` contains a public URL whose static extraction failed,
 open it deliberately rather than enabling hidden fallback:
 
 ```bash
-uv run hound interact \
+uv run hound-research interact \
   --adapter adapters/camofox/hound-driver.json \
   --record-root examples/family_suv_watch/.hound/web \
   --json '{"action":"open","url":"https://dealer.example/vehicle"}'

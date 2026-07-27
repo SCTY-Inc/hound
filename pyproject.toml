@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evidence-hound"
-version = "0.3.0"
-description = "Bounded research and evidence operations."
+version = "0.4.0"
+description = "Plan-bound capability execution for Git repositories."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE.md" }
 authors = [{ name = "SCTY" }]
-keywords = ["cli", "evidence", "provenance", "research"]
+keywords = ["cli", "agents", "provenance", "git"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -28,6 +28,7 @@ Issues = "https://github.com/SCTY-Inc/hound/issues"
 
 [project.scripts]
 hound = "hound_cli.cli:main"
+hound-research = "hound_research.cli:main"
 hound-web-adapter = "hound_web_adapters.cli:main"
 
 [dependency-groups]
@@ -37,7 +38,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hound_cli", "src/hound_web_adapters"]
+packages = ["src/hound_cli", "src/hound_research", "src/hound_web_adapters"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

@@ -4,130 +4,99 @@
 
 ## Purpose
 
-Hound is the trustworthy front door for discovery, extraction, and bounded web
-interaction across many projects.
+Hound is a Git-native, plan-bound capability runner for agents.
 
-Different subjects call for different search engines, databases, APIs, crawlers,
-extraction tools, and—only when static access fails—real browsers. Without a shared boundary, every project must rebuild
-those integrations and decide for itself how to preserve source identity,
-credentials, raw material, transformations, and audit records. The result is
-provider lock-in, duplicated plumbing, and durable outputs whose evidence trail
-is difficult to prove.
+An agent can invoke almost any executable, but a consequential operation needs
+better answers than a transcript can provide: Which reviewed capability ran?
+What repository state and input did it see? What exact effect was authorized?
+Did anything drift before execution? What actually changed? Can the record be
+checked later without trusting the agent's account?
 
-Hound lets each project compose the providers best suited to its domain while
-receiving the same provenance, lineage, safety, and review guarantees. Search,
-extraction, and interaction remain separate authorities rather than collapsing
-into one opaque browsing tool.
+Hound makes those answers part of one small execution contract.
 
 ## Promise
 
-A project can change or combine discovery and extraction providers without
-changing its downstream evidence model.
+**A maintainer can delegate a repository operation while retaining a verifiable
+boundary around what ran, what was approved, and what changed.**
 
-Every admitted piece of evidence should remain traceable from the originating
-request, through the adapter and retrieved source bytes, through each extraction
-or transformation, to the durable output it supports. When Hound permits a
-repository change, the evidence, decision, approval, and resulting write should
-form one verifiable chain.
+Owner repositories keep their domain logic. A language-neutral driver declares
+named read and write capabilities and speaks versioned JSON. Hound invokes
+reads without repository mutation, binds writes into deterministic plans,
+requires an exact human witness when declared, rejects drift, checks resulting
+effects, and emits portable verification records.
 
-## Who Hound serves
-
-Hound serves maintainers and operators of recurring research, intelligence,
-data, knowledge, and publishing workflows. They need to use heterogeneous
-sources across multiple repositories without trusting one provider, one model,
-or one project's conventions to preserve the record.
-
-Owner projects remain the domain experts. They decide what to search, which
-sources matter, how evidence should be interpreted, and what their repositories
-should contain. Hound provides the common execution and evidence boundary around
-those decisions.
+Hound is intentionally specific to capabilities operating on a Git workspace.
+It is general across domains, not universal across every execution substrate.
 
 ## Governing beliefs
 
-- **Composition over provider allegiance.** Search, extraction, and interaction
-  capabilities should be selected for the subject and replaced without
-  redesigning the workflow.
-- **Stable envelopes, replaceable adapters.** Hound owns the versioned contracts,
-  bounds, identities, and lineage records. Adapters own provider-specific
-  transport and normalization.
-- **Discovery is not evidence.** Search results, snippets, rankings, and model
-  suggestions are leads until selected source material is captured and verified.
-- **Extraction and interaction are recorded transformations.** Derived text,
-  structured data, snapshots, screenshots, and browser state observations must
-  remain bound to the available source or provider bytes, method, attempts,
-  actions, and adapter identity that produced them.
-- **Domain policy belongs to the owner.** Hound must not become the hidden owner
-  of relevance, editorial judgment, reconciliation, or publication decisions.
-- **Credentials and effects are explicit.** Adapters receive only declared
-  authority. Reads are bounded; writes are planned, scoped, reviewable, and
-  verifiable.
-- **Partial failure stays visible.** Fallbacks, missing sources, provider errors,
-  and degraded extraction must remain part of the record rather than being
-  smoothed into apparent success.
-- **The kernel stays small.** Hound should add durable primitives and remove
-  repeated decision sites, not accumulate a bespoke pipeline for every domain.
+- **The owner owns meaning.** Relevance, transformation, quality, and business
+  policy stay in the repository driver. The kernel understands capabilities and
+  effects, not the domain.
+- **Review must bind content.** Approval of a verb or path is weaker than
+  approval of exact input, repository state, plan, scope, and expected file
+  effects.
+- **Drift invalidates authority.** A changed driver, manifest, environment,
+  repository, input, or plan requires a new plan and, when gated, a new witness.
+- **Receipts outlive runtimes.** Emitted records are a durable product contract.
+  New Hound versions must continue to verify historical records.
+- **Failure is evidence.** Driver diagnostics, partial effects, mismatches, and
+  failed checks remain visible rather than being compressed into apparent
+  success.
+- **Trust claims stay narrow.** Drivers are reviewed code, not sandboxed
+  plugins. Filesystem effects are checked postconditions. Hound does not claim
+  to enforce external effects it cannot independently observe.
+- **The kernel earns every line.** A new domain should require a small driver,
+  not a kernel concept.
 
 ## Product shape
 
-Hound presents one consistent lifecycle across projects:
+The durable surface is:
 
 ```text
-search → select → extract → interact only when required → inspect → apply → verify
+driver check
+invoke read capability → receipt
+plan write capability → deterministic expected effects
+approve exact plan → human witness
+execute unchanged plan → checked effects + immutable record
+verify record
 ```
 
-Projects compose trusted adapters through explicit capabilities. A search
-adapter may federate many engines, query a specialist database, inspect a local
-corpus, or call a commercial API. An extraction adapter may fetch an origin
-page, parse a document, call a structured endpoint, or derive normalized
-content. An interaction adapter may operate a disposable browser session when
-JavaScript or explicit page actions are unavoidable. These implementations may
-differ, but their outputs cross the same Hound contracts.
+Research, web acquisition, publishing, migrations, code generation, and other
+workflows may build on this lifecycle. They are extensions or owner
+capabilities, not identities Hound must absorb. GiveCare is a demanding proving
+ground for the primitive, not its product definition.
 
-Hound records the request and adapter identity, enforces budgets and credential
-boundaries, distinguishes leads from evidence, preserves immutable captures and
-transformation lineage, and verifies the handoff into owner logic. When a
-workflow writes durable state, Hound binds that state transition to a
-content-specific plan and run record.
+## Refusals
 
-Adapters are trusted, explicitly installed capabilities—not arbitrary code
-silently selected by a prompt. Hound verifies their boundaries; it does not
-pretend to sandbox untrusted providers or owner drivers.
+Hound will not become:
 
-## Direction of travel
+- a scheduler, retry service, notifier, or workflow DAG engine;
+- a provider registry, automatic fallback system, or general browser platform;
+- an owner of corpus, editorial, publication, or other domain semantics;
+- a global lineage database, dashboard, or artifact-management service;
+- an in-process sandbox for untrusted code;
+- a signature or public-attestation system; or
+- an authority that labels unobservable network or third-party effects safe.
 
-Hound should evolve toward:
-
-- one versioned adapter contract and explicit manifests shared across projects;
-- independently reusable search, extraction, and interaction capabilities;
-- adapter packages that evolve without changing guarded-write kernel identity;
-- complete lineage across raw capture, derived representations, interpretation,
-  and durable writes;
-- portable run records that can be inspected and verified outside the producing
-  project; and
-- explicit composition and fallback behavior rather than provider-specific
-  orchestration hidden in project scripts.
-
-The measure of progress is not the number of providers bundled into Hound. It is
-how easily a project can choose the right providers while retaining one coherent
-evidence and execution contract.
+Those systems may call Hound, wrap it, or consume its records. They do not
+belong in the kernel.
 
 ## Observable success
 
 Hound is succeeding when:
 
-- a new adapter can serve multiple owner projects without changing the kernel;
-- a project can replace a provider without rewriting its evidence pipeline;
-- every durable claim or data change can be traced to verified source material
-  and the transformations that produced it;
-- provider and extraction failures are diagnosable from the run record alone;
-- owner repositories contain domain policy rather than duplicated acquisition
-  and provenance machinery; and
-- operators can review and verify what happened without trusting an agent's
-  narrative.
+- a meaningful new domain works through a small driver with no kernel change;
+- a reviewer can see exact expected file effects before authorizing a write;
+- drift, mismatched bytes, and driver failures produce specific diagnostics;
+- a copied historical record verifies on future Hound versions;
+- extension and provider changes do not alter guarded-write kernel identity;
+- owner repositories delete duplicated planning and receipt machinery; and
+- kernel production code and domain vocabulary trend downward while evaluator
+  coverage grows.
 
 ## Document boundary
 
-This vision defines Hound's enduring promise and decision principles. Current
-providers, commands, schemas, file layouts, deployment choices, and implementation
-milestones belong in the README, protocol reference, architecture notes, and
-roadmap. They may change while this promise remains stable.
+This vision governs the enduring product boundary. Commands, schemas, file
+layouts, extension packages, provider choices, and migration instructions
+belong in the README and protocol documentation.

@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
-from .runtime import RuntimeErrorHound, write_bytes_create_or_confirm
-from .safety import public_hostname, secret_key, url_text_safe
+from hound_cli.runtime import RuntimeErrorHound, write_bytes_create_or_confirm
+from hound_cli.safety import public_hostname, secret_key, url_text_safe
 
 
 LEAD_SCHEMA = "hound.lead.v1"

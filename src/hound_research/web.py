@@ -17,10 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .contracts import canonical_hash, canonical_json, load_manifest
+from hound_cli.contracts import canonical_hash, canonical_json, load_manifest
+from hound_cli.orchestrator import HoundError, invoke_read_with_receipt
+from hound_cli.runtime import kernel_identity, write_bytes_create_or_confirm
+
 from .evidence import EvidenceError, make_lead, validate_public_url
-from .orchestrator import HoundError, invoke_read_with_receipt
-from .runtime import kernel_identity, write_bytes_create_or_confirm
 
 try:
     import fcntl
