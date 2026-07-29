@@ -7,8 +7,135 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from hound_web_adapters import camofox, firecrawl, searxng
+from hound_web_adapters import camofox, exa, firecrawl, searxng
 from hound_web_adapters._http import AdapterError
+
+
+def test_exa_normalizes_bounded_candidates_and_preserves_provider_cost_receipt() -> None:
+    calls: list[dict[str, object]] = []
+    body = json.dumps(
+        {
+            "results": [
+                {
+                    "id": "https://example.test/care-workforce",
+                    "url": "https://example.test/care-workforce",
+                    "title": "States test a new care-workforce model",
+                    "publishedDate": "2026-07-28T09:00:00Z",
+                    "author": "Casey Writer",
+                    "score": 0.91,
+                    "highlights": ["A state pilot changes how home-care workers are paid."],
+                }
+            ],
+            "requestId": "request-123",
+            "costDollars": {"total": 0.008},
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def transport(**call: object) -> tuple[int, bytes]:
+        calls.append(call)
+        return 200, body
+
+    data = exa.search(
+        {
+            "query": "care workforce policy",
+            "limit": 5,
+            "options": {
+                "type": "fast",
+                "category": "news",
+                "startPublishedDate": "2026-07-22T00:00:00Z",
+                "endPublishedDate": "2026-07-29T23:59:59Z",
+                "userLocation": "US",
+            },
+        },
+        env={"EXA_API_KEY": "secret-test-key"},
+        transport=transport,
+        retrieved_at="2026-07-29T12:00:00Z",
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "https://api.exa.ai/search"
+    assert calls[0]["headers"]["x-api-key"] == "secret-test-key"
+    assert json.loads(calls[0]["body"]) == {
+        "category": "news",
+        "contents": {
+            "highlights": {
+                "maxCharacters": 1_000,
+                "query": "care workforce policy",
+            }
+        },
+        "endPublishedDate": "2026-07-29T23:59:59Z",
+        "numResults": 5,
+        "query": "care workforce policy",
+        "startPublishedDate": "2026-07-22T00:00:00Z",
+        "type": "fast",
+        "userLocation": "US",
+    }
+    assert json.loads(base64.b64decode(data["raw"]["body_base64"]))["costDollars"] == {
+        "total": 0.008
+    }
+    assert data["usage"] == {"requests": 1, "bytes": len(body)}
+    assert data["output"]["leads"] == [
+        {
+            "schema_version": "hound.lead.v1",
+            "evidence_status": "not-evidence",
+            "provider": "exa",
+            "query": "care workforce policy",
+            "url": "https://example.test/care-workforce",
+            "title": "States test a new care-workforce model",
+            "metadata": {
+                "rank": 1,
+                "publishedDate": "2026-07-28T09:00:00Z",
+                "author": "Casey Writer",
+                "providerId": "https://example.test/care-workforce",
+                "score": 0.91,
+                "snippet": "A state pilot changes how home-care workers are paid.",
+                "category": "news",
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"type": "deep"}, "type must be auto or fast"),
+        (
+            {"category": "company", "startPublishedDate": "2026-07-01T00:00:00Z"},
+            "do not support",
+        ),
+        (
+            {
+                "startPublishedDate": "2026-07-30T00:00:00Z",
+                "endPublishedDate": "2026-07-29T00:00:00Z",
+            },
+            "must not follow",
+        ),
+        ({"includeDomains": ["https://example.com"]}, "invalid domain"),
+        ({"unsupported": True}, "not supported"),
+    ],
+)
+def test_exa_refuses_ambiguous_or_high_cost_options(
+    options: dict[str, object], message: str
+) -> None:
+    with pytest.raises(AdapterError, match=message):
+        exa.search(
+            {"query": "caregiving", "options": options},
+            env={"EXA_API_KEY": "secret-test-key"},
+            transport=lambda **_: (200, b'{"results":[]}'),
+        )
+
+
+def test_exa_structural_failure_retains_exact_provider_bytes() -> None:
+    raw = b'{"requestId":"broken","costDollars":{"total":0.007}}'
+    with pytest.raises(AdapterError, match="does not contain results") as caught:
+        exa.search(
+            {"query": "caregiving"},
+            env={"EXA_API_KEY": "secret-test-key"},
+            transport=lambda **_: (200, raw),
+        )
+    assert caught.value.raw == raw
+    assert caught.value.requests == 1
 
 
 def test_searxng_normalizes_bounded_candidates_with_engine_attribution() -> None:

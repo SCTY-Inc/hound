@@ -1,0 +1,26 @@
+{
+  "schema_version": "hound.driver.v1",
+  "id": "exa",
+  "protocol": "hound.protocol.v1",
+  "owner": {
+    "repo": "../.."
+  },
+  "exec": [
+    "python3",
+    "-B",
+    "bin/hound-web-adapter",
+    "exa"
+  ],
+  "capabilities": {
+    "web.search": {
+      "effect": "read",
+      "gate": "none",
+      "env_allowlist": [
+        "EXA_API_KEY"
+      ]
+    }
+  },
+  "timeouts_seconds": {
+    "web.search": 60
+  }
+}

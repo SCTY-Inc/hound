@@ -61,11 +61,25 @@ calling their services:
 
 ```bash
 uv run hound driver check --driver adapters/searxng/hound-driver.json
+uv run hound driver check --driver adapters/exa/hound-driver.json
 uv run hound driver check --driver adapters/firecrawl/hound-driver.json
 uv run hound driver check --driver adapters/camofox/hound-driver.json
 ```
 
-Run the [versioned SearXNG overlay](../examples/searxng/README.md), or use a
+For direct Exa discovery, set `EXA_API_KEY` and run:
+
+```bash
+uv run hound-research search \
+  --adapter adapters/exa/hound-driver.json \
+  --json '{"query":"care workforce policy","limit":5,"options":{"type":"auto","category":"news","startPublishedDate":"2026-07-01T00:00:00Z","userLocation":"US"}}'
+```
+
+The Exa adapter accepts only `auto` or `fast` search, known categories,
+publication date bounds, include/exclude domains, and a two-letter country
+location. It retains the exact response, including Exa's provider cost estimate,
+while every normalized result remains an untrusted lead.
+
+Alternatively, run the [versioned SearXNG overlay](../examples/searxng/README.md), or use a
 trusted instance whose JSON format is enabled:
 
 ```bash

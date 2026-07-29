@@ -14,7 +14,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_first_party_adapter_manifests_handshake_through_the_public_driver_protocol() -> None:
-    for name in ("searxng", "firecrawl", "camofox"):
+    for name in ("searxng", "exa", "firecrawl", "camofox"):
         result = check_driver(ROOT / "adapters" / name / "hound-driver.json")
         assert result["ok"] is True
         assert result["data"]["adapter"] == name

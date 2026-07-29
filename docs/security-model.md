@@ -63,6 +63,9 @@ value may appear in request provenance and must be a credential-free HTTP root
 URL with no path, query, fragment, or user information.
 SearXNG custom-engine credentials belong to the separately operated SearXNG
 service and are never Hound search input.
+The direct Exa adapter receives only `EXA_API_KEY`; the key is sent in the
+provider header and never copied into request input, output, raw response, or
+diagnostics.
 
 Agent-supplied targets must be public HTTP(S) URLs. Literal loopback, private,
 link-local, malformed, credential-bearing, and ambiguous secret-parameter URLs
@@ -72,9 +75,11 @@ adapter and must preserve the same target policy. URL parsing cannot prevent DNS
 rebinding or constrain a browser's network; real private-network exclusion
 requires container or host egress controls.
 
-Search responses are leads marked `not-evidence`. SearXNG records its exact
+Search responses are leads marked `not-evidence`. Hound binds the exact Exa
+request to the exact response, including the provider request ID and cost
+receipt. SearXNG records its exact
 `/config` and page responses, engine attribution, and unresponsive-engine
-errors, but none of those turns a result into evidence. Firecrawl markdown and
+errors. None of those turns a result into evidence. Firecrawl markdown and
 Camofox snapshots are `provider-derived`: Hound stores the exact provider
 response and derivation hashes but does not claim those transformations are raw
 origin bytes. A separate origin capture is required when owner policy needs that

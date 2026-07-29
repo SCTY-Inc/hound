@@ -19,8 +19,8 @@ uv tool install --force --refresh-package evidence-hound .
 
 Hound's kernel and first-party adapter bundle use the Python standard library.
 Pytest and PyYAML are development dependencies; PyYAML validates the SearXNG
-settings overlay. SearXNG, Firecrawl, and Camofox remain separate services
-rather than package dependencies.
+settings overlay. Exa is called directly over HTTPS; SearXNG, Firecrawl, and
+Camofox remain separate services rather than package dependencies.
 
 ## Run the verification gate
 
