@@ -11,7 +11,7 @@
     "Lexus TX",
     "Lexus GX 460"
   ],
-  "search_adapter": "../../adapters/searxng/hound-driver.json",
+  "search_adapter": "../../adapters/exa/hound-driver.json",
   "extract_adapter": "../../adapters/firecrawl/hound-driver.json",
   "record_root": ".hound/web",
   "database": ".hound/listings.sqlite3",

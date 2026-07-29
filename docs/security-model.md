@@ -61,8 +61,6 @@ credential-like allowlisted values before accepting or persisting a response.
 Public service configuration uses environment names ending in `_ENDPOINT`; its
 value may appear in request provenance and must be a credential-free HTTP root
 URL with no path, query, fragment, or user information.
-SearXNG custom-engine credentials belong to the separately operated SearXNG
-service and are never Hound search input.
 The direct Exa adapter receives only `EXA_API_KEY`; the key is sent in the
 provider header and never copied into request input, output, raw response, or
 diagnostics.
@@ -77,9 +75,7 @@ requires container or host egress controls.
 
 Search responses are leads marked `not-evidence`. Hound binds the exact Exa
 request to the exact response, including the provider request ID and cost
-receipt. SearXNG records its exact
-`/config` and page responses, engine attribution, and unresponsive-engine
-errors. None of those turns a result into evidence. Firecrawl markdown and
+receipt. None of those turns a result into evidence. Firecrawl markdown and
 Camofox snapshots are `provider-derived`: Hound stores the exact provider
 response and derivation hashes but does not claim those transformations are raw
 origin bytes. A separate origin capture is required when owner policy needs that

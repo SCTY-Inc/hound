@@ -60,7 +60,6 @@ The first-party adapters are ordinary Hound drivers and can be checked without
 calling their services:
 
 ```bash
-uv run hound driver check --driver adapters/searxng/hound-driver.json
 uv run hound driver check --driver adapters/exa/hound-driver.json
 uv run hound driver check --driver adapters/firecrawl/hound-driver.json
 uv run hound driver check --driver adapters/camofox/hound-driver.json
@@ -78,30 +77,6 @@ The Exa adapter accepts only `auto` or `fast` search, known categories,
 publication date bounds, include/exclude domains, and a two-letter country
 location. It retains the exact response, including Exa's provider cost estimate,
 while every normalized result remains an untrusted lead.
-
-Alternatively, run the [versioned SearXNG overlay](../examples/searxng/README.md), or use a
-trusted instance whose JSON format is enabled:
-
-```bash
-export SEARXNG_ENDPOINT=http://127.0.0.1:8080
-uv run hound-research search \
-  --adapter adapters/searxng/hound-driver.json \
-  --json '{
-    "query":"family caregiver benefits",
-    "limit":5,
-    "options":{"engines":["federal register"],"max_pages":1}
-  }'
-```
-
-Use either `engines` or `categories`. SearXNG options also support `language`,
-`time_range` (`day`, `month`, or `year`), `safesearch` (`0` through `2`), and
-bounded `max_pages` (`1` through `5`). Pass routing through `options`; the
-adapter rejects SearXNG bang, language-prefix, and timeout syntax hidden inside
-the query. Hound checks `/config` before search so a missing or disabled route
-fails visibly. A search that returns no leads while any requested engine was
-unresponsive also fails, so a broken route is never reported as an empty
-result. Engine failures alongside surviving leads stay a success and are
-reported at `routing.unresponsive_engines` for the caller to judge.
 
 The command returns compact leads and writes the exact adapter response plus its
 request, adapter identity, hashes, and normalized output under `.hound/web/`.

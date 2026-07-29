@@ -6,7 +6,7 @@ This example proves that Hound's three web primitives compose into a useful
 owner workflow without putting scheduling, valuation, browser policy, or Discord
 inside the kernel.
 
-The cycle performs at most five SearXNG searches, deduplicates candidate URLs,
+The cycle performs at most five direct Exa searches, deduplicates candidate URLs,
 asks Firecrawl to extract each selected detail page, stores verified observations
 in SQLite, values groups with at least three comparable asking prices, and emits
 Discord webhook payloads only for new or changed listings at least 15% below the
@@ -14,11 +14,10 @@ comparable median.
 
 ## Configure services
 
-Run a trusted SearXNG instance with JSON output enabled, then export its URL and
-the hosted Firecrawl credential:
+Export the direct Exa and hosted Firecrawl credentials:
 
 ```bash
-export SEARXNG_ENDPOINT=http://127.0.0.1:8080
+export EXA_API_KEY=...
 export FIRECRAWL_API_KEY=...
 ```
 

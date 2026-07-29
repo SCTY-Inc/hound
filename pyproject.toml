@@ -34,7 +34,6 @@ hound-web-adapter = "hound_web_adapters.cli:main"
 [dependency-groups]
 dev = [
   "pytest>=8.3",
-  "pyyaml==6.0.2",
 ]
 
 [tool.hatch.build.targets.wheel]

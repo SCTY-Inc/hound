@@ -15,11 +15,11 @@ def _lead(url: str, title: str) -> dict[str, object]:
         "search_record_id": "a" * 64,
         "schema_version": "hound.lead.v1",
         "evidence_status": "not-evidence",
-        "provider": "searxng",
+        "provider": "exa",
         "query": "used Lexus GX 460 Long Island dealer",
         "url": url,
         "title": title,
-        "metadata": {"engines": ["brave"], "rank": 1},
+        "metadata": {"rank": 1},
     }
 
 

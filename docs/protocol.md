@@ -217,12 +217,7 @@ appear in any response or diagnostic.
   Exa accepts `auto` or `fast` search, a known category, ISO publication-date
   bounds, include/exclude domains, and a two-letter country location. Deep or
   synthesized search modes are refused. One exact Exa response is retained,
-  including its provider cost estimate. SearXNG accepts either explicit engines
-  or categories, plus language, day/month/year range, safe-search level, and
-  `max_pages` from 1 through 5. Engine bangs, language prefixes, and timeout
-  controls are rejected in query text so routing remains explicit. Its output
-  preserves configuration hash, completed pages, suggestions, corrections, and
-  unresponsive-engine diagnostics.
+  including its provider cost estimate.
 - `hound.web.extract.v1` contains known-URL documents with markdown, markdown
   digest, public links, metadata, and `evidence_class: "provider-derived"`.
   Input lineage is mandatory: either an explicit direct root or an exact search

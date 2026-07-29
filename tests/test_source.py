@@ -42,11 +42,11 @@ def _search_data(query: str = "care workforce") -> dict[str, object]:
                 {
                     "schema_version": "hound.lead.v1",
                     "evidence_status": "not-evidence",
-                    "provider": "searxng",
+                    "provider": "exa",
                     "query": query,
                     "url": "https://example.test/one",
                     "title": "First result",
-                    "metadata": {"engines": ["federal register"], "rank": 1},
+                    "metadata": {"rank": 1},
                 }
             ],
         },

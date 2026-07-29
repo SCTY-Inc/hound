@@ -20,11 +20,11 @@ def _lead(url: str = "https://example.test/listing") -> dict[str, object]:
     return {
         "schema_version": "hound.lead.v1",
         "evidence_status": "not-evidence",
-        "provider": "searxng",
+        "provider": "exa",
         "query": "used family SUV Long Island",
         "url": url,
         "title": "2021 family SUV",
-        "metadata": {"engines": ["brave"], "rank": 1},
+        "metadata": {"rank": 1},
     }
 
 

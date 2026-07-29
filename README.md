@@ -170,7 +170,7 @@ hound-research capture store|verify
 hound-research verify
 ```
 
-First-party Exa, SearXNG, Firecrawl, and Camofox adapters live outside
+First-party Exa, Firecrawl, and Camofox adapters live outside
 `hound_cli`, so their code does not alter guarded-write kernel identity.
 Existing manifests with top-level `source` metadata remain compatible; new
 extensions belong under generic manifest `extensions` metadata.

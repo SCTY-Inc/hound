@@ -14,13 +14,12 @@ from typing import Any
 from hound_cli.contracts import canonical_json
 from hound_research.web import WebError
 
-from . import camofox, exa, firecrawl, searxng
+from . import camofox, exa, firecrawl
 from ._http import AdapterError
 
 
 Adapter = Callable[..., dict[str, Any]]
 _ADAPTERS: dict[str, tuple[str, Adapter]] = {
-    "searxng": ("web.search", searxng.search),
     "exa": ("web.search", exa.search),
     "firecrawl": ("web.extract", firecrawl.extract),
     "camofox": ("web.interact", camofox.interact),
@@ -69,7 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     response: dict[str, Any]
     try:
         if len(arguments) != 1:
-            raise AdapterError("usage: hound-web-adapter searxng|exa|firecrawl|camofox")
+            raise AdapterError("usage: hound-web-adapter exa|firecrawl|camofox")
         request = json.load(sys.stdin)
         response = run(arguments[0], request, os.environ)
     except (AdapterError, WebError, ValueError, json.JSONDecodeError) as error:

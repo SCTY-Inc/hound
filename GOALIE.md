@@ -1,6 +1,6 @@
 # Goal: hard-cut Hound to one honest execution and acquisition core
 
-Status: **Implementation verified — production cutover blocked on SearXNG service and Firecrawl quota**
+Status: **Complete — direct Exa cutover verified and the retired search service removed**
 
 ## Outcome
 
@@ -71,31 +71,30 @@ are deleted in the same coordinated migration as all known owner call sites.
 
 ## Verification evidence
 
-- Hound: **259 passed**; Black 25.1.0, Ruff 0.11.0, and `git diff
+- Hound: **274 passed**; Ruff 0.11.0, scoped Black 25.1.0, and `git diff
   --check` pass.
-- The former 6,578-line kernel is 4,536 lines. Provider implementations are
-  1,005 lines in a separate package namespace. Whole-product Python fell to
-  5,541 lines: about 31% less kernel and 16% less total implementation.
-- The 1,629-line provider/source-pack island, Scrapling and its seven transitive
-  dependencies, provider CLI, and owner-domain CLI registry are gone.
-- GC-web Pulse: **145 passed** plus TypeScript typecheck. GC-Intel: **17
-  passed**. GC-wiki's full contract suite passed. GC-Benefits: **1,901 passed**.
+- The kernel surface is unchanged. The retired adapter, service, overlay,
+  probe, operator docs, and dedicated tests were deleted, shrinking the tracked
+  changeset by more than 3,000 lines and removing PyYAML.
+- GC-web Pulse: **227 pipeline + 10 article + 26 app tests** and both
+  TypeScript typechecks passed. GC-Intel: **30 passed**. GC-wiki's lint and
+  full contract suite passed. GC-Benefits: **1,937 passed** plus all 429
+  program records validated.
 - All four owner driver checks and representative read invocations passed.
-- A pinned local SearXNG completed the real Pulse source-v2 discovery path:
-  six search records, six `not-evidence` leads, zero diagnostics; every record
-  verified. No Firecrawl credit was used.
+- Direct Exa completed the real source-v2 discovery paths with provider cost
+  receipts; every migrated consumer then passed a bounded live automation gate.
 - Wheel and source distribution built. A dependency-free clean environment
-  installed both console scripts and completed faux search → exact lead →
+  installed all three console scripts and completed faux search → exact lead →
   extract → inspect → record verification. The wheel contains no provider
   runtime or source packs.
 - All temporary Hound containers were removed. Relevant owner files were
   migrated without reverting or staging unrelated dirty work.
 
-Production cutover is intentionally not performed: the enabled Pulse timer
-still needs a persistent pinned SearXNG endpoint, and Firecrawl previously
-reported overdrawn credits. The migrated conductor points at this verified
-worktree Hound, but it must not be shipped or allowed to reach its next scheduled
-run until those external services are ready or the migration is held back.
+Production cutover completed on 2026-07-29. The enabled user service, unit
+drop-in, mounted configuration, custom engine, environment endpoint, container,
+and pinned image were removed after the direct replacements passed their live
+and deterministic gates. The adapter, overlay, probe, service assets, dedicated
+tests, and obsolete PyYAML dependency were deleted from this repository.
 
 ## Deliberately retained defenses
 
