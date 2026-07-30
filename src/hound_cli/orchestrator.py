@@ -861,6 +861,12 @@ def _execute_plan_locked(
         item for item in changed if not _actual_matches_expected(item, expected)
     ]
     missing = [item for item in expected if item not in changed]
+    reported_failure = (
+        _driver_failure("driver reported failure", response)
+        if response is not None
+        and (not response["ok"] or response["outcome"] == "failed")
+        else None
+    )
 
     if driver_interrupt is not None:
         error = "driver interrupted"
@@ -879,7 +885,14 @@ def _execute_plan_locked(
     elif unexpected:
         error = f"driver wrote outside its approved plan: {', '.join(unexpected)}"
     elif missing:
-        error = f"driver did not produce its approved writes: {', '.join(missing)}"
+        missing_error = (
+            f"driver did not produce its approved writes: {', '.join(missing)}"
+        )
+        error = (
+            f"{reported_failure}; {missing_error}"
+            if reported_failure is not None
+            else missing_error
+        )
     elif expected_effects is not None and observed_effects != expected_effects:
         mismatched = [
             expected_effect["path"]
@@ -896,8 +909,8 @@ def _execute_plan_locked(
         "failed",
     }:
         error = f"driver returned invalid outcome for execute mode: {response['outcome']}"
-    elif response is not None and (not response["ok"] or response["outcome"] == "failed"):
-        error = _driver_failure("driver reported failure", response)
+    elif reported_failure is not None:
+        error = reported_failure
     else:
         error = None
 

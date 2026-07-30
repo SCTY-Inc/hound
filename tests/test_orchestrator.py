@@ -240,12 +240,12 @@ def test_plan_requires_driver_ok(driver_repo: tuple[Path, Path]) -> None:
 def test_execute_surfaces_driver_diagnostics(
     driver_repo: tuple[Path, Path],
 ) -> None:
-    _, manifest_path = driver_repo
+    repo, manifest_path = driver_repo
     plan = make_plan(
         manifest_path,
         "edition.build",
         {
-            "expected_writes": [],
+            "exact_effects": True,
             "skip_write": True,
             "execute_fail": True,
             "execute_diagnostics": [
@@ -255,8 +255,18 @@ def test_execute_surfaces_driver_diagnostics(
         as_of="2026-07-17",
     )
 
-    with pytest.raises(HoundError, match="upstream rejected candidate"):
+    with pytest.raises(HoundError) as caught:
         execute_plan(manifest_path, plan)
+
+    error = str(caught.value)
+    assert "upstream rejected candidate" in error
+    assert "did not produce its approved writes: output/result.json" in error
+    result = json.loads(
+        (
+            repo / ".hound" / "runs" / plan["plan_id"] / "result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["error"] == error
 
 
 def test_plan_requires_object_driver_data(driver_repo: tuple[Path, Path]) -> None:
