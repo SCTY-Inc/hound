@@ -216,8 +216,12 @@ appear in any response or diagnostic.
   attached. Search input may include a bounded adapter-owned `options` object.
   Exa accepts `auto` or `fast` search, a known category, ISO publication-date
   bounds, include/exclude domains, and a two-letter country location. Deep or
-  synthesized search modes are refused. One exact Exa response is retained,
-  including its provider cost estimate.
+  synthesized search modes are refused. Exa retries 401, 408, 409, 425, 429,
+  and 5xx statuses at most twice with short backoffs. A single response remains
+  the exact raw body; any retry path retains every exact response in the
+  canonical HTTP-exchanges envelope, including provider cost estimates.
+  Transport attempts that receive no HTTP response count toward usage without
+  fabricating an exchange.
 - `hound.web.extract.v1` contains known-URL documents with markdown, markdown
   digest, public links, metadata, and `evidence_class: "provider-derived"`.
   Input lineage is mandatory: either an explicit direct root or an exact search

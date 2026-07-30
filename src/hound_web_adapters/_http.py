@@ -24,11 +24,13 @@ class AdapterError(ValueError):
         raw: bytes = b"",
         media_type: str = "application/octet-stream",
         requests: int = 0,
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.raw = raw
         self.media_type = media_type
         self.requests = requests
+        self.retryable = retryable
 
     def with_raw(
         self,
@@ -37,7 +39,13 @@ class AdapterError(ValueError):
         media_type: str = "application/json",
         requests: int = 1,
     ) -> "AdapterError":
-        return AdapterError(str(self), raw=raw, media_type=media_type, requests=requests)
+        return AdapterError(
+            str(self),
+            raw=raw,
+            media_type=media_type,
+            requests=requests,
+            retryable=self.retryable,
+        )
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -97,9 +105,9 @@ def request(
         status = error.code
         error.close()
     except Exception as error:
-        raise AdapterError("provider transport failed") from error
+        raise AdapterError("provider transport failed", requests=1, retryable=True) from error
     if len(payload) > MAX_RESPONSE_BYTES:
-        raise AdapterError("provider response exceeded the byte ceiling")
+        raise AdapterError("provider response exceeded the byte ceiling", requests=1)
     return status, payload
 
 
