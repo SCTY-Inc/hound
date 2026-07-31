@@ -75,6 +75,26 @@ def _fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
+def _swap_index(root: Path, kind: str, *, outside: Path | None = None, swap_back: bool = False) -> None:
+    """Replace the visible projection leaf while a held descriptor remains open."""
+
+    index = root / "index.sqlite"
+    original = root / ".index.sqlite.original"
+    index.rename(original)
+    if kind == "symlink":
+        assert outside is not None
+        index.symlink_to(outside / "index.sqlite")
+    elif kind == "different-file":
+        replacement = root / ".index.sqlite.replacement"
+        replacement.write_bytes(b"not the held database")
+        replacement.rename(index)
+    else:  # pragma: no cover - defensive parameter guard
+        raise AssertionError(f"unknown leaf replacement kind: {kind}")
+    if swap_back:
+        index.unlink()
+        original.rename(index)
+
+
 def test_hsp20_delete_rebuild_projection_matches_journal_and_detects_drift(tmp_path) -> None:
     store = HounddStore(tmp_path / "store")
     _populate(store)
@@ -198,6 +218,151 @@ def test_hsp20_projection_delete_fails_closed_when_root_swaps_around_unlink(
 
     with pytest.raises(UnsafeStoreError):
         store.projection.delete()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "different-file"])
+def test_hsp20_projection_rows_refuses_leaf_replacement_during_sqlite_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_connect = sqlite3.connect
+
+    def connect_with_leaf_swap(*args, **kwargs):
+        _swap_index(store.root, replacement_kind, outside=outside)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_leaf_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.projection.rows()
+    assert not (outside / "index.sqlite").exists()
+
+
+def test_hsp20_projection_rows_refuses_leaf_swap_back_during_sqlite_open(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    real_connect = sqlite3.connect
+
+    def connect_with_swap_back(*args, **kwargs):
+        _swap_index(store.root, "different-file", swap_back=True)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
+
+    with pytest.raises(UnsafeStoreError):
+        store.projection.rows()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "different-file"])
+def test_hsp20_verify_store_never_accepts_leaf_replacement_truth(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def connect_with_leaf_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_index(store.root, replacement_kind, outside=outside)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_leaf_swap)
+
+    report = verify_store(store.root)
+    assert report["valid"] is False
+    assert report["failures"]
+    assert not (outside / "index.sqlite").exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "different-file"])
+@pytest.mark.parametrize("populated", [False, True])
+def test_hsp20_projection_rebuild_refuses_leaf_replacement_without_outside_write(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str, populated: bool
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    if populated:
+        _populate(store, count=1)
+        monkeypatch.setattr(store.records, "verify_record", lambda *_args, **_kwargs: True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_connect = sqlite3.connect
+
+    def connect_with_leaf_swap(*args, **kwargs):
+        _swap_index(store.root, replacement_kind, outside=outside)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_leaf_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.rebuild_index()
+    assert not (outside / "index.sqlite").exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "different-file"])
+def test_hsp20_projection_delete_refuses_leaf_replacement_around_unlink(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_unlink = os.unlink
+
+    def unlink_with_leaf_swap(*args, **kwargs):
+        _swap_index(store.root, replacement_kind, outside=outside)
+        return real_unlink(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.os.unlink", unlink_with_leaf_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.projection.delete()
+    assert not (outside / "index.sqlite").exists()
+
+
+def test_hsp20_projection_refuses_preexisting_leaf_symlink(tmp_path) -> None:
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside.sqlite"
+    root.joinpath("index.sqlite").symlink_to(outside)
+
+    with pytest.raises(UnsafeStoreError):
+        HounddStore(root)
+
+
+def test_hsp20_projection_rows_are_read_only_and_projection_fds_are_flat(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    before = _tree_snapshot(store.root)
+    index_before = store.projection.path.stat()
+    baseline = _fd_count()
+    for _ in range(20):
+        assert store.projection.rows()
+    index_after = store.projection.path.stat()
+    assert _tree_snapshot(store.root) == before
+    assert (index_after.st_mtime_ns, index_after.st_ctime_ns, index_after.st_size) == (
+        index_before.st_mtime_ns,
+        index_before.st_ctime_ns,
+        index_before.st_size,
+    )
+    assert _fd_count() == baseline
+
+    def failing_connect(*_args, **_kwargs):
+        raise sqlite3.OperationalError("injected sqlite open failure")
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", failing_connect)
+    failure_baseline = _fd_count()
+    for _ in range(10):
+        with pytest.raises(ProjectionError):
+            store.projection.rows()
+    assert _fd_count() == failure_baseline
 
 
 def test_hsp20_tamper_and_orphans_fail_independent_verification(tmp_path) -> None:
