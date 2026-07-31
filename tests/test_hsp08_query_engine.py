@@ -28,6 +28,8 @@ from houndd.query_engine import (
     JournalQueryEngine,
     JournalQuerySnapshot,
     QueryContext,
+    QueryEngineError,
+    QueryItem,
     dedupe_replay_entry_ids,
 )
 
@@ -59,7 +61,7 @@ def _event(
             "hash": _digest(f"record-{sequence}"),
             "authorized_uri": f"houndd://record/{sequence}",
         },
-        lineage={"relation": "none", "record_id": f"record-{sequence}", "lead_id": "none"},
+        lineage={"relation": "none", "record_id": f"lineage-record-{sequence}", "lead_id": "none"},
         source={"provider": provider, "native_id": f"native-{sequence}", "canonical_url": url},
         classification={"outcome": outcome, "evidence_status": evidence_status},
         access=access,
@@ -118,14 +120,14 @@ def _projection(events: list[dict[str, object]]) -> ProvenanceProjection:
                 "topic",
                 event["entry_id"],
                 topic,
-                AnnotationHeader("workspace", event["policy_id"], ProducerClaim("owner", "capture", "annotation")),
+                AnnotationHeader("workspace", event["policy_id"], ProducerClaim("owner", "capture", event["producer"]["run_id"])),
                 source="owner:topics",
             ),
             OwnerAnnotation(
                 "entity",
                 event["entry_id"],
                 entity,
-                AnnotationHeader("workspace", event["policy_id"], ProducerClaim("owner", "capture", "annotation")),
+                AnnotationHeader("workspace", event["policy_id"], ProducerClaim("owner", "capture", event["producer"]["run_id"])),
                 source="owner:entities",
             ),
         )
@@ -202,10 +204,34 @@ def test_hsp08_six_event_matrix_orders_chronologically_and_is_insertion_independ
 )
 def test_hsp08_every_canonical_and_provenance_filter_family(filter_value, expected) -> None:
     events, snapshot, projection, scope, context, codec = _matrix()
-    if "entry_id" not in filter_value and expected == [0]:
-        filter_value = {"entry_id": [events[0]["entry_id"]]}
     page = _query(QueryRequest(parse_query_filter(filter_value), limit=10), snapshot, projection, scope, context, codec)
     assert _ids(page) == [events[index]["entry_id"] for index in expected]
+
+
+def test_hsp08_record_id_uses_artifact_identity_not_lineage_identity() -> None:
+    events, snapshot, projection, scope, context, codec = _matrix()
+    assert events[4]["artifact"]["record_id"] == "record-4"
+    assert events[4]["lineage"]["record_id"] == "lineage-record-4"
+
+    artifact_match = _query(
+        QueryRequest(parse_query_filter({"record_id": ["record-4"]}), limit=10),
+        snapshot,
+        projection,
+        scope,
+        context,
+        codec,
+    )
+    lineage_non_match = _query(
+        QueryRequest(parse_query_filter({"record_id": ["lineage-record-4"]}), limit=10),
+        snapshot,
+        projection,
+        scope,
+        context,
+        codec,
+    )
+
+    assert _ids(artifact_match) == [events[4]["entry_id"]]
+    assert _ids(lineage_non_match) == []
 
 
 def test_hsp08_entry_id_or_and_cross_family_and_time_bounds_are_exact() -> None:
@@ -226,11 +252,12 @@ def test_hsp08_entry_id_or_and_cross_family_and_time_bounds_are_exact() -> None:
 
 
 def test_hsp08_fixed_hwm_multi_page_replay_has_no_loss_or_duplication_and_excludes_concurrent_e6() -> None:
-    old_events, old_snapshot, projection, scope, old_context, codec = _matrix()
+    old_events, old_snapshot, projection, _, _, codec = _matrix()
+    all_events, new_snapshot, new_projection, scope, _, _ = _matrix(include_e6=True)
+    old_context = QueryContext.from_projection("generation-1", scope, old_snapshot, projection)
     first = _query(QueryRequest(parse_query_filter({}), limit=2), old_snapshot, projection, scope, old_context, codec)
     assert first.next_cursor is not None
 
-    all_events, new_snapshot, new_projection, _, _, _ = _matrix(include_e6=True)
     second = _query(QueryRequest(parse_query_filter({}), limit=2, cursor=first.next_cursor), new_snapshot, new_projection, scope, old_context, codec)
     third = _query(QueryRequest(parse_query_filter({}), limit=2, cursor=second.next_cursor), new_snapshot, new_projection, scope, old_context, codec)
 
@@ -255,3 +282,33 @@ def test_hsp08_pure_replay_dedupe_uses_only_entry_ids_and_returns_new_state() ->
     assert result.new_entry_ids == (_digest("a"),)
     assert result.seen_entry_ids == frozenset({_digest("a"), _digest("b")})
     assert first == (_digest("a"), _digest("b"), _digest("a"))
+
+
+@pytest.mark.parametrize(
+    ("entry_ids", "seen_entry_ids"),
+    [
+        (_digest("incoming"), ()),
+        (_digest("incoming").encode("ascii"), ()),
+        ((_digest("incoming"),), _digest("seen")),
+        ((_digest("incoming"),), _digest("seen").encode("ascii")),
+        (("A" * 64,), ()),
+        (("f" * 63,), ()),
+        (("g" * 64,), ()),
+        ((_digest("incoming"),), ("A" * 64,)),
+    ],
+)
+def test_hsp08_replay_dedupe_requires_collections_of_canonical_entry_ids(entry_ids, seen_entry_ids) -> None:
+    with pytest.raises(QueryEngineError):
+        dedupe_replay_entry_ids(entry_ids, seen_entry_ids)
+
+
+def test_hsp08_direct_query_item_clones_and_deeply_freezes_its_event() -> None:
+    events, snapshot, projection, scope, _, _ = _matrix()
+    event = events[0]
+    item = QueryItem(event, projection.project(scope, snapshot.events[0]))
+
+    event["source"]["provider"] = "mutated-after-construction"
+
+    assert item.event["source"]["provider"] == "exa"
+    with pytest.raises(TypeError):
+        item.event["source"]["provider"] = "forged"  # type: ignore[index]

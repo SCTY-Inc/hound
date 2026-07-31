@@ -66,7 +66,7 @@ def _scope_value(scope: PrincipalScope) -> dict[str, Any]:
 
 @dataclass(frozen=True, slots=True)
 class AnnotationHeader:
-    """The independently authorized header of an owner annotation."""
+    """The authorization and target-semantics header of an owner annotation."""
 
     access: str
     policy_id: str
@@ -161,7 +161,7 @@ class LaneRule:
 
 @dataclass(frozen=True, slots=True)
 class OwnerAnnotation:
-    """A content-addressed topic/entity value attached to one journal entry."""
+    """A content-addressed topic/entity value bound to one event header."""
 
     kind: str
     entry_id: str
@@ -207,6 +207,25 @@ class OwnerAnnotation:
     def verify(self) -> None:
         if self.kind not in _ANNOTATION_KINDS or self.provenance_id != canonical_hash(self._body()):
             raise ProvenanceError("owner annotation digest does not match its immutable body")
+
+    def matches_target(self, event: Mapping[str, object]) -> bool:
+        try:
+            entry_id = _digest(event["entry_id"], "event entry_id")
+            policy_id = _text(event["policy_id"], "event policy_id")
+            producer = event["producer"]
+            if not isinstance(producer, Mapping) or set(producer) != {"owner_id", "capability", "run_id"}:
+                raise ProvenanceError("event producer is invalid")
+            producer_value = {
+                field: _text(producer[field], f"event producer.{field}")
+                for field in ("owner_id", "capability", "run_id")
+            }
+        except (KeyError, TypeError) as error:
+            raise ProvenanceError("event annotation target is invalid") from error
+        return (
+            self.entry_id == entry_id
+            and self.header.policy_id == policy_id
+            and _producer_value(self.header.producer) == producer_value
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,11 +335,14 @@ class ProvenanceProjection:
 
     def _authorized_values(self, scope: PrincipalScope, event: Mapping[str, object], kind: str) -> tuple[ProvenanceValue, ...]:
         entry_id = self._entry_id(event)
-        return tuple(
-            ProvenanceValue(annotation.value, annotation.source, annotation.provenance_id)
-            for annotation in self._annotations.get((entry_id, kind), ())
-            if annotation.header.is_authorized(scope)
-        )
+        values: list[ProvenanceValue] = []
+        for annotation in self._annotations.get((entry_id, kind), ()):
+            if not annotation.header.is_authorized(scope):
+                continue
+            if not annotation.matches_target(event):
+                raise ProvenanceError("owner annotation target does not match its authorized event")
+            values.append(ProvenanceValue(annotation.value, annotation.source, annotation.provenance_id))
+        return tuple(values)
 
     def project(self, scope: PrincipalScope, event: Mapping[str, object]) -> EventProvenance:
         """Resolve only after the event header has independently authorized."""

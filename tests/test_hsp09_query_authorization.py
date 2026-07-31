@@ -74,6 +74,8 @@ def _codec() -> CursorCodec:
 
 
 def _execute(request, scope, snapshot, provenance, context=None):
+    if context is None and isinstance(scope, PrincipalScope):
+        context = QueryContext.from_projection("generation", scope, snapshot, provenance)
     return JournalQueryEngine().execute(
         request,
         scope,
@@ -110,20 +112,42 @@ def test_hsp09_unauthorized_event_body_is_not_inspected_beyond_three_header_fiel
 
     observed = ObservedEvent(unauthorized)
     object.__setattr__(snapshot, "events", (observed,))
-    called = False
+    project_called = False
+    context_called = False
+    recover_called = False
     original_project = ProvenanceProjection.project
 
     def project_spy(self, scope, event):
-        nonlocal called
-        called = True
+        nonlocal project_called
+        project_called = True
         return original_project(self, scope, event)
 
+    def context_spy(self, scope, events):
+        nonlocal context_called
+        context_called = True
+        raise AssertionError("provenance context inspected for a scope with no authorized headers")
+
+    def recover_spy(self, token, bindings, recovery):
+        nonlocal recover_called
+        recover_called = True
+        raise AssertionError("cursor recovery called for a scope with no authorized headers")
+
     monkeypatch.setattr(ProvenanceProjection, "project", project_spy)
-    page = _execute(QueryRequest(parse_query_filter({"source": {"provider": ["secret-provider"]}}), limit=1), _scope(), snapshot, ProvenanceProjection())
+    monkeypatch.setattr(ProvenanceProjection, "access_scoped_context_hash", context_spy)
+    monkeypatch.setattr(CursorCodec, "recover", recover_spy)
+    page = _execute(
+        QueryRequest(parse_query_filter({"source": {"provider": ["secret-provider"]}}), limit=1, cursor="opaque"),
+        _scope(),
+        snapshot,
+        ProvenanceProjection(),
+        QueryContext("generation", _digest("caller-chosen")),
+    )
 
     assert page is EMPTY_QUERY_PAGE
     assert set(observed.inspected) == {"access", "policy_id", "producer"}
-    assert called is False
+    assert project_called is False
+    assert context_called is False
+    assert recover_called is False
 
 
 def test_hsp09_unauthorized_and_nonexistent_entry_or_topic_are_the_same_empty_shape() -> None:
@@ -151,13 +175,14 @@ def test_hsp09_forged_request_producer_filter_never_replaces_the_authenticated_s
 
 
 def test_hsp09_unauthorized_annotation_cannot_change_results_filters_cursors_or_context() -> None:
-    event = _event(0, policy_id="policy-allowed", owner="allowed", access="public", when="2026-07-31T00:00:00Z", provider="visible")
-    snapshot = _snapshot([event])
+    event = _event(0, policy_id="policy-allowed", owner="allowed", access="public", when="2026-07-31T01:00:00Z", provider="visible")
+    earlier = _event(1, policy_id="policy-allowed", owner="allowed", access="public", when="2026-07-31T00:00:00Z", provider="also-visible")
+    snapshot = _snapshot([event, earlier])
     lane = LaneRule("policy-allowed", "allowed", "capture", "public-lane", source="policy")
     denied = OwnerAnnotation(
         "topic",
-        event["entry_id"],
-        "hidden-topic",
+        earlier["entry_id"],
+        "visible-topic",
         AnnotationHeader("restricted", "policy-hidden", ProducerClaim("hidden", "capture", "annotation")),
         source="hidden-owner",
     )
@@ -165,7 +190,7 @@ def test_hsp09_unauthorized_annotation_cannot_change_results_filters_cursors_or_
         "topic",
         event["entry_id"],
         "visible-topic",
-        AnnotationHeader("public", "policy-allowed", ProducerClaim("allowed", "capture", "annotation")),
+        AnnotationHeader("public", "policy-allowed", ProducerClaim("allowed", "capture", "run-0")),
         source="allowed-owner",
     )
     base = ProvenanceProjection((lane,), (visible,))
@@ -173,12 +198,47 @@ def test_hsp09_unauthorized_annotation_cannot_change_results_filters_cursors_or_
     scope = _scope()
     assert base.access_scoped_context_hash(scope, snapshot.events) == with_denied.access_scoped_context_hash(scope, snapshot.events)
     context = QueryContext.from_projection("generation", scope, snapshot, with_denied)
-    unfiltered = _execute(QueryRequest(parse_query_filter({}), limit=1), scope, snapshot, with_denied, context)
-    denied_filter = _execute(QueryRequest(parse_query_filter({"topic": ["hidden-topic"]}), limit=1), scope, snapshot, with_denied, context)
-    visible_filter = _execute(QueryRequest(parse_query_filter({"topic": ["visible-topic"]}), limit=1), scope, snapshot, with_denied, context)
-    assert len(unfiltered.items) == 1 and unfiltered.next_cursor is None
-    assert denied_filter is EMPTY_QUERY_PAGE
-    assert len(visible_filter.items) == 1
+    base_context = QueryContext.from_projection("generation", scope, snapshot, base)
+    base_unfiltered = _execute(QueryRequest(parse_query_filter({}), limit=1), scope, snapshot, base, base_context)
+    with_denied_unfiltered = _execute(QueryRequest(parse_query_filter({}), limit=1), scope, snapshot, with_denied, context)
+    base_filtered = _execute(QueryRequest(parse_query_filter({"topic": ["visible-topic"]}), limit=1), scope, snapshot, base, base_context)
+    with_denied_filtered = _execute(QueryRequest(parse_query_filter({"topic": ["visible-topic"]}), limit=1), scope, snapshot, with_denied, context)
+
+    assert [item.event["entry_id"] for item in base_unfiltered.items] == [earlier["entry_id"]]
+    assert [item.event["entry_id"] for item in with_denied_unfiltered.items] == [earlier["entry_id"]]
+    assert base_unfiltered.next_cursor == with_denied_unfiltered.next_cursor
+    assert base_unfiltered.next_cursor is not None
+    assert [item.event["entry_id"] for item in base_filtered.items] == [event["entry_id"]]
+    assert [item.event["entry_id"] for item in with_denied_filtered.items] == [event["entry_id"]]
+    assert base_filtered.next_cursor is None and with_denied_filtered.next_cursor is None
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        AnnotationHeader("public", "policy-other", ProducerClaim("allowed", "capture", "run-0")),
+        AnnotationHeader("public", "policy-allowed", ProducerClaim("other", "capture", "run-0")),
+        AnnotationHeader("public", "policy-allowed", ProducerClaim("allowed", "capture", "other-run")),
+    ],
+)
+def test_hsp09_authorized_annotation_must_match_target_event_policy_and_producer(header: AnnotationHeader) -> None:
+    event = _event(0, policy_id="policy-allowed", owner="allowed", access="public", when="2026-07-31T00:00:00Z", provider="visible")
+    scope = PrincipalScope(
+        AuthenticatedPrincipal("transport:real-reader"),
+        frozenset({"public"}),
+        (
+            EventSelector("policy-allowed", ProducerSelector(owner_id="allowed", capability="capture"), frozenset({"public"})),
+            EventSelector(header.policy_id, ProducerSelector(owner_id=header.producer.owner_id, capability=header.producer.capability), frozenset({"public"})),
+        ),
+    )
+    projection = ProvenanceProjection(
+        owner_annotations=(
+            OwnerAnnotation("topic", event["entry_id"], "cross-boundary", header, source="owner"),
+        )
+    )
+
+    with pytest.raises(ProvenanceError, match="target"):
+        projection.project(scope, event)
 
 
 def test_hsp09_tampered_or_conflicting_provenance_artifacts_fail_closed() -> None:

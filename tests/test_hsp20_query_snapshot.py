@@ -24,7 +24,7 @@ from houndd import (
     parse_query_filter,
 )
 from houndd.provenance import LaneRule, ProvenanceProjection
-from houndd.query_engine import JournalQueryEngine, JournalQuerySnapshot, QueryContext, QuerySnapshotError
+from houndd.query_engine import JournalQueryEngine, JournalQuerySnapshot, QueryContext, QueryContextError, QuerySnapshotError
 
 
 def _digest(value: str) -> str:
@@ -148,6 +148,33 @@ def test_hsp20_equivalent_rebuilt_snapshots_have_identical_manifests_and_semanti
     assert first_page.next_cursor == second_page.next_cursor
     assert [item.event["entry_id"] for item in resumed.items] == [events[0]["entry_id"]]
     assert tuple(tmp_path.iterdir()) == before
+
+
+def test_hsp20_execute_rejects_an_arbitrary_unverified_context_hash() -> None:
+    _, snapshot, scope, provenance, _ = _materials()
+    forged = QueryContext("same-generation", _digest("caller-chosen-context"))
+
+    with pytest.raises(QueryContextError, match="trusted"):
+        _page(snapshot, scope, provenance, forged, _codec())
+
+
+def test_hsp20_authorized_provenance_change_inside_cursor_hwm_invalidates_resume() -> None:
+    events, snapshot, scope, provenance, original_context = _materials()
+    codec = _codec()
+    first = _page(snapshot, scope, provenance, original_context, codec)
+    assert first.next_cursor is not None
+    changed = ProvenanceProjection(
+        tuple(
+            LaneRule(event["policy_id"], "owner", "capture", "changed-lane", source="changed-policy")
+            for event in events
+        )
+    )
+    changed_context = QueryContext.from_projection("same-generation", scope, snapshot, changed)
+    arbitrary_context = QueryContext("same-generation", _digest("masking-context"))
+
+    for context in (original_context, changed_context, arbitrary_context):
+        with pytest.raises(CursorRejected):
+            _page(snapshot, scope, changed, context, codec, cursor=first.next_cursor)
 
 
 def test_hsp20_key_overlap_recovers_same_generation_cursor_and_retirement_stays_generic() -> None:

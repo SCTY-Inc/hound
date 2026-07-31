@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from .cursor import (
     CursorBindings,
     CursorCodec,
     CursorRecoverySnapshot,
+    CursorRejected,
     JournalCursorCandidate,
 )
 from .provenance import EventProvenance, ProvenanceProjection
@@ -34,8 +36,12 @@ class QueryEngineError(ValueError):
     """A query invocation does not satisfy the pure engine contract."""
 
 
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _sha256(value: object, label: str) -> str:
-    if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+    if not isinstance(value, str) or not _is_sha256(value):
         raise QueryContextError(f"{label} must be a lowercase SHA-256 digest")
     return value
 
@@ -55,8 +61,20 @@ def _freeze(value: Any) -> Any:
         if any(not isinstance(key, str) for key in value):
             raise QuerySnapshotError("canonical event mappings must have string keys")
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise QuerySnapshotError("canonical event contains a non-JSON value")
+
+
+def _clone_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise QuerySnapshotError("canonical event mappings must have string keys")
+        return {key: _clone_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clone_json_value(item) for item in value]
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
     raise QuerySnapshotError("canonical event contains a non-JSON value")
@@ -64,7 +82,8 @@ def _freeze(value: Any) -> Any:
 
 def _clone_envelope(value: Mapping[str, object]) -> dict[str, Any]:
     try:
-        validated = validate_journal_envelope(value)
+        copied = _clone_json_value(value)
+        validated = validate_journal_envelope(copied)
         return json.loads(canonical_bytes(validated).decode("utf-8"))
     except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
         raise QuerySnapshotError("journal query snapshot contains an invalid canonical envelope") from error
@@ -195,6 +214,11 @@ class QueryItem:
     def __post_init__(self) -> None:
         if not isinstance(self.event, Mapping) or not isinstance(self.provenance, EventProvenance):
             raise QueryEngineError("query item is invalid")
+        try:
+            event = _freeze(_clone_envelope(self.event))
+        except QuerySnapshotError as error:
+            raise QueryEngineError("query item event is not a canonical journal envelope") from error
+        object.__setattr__(self, "event", event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,10 +247,22 @@ class ReplayDedupeResult:
     seen_entry_ids: frozenset[str]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.new_entry_ids, tuple) or any(not isinstance(value, str) for value in self.new_entry_ids):
+        if not isinstance(self.new_entry_ids, tuple) or any(not _is_sha256(value) for value in self.new_entry_ids):
             raise QueryEngineError("replay dedupe entry IDs are invalid")
-        if not isinstance(self.seen_entry_ids, frozenset) or any(not isinstance(value, str) for value in self.seen_entry_ids):
+        if not isinstance(self.seen_entry_ids, frozenset) or any(not _is_sha256(value) for value in self.seen_entry_ids):
             raise QueryEngineError("replay dedupe state is invalid")
+
+
+def _replay_entry_ids(values: Iterable[str], label: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        raise QueryEngineError(f"{label} must be an iterable of entry IDs")
+    try:
+        copied = tuple(values)
+    except TypeError as error:
+        raise QueryEngineError(f"{label} must be an iterable of entry IDs") from error
+    if any(not _is_sha256(value) for value in copied):
+        raise QueryEngineError(f"{label} must contain canonical lowercase SHA-256 entry IDs")
+    return copied
 
 
 def dedupe_replay_entry_ids(
@@ -235,13 +271,8 @@ def dedupe_replay_entry_ids(
 ) -> ReplayDedupeResult:
     """Return accepted IDs and a new state set; never mutates or persists caller state."""
 
-    try:
-        seen = frozenset(entry_id for entry_id in seen_entry_ids)
-        incoming = tuple(entry_ids)
-    except TypeError as error:
-        raise QueryEngineError("replay dedupe inputs must be iterable") from error
-    if any(not isinstance(entry_id, str) for entry_id in (*seen, *incoming)):
-        raise QueryEngineError("replay dedupe IDs must be strings")
+    incoming = _replay_entry_ids(entry_ids, "replay entry IDs")
+    seen = frozenset(_replay_entry_ids(seen_entry_ids, "seen replay entry IDs"))
     new: list[str] = []
     state = set(seen)
     for entry_id in incoming:
@@ -310,6 +341,27 @@ def _matches_provenance(request: QueryRequest, provenance: EventProvenance) -> b
     return filters.entity is None or any(value.value in filters.entity for value in provenance.entities)
 
 
+def _verified_context_hash(
+    context: QueryContext,
+    scope: PrincipalScope,
+    snapshot: JournalQuerySnapshot,
+    provenance: ProvenanceProjection,
+    *,
+    cursor_resume: bool,
+) -> str:
+    if not cursor_resume:
+        trusted = provenance.access_scoped_context_hash(scope, snapshot.events)
+        if not hmac.compare_digest(context.access_scoped_context_hash, trusted):
+            raise QueryContextError("query context hash does not match trusted query inputs")
+        return trusted
+
+    for end in range(1, len(snapshot.events) + 1):
+        trusted = provenance.access_scoped_context_hash(scope, snapshot.events[:end])
+        if hmac.compare_digest(context.access_scoped_context_hash, trusted):
+            return trusted
+    raise CursorRejected()
+
+
 class JournalQueryEngine:
     """Evaluate a request without filesystem, journal, projection, or server state."""
 
@@ -328,10 +380,14 @@ class JournalQueryEngine:
             return EMPTY_QUERY_PAGE
         if not isinstance(scope, PrincipalScope):
             raise QueryEngineError("query scope must be a PrincipalScope or None")
-        if not isinstance(request, QueryRequest):
-            raise QueryEngineError("query request must be a QueryRequest")
         if not isinstance(snapshot, JournalQuerySnapshot):
             raise QueryEngineError("query snapshot must be a JournalQuerySnapshot")
+
+        if not any(authorize_event_header(scope, event) for event in snapshot.events):
+            return EMPTY_QUERY_PAGE
+
+        if not isinstance(request, QueryRequest):
+            raise QueryEngineError("query request must be a QueryRequest")
         if not isinstance(provenance, ProvenanceProjection):
             raise QueryEngineError("query provenance must be a ProvenanceProjection")
         if not isinstance(cursor_codec, CursorCodec):
@@ -339,11 +395,18 @@ class JournalQueryEngine:
         if not isinstance(context, QueryContext):
             raise QueryEngineError("query context must be a QueryContext")
 
+        context_hash = _verified_context_hash(
+            context,
+            scope,
+            snapshot,
+            provenance,
+            cursor_resume=request.cursor is not None,
+        )
         bindings = CursorBindings(
             context.service_generation,
             request.filter_hash,
             scope.principal.subject,
-            context.access_scoped_context_hash,
+            context_hash,
         )
         resume_after: tuple[datetime, int, str] | None = None
         high_watermark = snapshot.head

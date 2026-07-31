@@ -23,8 +23,8 @@
       "covers": [
         "pure immutable in-memory canonical journal query snapshots",
         "all HSP-08 filter families with AND across fields, OR within values, exact UTC boundaries, stable chronological ordering, fixed high-watermarks, and stateless cursors",
-        "immutable lane/topic/entity provenance that never enters canonical journal envelopes",
-        "pure consumer replay dedupe by entry_id with returned new state only"
+        "immutable lane/topic/entity provenance canonically bound to target event policy and producer semantics that never enters canonical journal envelopes",
+        "pure consumer replay dedupe by canonical lowercase entry_id with returned new state only"
       ],
       "deferred": [
         "daemon, Unix-socket API, CLI, streaming, and consumer integration",
@@ -34,9 +34,9 @@
     "HSP-09": {
       "status": "partial",
       "covers": [
-        "header-only authorization before high-watermark, resume, filters, provenance, pagination, or returned metadata",
+        "header-only authorization and indistinguishable zero-authorized-snapshot exit before high-watermark, resume, filters, provenance, pagination, or returned metadata",
         "non-disclosing identical empty pages for absent/unauthorized/scope-none queries",
-        "access-scoped provenance context hashes excluding unauthorized annotations"
+        "trusted-prefix-verified access-scoped provenance context hashes excluding unauthorized annotations"
       ],
       "deferred": [
         "Unix peer credential transport and local caller-scope allowlist integration",
@@ -47,7 +47,7 @@
       "status": "partial",
       "covers": [
         "independently validated immutable in-memory envelope/candidate snapshots with contiguous sequence, entry identity, canonical bytes, and chain commitments",
-        "same-generation stateless cursor recovery across independently rebuilt equivalent snapshots and signing-key overlap or retirement"
+        "same-generation stateless cursor recovery across independently rebuilt equivalent snapshots, append-only growth, authorized provenance-change rejection, and signing-key overlap or retirement"
       ],
       "deferred": [
         "crash recovery, index rebuild, backup restore, local migration, service-generation persistence, and durable policy/journal/record verification integration"
