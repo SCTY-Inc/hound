@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Type
+from typing import Iterator, Type
 
 
 def _raise(error_type: Type[BaseException], path: Path | str, reason: str) -> None:
@@ -23,71 +26,174 @@ def check_private_stat(st: os.stat_result, path: Path | str, *, directory: bool,
         _raise(error_type, path, "is not a regular file")
 
 
-class AnchoredRoot:
-    """Openat-style access to one initialized root directory."""
+@dataclass
+class _AncestryLink:
+    parent_fd: int
+    child_fd: int
+    name: str
 
-    def __init__(self, root: Path, *, error_type: Type[BaseException]) -> None:
-        self.path = Path(root)
+
+class AnchoredRoot:
+    """Openat-style access to one initialized root directory.
+
+    ``operation()`` is the linearization boundary for a public store action.
+    It walks the *supplied lexical path* from ``/`` with ``O_NOFOLLOW`` and
+    holds every ancestor descriptor until completion. At completion it
+    re-walks the lexical spelling and requires every name-to-inode link to
+    still match, without treating unrelated sibling churn as unsafe.
+
+    A successful return is linearized at the final validation.  This is not an
+    OS sandbox: a same-UID process with raw filesystem access can still race a
+    name after that validation or alter durable bytes by other means. A swap
+    restored to the same inode before that validation leaves no portable
+    observable evidence and is outside this guard's claim.
+    """
+
+    def __init__(self, root: Path | str | os.PathLike[str], *, error_type: Type[BaseException], create: bool = False) -> None:
+        raw = os.fspath(root)
+        if not raw:
+            _raise(error_type, root, "must not be empty")
+        # Do not let normpath/resolve erase a caller-supplied component before
+        # it has been opened with O_NOFOLLOW.  Dot traversal is not a stable
+        # supplied ancestry, so reject it rather than silently canonicalizing.
+        supplied = [part for part in raw.split(os.sep) if part]
+        if any(part in {".", ".."} for part in supplied):
+            _raise(error_type, root, "must not contain dot traversal")
+        self.path = Path(os.path.abspath(raw))
         self.error_type = error_type
-        self.fd: int | None = None
-        self._parent_fd: int | None = None
-        if self.path.is_symlink():
-            _raise(self.error_type, self.path, "must not be a symlink")
-        self._root_name = self.path.name
-        if not self._root_name:
+        self._parts = self.path.parts[1:]
+        if not self._parts:
             _raise(self.error_type, self.path, "must have a parent directory")
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        self.fd: int | None = None
+        self._root_stat: os.stat_result | None = None
+        self._binding: list[_AncestryLink] | None = None
+        # A facade can be shared by callers.  An operation guard is not
+        # transferable across threads, so serialize its descriptor lifetime.
+        self._operation_lock = threading.RLock()
         try:
-            self._parent_fd = os.open(self.path.parent, flags)
-            self._parent_stat = os.fstat(self._parent_fd)
-            self.fd = os.open(self._root_name, flags, dir_fd=self._parent_fd)
-        except OSError as error:
-            self.close()
-            _raise(self.error_type, self.path, "cannot be anchored")
-            raise error  # pragma: no cover
-        try:
+            links = self._walk(create=create)
+            self.fd = links[-1].child_fd
             self._root_stat = os.fstat(self.fd)
             check_private_stat(self._root_stat, self.path, directory=True, error_type=self.error_type)
-            self._check_root_identity()
+            # Ownership of the root fd transfers to us; close only ancestors.
+            self._close_links(links, keep={self.fd})
         except Exception:
             self.close()
             raise
 
+    @staticmethod
+    def _directory_flags() -> int:
+        return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+    @staticmethod
+    def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+        return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+    def _walk(self, *, create: bool) -> list[_AncestryLink]:
+        """Open every supplied component without following a symlink."""
+
+        current = os.open(os.sep, self._directory_flags())
+        links: list[_AncestryLink] = []
+        try:
+            for index, name in enumerate(self._parts):
+                try:
+                    child = os.open(name, self._directory_flags(), dir_fd=current)
+                except FileNotFoundError:
+                    if not create or index != len(self._parts) - 1:
+                        raise
+                    os.mkdir(name, 0o700, dir_fd=current)
+                    child = os.open(name, self._directory_flags(), dir_fd=current)
+                links.append(_AncestryLink(current, child, name))
+                current = child
+            return links
+        except OSError as error:
+            self._close_links(links)
+            # ``current`` is either owned by the final link or is the initial
+            # slash descriptor.  The former was closed above.
+            if not links:
+                os.close(current)
+            raise self.error_type(f"{self.path} cannot be anchored without following a symlink") from error
+
     def _require_open(self) -> None:
-        if self.fd is None or self._parent_fd is None:
+        if self.fd is None or self._root_stat is None:
             _raise(self.error_type, self.path, "has been closed")
 
-    def _check_root_identity(self) -> None:
+    def _validate_binding(self) -> None:
         self._require_open()
+        assert self._binding is not None
         try:
-            parent = os.fstat(self._parent_fd)
-            if (
-                parent.st_dev != self._parent_stat.st_dev
-                or parent.st_ino != self._parent_stat.st_ino
-                or parent.st_ctime_ns != self._parent_stat.st_ctime_ns
-                or parent.st_mtime_ns != self._parent_stat.st_mtime_ns
-            ):
-                _raise(self.error_type, self.path, "parent directory changed while it was anchored")
-            current = os.stat(self._root_name, dir_fd=self._parent_fd, follow_symlinks=False)
+            for link in self._binding:
+                visible = os.stat(link.name, dir_fd=link.parent_fd, follow_symlinks=False)
+                child_now = os.fstat(link.child_fd)
+                if not stat.S_ISDIR(visible.st_mode) or not self._same_file(visible, child_now):
+                    _raise(self.error_type, self.path, "supplied ancestry changed during this operation")
+            rebound = self._walk(create=False)
+            try:
+                if len(rebound) != len(self._binding) or any(
+                    not self._same_file(os.fstat(now.child_fd), os.fstat(held.child_fd))
+                    for now, held in zip(rebound, self._binding)
+                ):
+                    _raise(self.error_type, self.path, "supplied ancestry no longer names the anchored root")
+            finally:
+                self._close_links(rebound)
+            root_now = os.fstat(self.fd)
+            if not self._same_file(root_now, self._root_stat):
+                _raise(self.error_type, self.path, "is no longer the anchored root directory")
+            check_private_stat(root_now, self.path, directory=True, error_type=self.error_type)
         except OSError as error:
-            raise self.error_type(f"{self.path} is no longer the anchored root directory") from error
-        if not stat.S_ISDIR(current.st_mode):
-            _raise(self.error_type, self.path, "is no longer the anchored root directory")
-        if (
-            current.st_dev != self._root_stat.st_dev
-            or current.st_ino != self._root_stat.st_ino
-            or current.st_uid != self._root_stat.st_uid
-            or stat.S_IMODE(current.st_mode) != stat.S_IMODE(self._root_stat.st_mode)
-        ):
-            _raise(self.error_type, self.path, "is no longer the anchored root directory")
+            raise self.error_type(f"{self.path} supplied ancestry is no longer safe") from error
+
+    def _close_binding(self) -> None:
+        binding, self._binding = self._binding, None
+        if binding is not None:
+            self._close_links(binding)
+
+    @staticmethod
+    def _close_links(links: list[_AncestryLink], *, keep: set[int] | None = None) -> None:
+        for descriptor in {fd for link in links for fd in (link.parent_fd, link.child_fd)} - (keep or set()):
+            os.close(descriptor)
+
+    @contextmanager
+    def operation(self) -> Iterator["AnchoredRoot"]:
+        """Bind and validate the complete original ancestry for one action."""
+
+        with self._operation_lock:
+            if self._binding is not None:
+                yield self
+                return
+            self._require_open()
+            binding = self._walk(create=False)
+            try:
+                root_now = os.fstat(binding[-1].child_fd)
+                assert self._root_stat is not None
+                if not self._same_file(root_now, self._root_stat):
+                    _raise(self.error_type, self.path, "is no longer the anchored root directory")
+                self._binding = binding
+                self._validate_binding()
+                try:
+                    yield self
+                except Exception:
+                    raise
+                else:
+                    self._validate_binding()
+            finally:
+                self._close_binding()
+
+    def _check_root_identity(self) -> None:
+        if self._binding is not None:
+            self._validate_binding()
+            return
+        # Internal callers remain safe when used directly, while public
+        # callers keep one binding around their complete operation.
+        with self.operation():
+            pass
 
     def close(self) -> None:
+        self._close_binding()
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
-        if self._parent_fd is not None:
-            os.close(self._parent_fd)
-            self._parent_fd = None
+        self._root_stat = None
 
     def __enter__(self) -> "AnchoredRoot":
         return self
@@ -100,6 +206,33 @@ class AnchoredRoot:
         if not isinstance(part, str) or not part or "/" in part or part in {".", ".."}:
             raise ValueError("path components must be safe relative names")
 
+    def mkdir(self, *parts: str, create: bool = True) -> None:
+        if not parts:
+            raise ValueError("a directory path is required")
+        self._check_root_identity()
+        parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
+        try:
+            leaf = parts[-1]
+            self._validate_part(leaf)
+            if create:
+                try:
+                    os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise self.error_type(f"{self.path.joinpath(*parts)} cannot be created") from error
+            try:
+                child_fd = os.open(leaf, self._directory_flags(), dir_fd=parent_fd)
+            except OSError as error:
+                raise self.error_type(f"{self.path.joinpath(*parts)} is missing or unsafe") from error
+            try:
+                check_private_stat(os.fstat(child_fd), self.path.joinpath(*parts), directory=True, error_type=self.error_type)
+            finally:
+                os.close(child_fd)
+            self._check_root_identity()
+        finally:
+            os.close(parent_fd)
+
     def dirfd(self, *parts: str) -> int:
         self._check_root_identity()
         fd = os.dup(self.fd)
@@ -107,11 +240,7 @@ class AnchoredRoot:
             for part in parts:
                 self._validate_part(part)
                 try:
-                    next_fd = os.open(
-                        part,
-                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                        dir_fd=fd,
-                    )
+                    next_fd = os.open(part, self._directory_flags(), dir_fd=fd)
                 except OSError as error:
                     raise self.error_type(f"{self.path.joinpath(*parts)} is not a safe directory") from error
                 os.close(fd)
@@ -132,12 +261,7 @@ class AnchoredRoot:
             leaf = parts[-1]
             self._validate_part(leaf)
             try:
-                fd = os.open(
-                    leaf,
-                    flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                    mode,
-                    dir_fd=parent_fd,
-                )
+                fd = os.open(leaf, flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=parent_fd)
             except OSError as error:
                 raise self.error_type(f"{self.path.joinpath(*parts)} is not a safe file") from error
             self._check_root_identity()
@@ -169,23 +293,14 @@ class AnchoredRoot:
         leaf = parts[-1]
         self._validate_part(leaf)
         temp_name = f".{leaf}.tmp.{os.getpid()}.{os.urandom(8).hex()}"
-        temp_fd = os.open(
-            temp_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            mode,
-            dir_fd=parent_fd,
-        )
+        temp_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=parent_fd)
         try:
             with os.fdopen(temp_fd, "wb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            directory_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0), dir_fd=parent_fd)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(parent_fd)
             self._check_root_identity()
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be written") from error
@@ -200,21 +315,13 @@ class AnchoredRoot:
         leaf = parts[-1]
         self._validate_part(leaf)
         try:
-            fd = os.open(
-                leaf,
-                os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=parent_fd,
-            )
+            fd = os.open(leaf, os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
             check_private_stat(os.fstat(fd), self.path.joinpath(*parts), directory=False, error_type=self.error_type)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            directory_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0), dir_fd=parent_fd)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(parent_fd)
             self._check_root_identity()
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be written") from error
@@ -244,3 +351,26 @@ class AnchoredRoot:
             os.close(fd)
         self._check_root_identity()
         return info
+
+    def lstat(self, *parts: str) -> os.stat_result:
+        """Return a no-follow visible stat relative to this bound root."""
+
+        if not parts:
+            return self.stat()
+        self._check_root_identity()
+        parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
+        try:
+            leaf = parts[-1]
+            self._validate_part(leaf)
+            info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        self._check_root_identity()
+        return info
+
+    def exists(self, *parts: str) -> bool:
+        try:
+            self.lstat(*parts)
+        except FileNotFoundError:
+            return False
+        return True

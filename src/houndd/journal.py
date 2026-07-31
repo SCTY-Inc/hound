@@ -48,38 +48,28 @@ class Journal:
     """A single-writer logical journal backed by a process-safe file lock."""
 
     def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
-        root_path = Path(root)
-        if root_path.is_symlink():
-            raise UnsafeStoreError(f"{root_path} must not be a symlink")
-        self.root = root_path.resolve(strict=False)
         try:
-            _private_directory(self.root, create=create)
+            self.anchor = AnchoredRoot(root, error_type=UnsafeStoreError, create=create)
+            self.root = self.anchor.path
             self.directory = self.root / "journal"
-            _private_directory(self.directory, create=create)
             self.events_path = self.directory / "events.jsonl"
             self.chain_path = self.directory / "chain.jsonl"
             self.head_path = self.directory / "head.json"
             self.lock_path = self.directory / "lock"
-            for path in (self.events_path, self.chain_path, self.lock_path):
-                if path.is_symlink():
-                    raise UnsafeStoreError(f"{path} must not be a symlink")
-                if not path.exists():
-                    if not create:
-                        raise UnsafeStoreError(f"{path} is missing")
-                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    os.close(descriptor)
-                info = path.stat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise UnsafeStoreError(f"{path} is not a regular file")
-                check_private_stat(info, path, directory=False, error_type=UnsafeStoreError)
-            if self.head_path.exists() and self.head_path.is_symlink():
-                raise UnsafeStoreError(f"{self.head_path} must not be a symlink")
-            if self.head_path.exists():
-                info = self.head_path.stat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise UnsafeStoreError(f"{self.head_path} is unsafe")
-                check_private_stat(info, self.head_path, directory=False, error_type=UnsafeStoreError)
-            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+            with self.anchor.operation():
+                self.anchor.mkdir("journal", create=create)
+                for name, path in (("events.jsonl", self.events_path), ("chain.jsonl", self.chain_path), ("lock", self.lock_path)):
+                    try:
+                        flags = os.O_WRONLY | ((os.O_CREAT | os.O_EXCL) if create else 0)
+                        descriptor = self.anchor.open_file("journal", name, flags=flags)
+                    except UnsafeStoreError:
+                        descriptor = self.anchor.open_file("journal", name, flags=os.O_WRONLY)
+                    try:
+                        check_private_stat(os.fstat(descriptor), path, directory=False, error_type=UnsafeStoreError)
+                    finally:
+                        os.close(descriptor)
+                if "head.json" in self.anchor.listdir("journal"):
+                    check_private_stat(self.anchor.stat("journal", "head.json"), self.head_path, directory=False, error_type=UnsafeStoreError)
         except Exception:
             self.close()
             raise
@@ -99,13 +89,14 @@ class Journal:
     def _lock(self) -> Iterator[None]:
         if fcntl is None:
             raise JournalError("journal locking is unavailable")
-        descriptor = self.anchor.open_file("journal", "lock", flags=os.O_RDWR)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        with self.anchor.operation():
+            descriptor = self.anchor.open_file("journal", "lock", flags=os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     def _event_values_unlocked(self) -> list[dict[str, Any]]:
         try:
@@ -175,7 +166,7 @@ class Journal:
             head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
         else:
             head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
-        if self.head_path.exists():
+        if self.anchor.exists("journal", "head.json"):
             try:
                 import json
 

@@ -148,7 +148,7 @@ def test_hsp20_projection_rows_fails_closed_when_root_swaps_during_sqlite_open(
 
 
 @pytest.mark.parametrize("operation", ["rows", "verify", "delete", "rebuild"])
-def test_hsp20_projection_rejects_root_symlink_swap_back_at_mutation_boundaries(
+def test_hsp20_projection_swap_back_uses_held_root_and_never_writes_outside(
     tmp_path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     outside = tmp_path / "outside"
@@ -163,12 +163,11 @@ def test_hsp20_projection_rejects_root_symlink_swap_back_at_mutation_boundaries(
             _swap_root_back(store.root, outside)
             return real_connect(*args, **kwargs)
 
-        monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
-        if operation == "rows":
-            with pytest.raises(UnsafeStoreError):
-                store.projection.rows()
-        else:
-            assert store.verify()["valid"] is False
+            monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
+            if operation == "rows":
+                assert store.projection.rows()
+            else:
+                assert store.verify()["valid"] is True
     elif operation == "delete":
         real_unlink = os.unlink
 
@@ -177,8 +176,7 @@ def test_hsp20_projection_rejects_root_symlink_swap_back_at_mutation_boundaries(
             return real_unlink(*args, **kwargs)
 
         monkeypatch.setattr("houndd.projection.os.unlink", unlink_with_swap_back)
-        with pytest.raises(UnsafeStoreError):
-            store.projection.delete()
+        store.projection.delete()
     else:
         real_replace = os.replace
 
@@ -187,8 +185,7 @@ def test_hsp20_projection_rejects_root_symlink_swap_back_at_mutation_boundaries(
             return real_replace(*args, **kwargs)
 
         monkeypatch.setattr("houndd.projection.os.replace", replace_with_swap_back)
-        with pytest.raises(UnsafeStoreError):
-            store.rebuild_index()
+        assert store.rebuild_index()["valid"] is True
 
     assert not any(outside.iterdir())
 

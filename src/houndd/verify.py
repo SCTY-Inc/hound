@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_request_hash, validate_request
+from ._safety import AnchoredRoot
 from .journal import Journal
 from .projection import Projection
 from .store import RecordStore, StoreError
@@ -48,11 +49,10 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
     failures: list[str] = []
     report: dict[str, Any] = {"valid": False, "failures": failures}
     root_path = Path(root)
-    if root_path.is_symlink() or not root_path.exists():
-        failures.append(f"store root missing or unsafe: {root_path}")
-        return report
     try:
         with ExitStack() as stack:
+            root_anchor = stack.enter_context(AnchoredRoot(root, error_type=StoreError, create=False))
+            stack.enter_context(root_anchor.operation())
             records = stack.enter_context(RecordStore(root_path, create=False))
             journal = stack.enter_context(Journal(root_path, create=False))
             transactions = stack.enter_context(TransactionCoordinator(root_path, create=False))

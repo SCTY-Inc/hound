@@ -158,30 +158,32 @@ class TransactionCoordinator:
     """Coordinate one durable attempt per authenticated scope and key."""
 
     def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
-        root_path = Path(root)
-        if root_path.is_symlink():
-            raise TransactionError(f"{root_path} must not be a symlink")
-        self.root = root_path.resolve(strict=False)
         try:
-            _private_directory(self.root, create=create)
+            self.anchor = AnchoredRoot(root, error_type=TransactionError, create=create)
+            self.root = self.anchor.path
             self.transactions = self.root / "transactions"
             self.stages = self.transactions / "stages"
             self.idempotency = self.transactions / "idempotency"
-            for directory in (self.transactions, self.stages, self.idempotency):
-                _private_directory(directory, create=create)
+            with self.anchor.operation():
+                self.anchor.mkdir("transactions", create=create)
+                self.anchor.mkdir("transactions", "stages", create=create)
+                self.anchor.mkdir("transactions", "idempotency", create=create)
             self.lock_path = self.transactions / "lock"
-            if not self.lock_path.exists():
-                if not create:
-                    raise TransactionError(f"{self.lock_path} is missing")
-                descriptor = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.close(descriptor)
-            _private_file(self.lock_path, create=create)
-            for directory in (self.stages, self.idempotency):
-                for path in directory.glob("*.json"):
-                    _private_file(path, create=create)
+            with self.anchor.operation():
+                try:
+                    descriptor = self.anchor.open_file("transactions", "lock", flags=os.O_WRONLY | ((os.O_CREAT | os.O_EXCL) if create else 0))
+                except TransactionError:
+                    descriptor = self.anchor.open_file("transactions", "lock", flags=os.O_WRONLY)
+                try:
+                    check_private_stat(os.fstat(descriptor), self.lock_path, directory=False, error_type=TransactionError)
+                finally:
+                    os.close(descriptor)
+                for directory in ("stages", "idempotency"):
+                    for name in self.anchor.listdir("transactions", directory):
+                        if name.endswith(".json"):
+                            check_private_stat(self.anchor.stat("transactions", directory, name), self.root / "transactions" / directory / name, directory=False, error_type=TransactionError)
             self.records = RecordStore(self.root, create=create)
             self.journal = Journal(self.root, create=create)
-            self.anchor = AnchoredRoot(self.root, error_type=TransactionError)
         except Exception:
             self.close()
             raise
@@ -205,13 +207,14 @@ class TransactionCoordinator:
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        descriptor = self.anchor.open_file("transactions", "lock", flags=os.O_RDWR)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        with self.anchor.operation():
+            descriptor = self.anchor.open_file("transactions", "lock", flags=os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     @staticmethod
     def _scope_id(principal: str, capability: str, idempotency_key: str) -> str:
@@ -388,7 +391,7 @@ class TransactionCoordinator:
         stage_path = self._stage_path(transaction_id)
         idempotency_path = self._idempotency_path(scope_id)
         with self._lock():
-            if idempotency_path.exists():
+            if self.anchor.exists("transactions", "idempotency", f"{scope_id}.json"):
                 stored_idempotency = self._load_metadata("transactions", "idempotency", f"{scope_id}.json")
                 if stored_idempotency.get("request_hash") != request_hash:
                     raise IdempotencyConflict("idempotency key was reused for a different request")
@@ -406,7 +409,7 @@ class TransactionCoordinator:
                 )
                 response = stage.get("response") if stage["status"] == "complete" else None
                 return Transaction(self, transaction_id, request, principal, capability, request_hash, scope_id, response)
-            if stage_path.exists():
+            if self.anchor.exists("transactions", "stages", f"{transaction_id}.json"):
                 raise TransactionError("reservation counterpart is missing")
             context = self._neutral_context(request, request_hash)
             stage = {

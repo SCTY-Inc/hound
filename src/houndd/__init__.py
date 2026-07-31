@@ -43,6 +43,7 @@ class HounddStore:
         self.root = Path(root)
         try:
             self.records = RecordStore(self.root)
+            self.root = self.records.root
             self.journal = Journal(self.root)
             self.transactions = TransactionCoordinator(self.root)
             self.projection = Projection(self.root, create=True)

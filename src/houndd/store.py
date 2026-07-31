@@ -109,11 +109,11 @@ class BlobStore:
     """A create-only SHA-256 blob store."""
 
     def __init__(self, root: Path, *, create: bool = True) -> None:
-        self.root = Path(root).resolve(strict=False)
         try:
-            _mkdir_private(self.root, create=create)
-            _mkdir_private(self.root / "blobs", create=create)
-            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+            self.anchor = AnchoredRoot(root, error_type=UnsafeStoreError, create=create)
+            self.root = self.anchor.path
+            with self.anchor.operation():
+                self.anchor.mkdir("blobs", create=create)
         except Exception:
             self.close()
             raise
@@ -138,44 +138,44 @@ class BlobStore:
         if not isinstance(data, bytes):
             raise StoreError("blob data must be bytes")
         digest = hashlib.sha256(data).hexdigest()
-        _create_or_confirm(self.anchor, "blobs", digest, data=data)
+        with self.anchor.operation():
+            _create_or_confirm(self.anchor, "blobs", digest, data=data)
         return digest
 
     def get(self, digest: str) -> bytes:
         path = self.path_for(digest)
-        check_private_stat(self.anchor.stat("blobs", digest), path, directory=False, error_type=UnsafeStoreError)
-        try:
-            data = self.anchor.read_bytes("blobs", digest)
-        except OSError as error:
-            raise StoreError(f"cannot read blob {digest}") from error
+        with self.anchor.operation():
+            check_private_stat(self.anchor.stat("blobs", digest), path, directory=False, error_type=UnsafeStoreError)
+            try:
+                data = self.anchor.read_bytes("blobs", digest)
+            except OSError as error:
+                raise StoreError(f"cannot read blob {digest}") from error
         if hashlib.sha256(data).hexdigest() != digest:
             raise StoreError(f"blob {digest} failed verification")
         return data
 
     def digests(self) -> list[str]:
-        names = self.anchor.listdir("blobs")
-        for name in names:
-            if len(name) != 64 or any(char not in "0123456789abcdef" for char in name):
-                raise UnsafeStoreError(f"unexpected blob path {self.root / 'blobs' / name}")
-        return names
+        with self.anchor.operation():
+            names = self.anchor.listdir("blobs")
+            for name in names:
+                if len(name) != 64 or any(char not in "0123456789abcdef" for char in name):
+                    raise UnsafeStoreError(f"unexpected blob path {self.root / 'blobs' / name}")
+            return names
 
 
 class RecordStore:
     """Create-only record bytes with a verbatim legacy mirror primitive."""
 
     def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
-        root_path = Path(root)
-        if root_path.is_symlink():
-            raise UnsafeStoreError(f"{root_path} must not be a symlink")
-        self.root = root_path.resolve(strict=False)
         try:
-            _mkdir_private(self.root, create=create)
+            self.anchor = AnchoredRoot(root, error_type=UnsafeStoreError, create=create)
+            self.root = self.anchor.path
             self.records = self.root / "records"
             self.legacy = self.root / "legacy"
-            _mkdir_private(self.records, create=create)
-            _mkdir_private(self.legacy, create=create)
+            with self.anchor.operation():
+                self.anchor.mkdir("records", create=create)
+                self.anchor.mkdir("legacy", create=create)
             self.blobs = BlobStore(self.root, create=create)
-            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
         except Exception:
             self.close()
             raise
@@ -201,7 +201,8 @@ class RecordStore:
         data = canonical_bytes(value)
         record_id = hashlib.sha256(data).hexdigest()
         path = self.record_path(record_id)
-        _create_or_confirm(self.anchor, "records", f"{record_id}.bin", data=data)
+        with self.anchor.operation():
+            _create_or_confirm(self.anchor, "records", f"{record_id}.bin", data=data)
         return RecordRef(record_id, record_id, len(data), path)
 
     def put_bytes(self, record_id: str, data: bytes, *, expected_sha256: str | None = None) -> RecordRef:
@@ -214,13 +215,14 @@ class RecordStore:
         if expected_sha256 is not None and expected_sha256 != digest:
             raise StoreError("legacy record hash does not match its bytes")
         path = self.record_path(record_id)
-        _create_or_confirm(self.anchor, "records", f"{record_id}.bin", data=data)
-        manifest = self.legacy / f"{record_id}.json"
-        _create_or_confirm(self.anchor, "legacy", f"{record_id}.json", data=canonical_bytes({
-            "record_id": record_id,
-            "sha256": digest,
-            "byte_length": len(data),
-        }))
+        with self.anchor.operation():
+            _create_or_confirm(self.anchor, "records", f"{record_id}.bin", data=data)
+            manifest = self.legacy / f"{record_id}.json"
+            _create_or_confirm(self.anchor, "legacy", f"{record_id}.json", data=canonical_bytes({
+                "record_id": record_id,
+                "sha256": digest,
+                "byte_length": len(data),
+            }))
         manifest_body = {
             "record_id": record_id,
             "sha256": digest,
@@ -230,70 +232,76 @@ class RecordStore:
 
     def read(self, record_id: str) -> bytes:
         path = self.record_path(record_id)
-        check_private_stat(self.anchor.stat("records", f"{_validate_id(record_id)}.bin"), path, directory=False, error_type=UnsafeStoreError)
-        try:
-            return self.anchor.read_bytes("records", f"{_validate_id(record_id)}.bin")
-        except OSError as error:
-            raise StoreError(f"cannot read record {record_id}") from error
+        with self.anchor.operation():
+            check_private_stat(self.anchor.stat("records", f"{_validate_id(record_id)}.bin"), path, directory=False, error_type=UnsafeStoreError)
+            try:
+                return self.anchor.read_bytes("records", f"{_validate_id(record_id)}.bin")
+            except OSError as error:
+                raise StoreError(f"cannot read record {record_id}") from error
 
     def read_json(self, record_id: str) -> Any:
-        try:
-            value = json.loads(self.read(record_id).decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise StoreError(f"record {record_id} is not canonical JSON") from error
-        if canonical_bytes(value) != self.read(record_id):
-            raise StoreError(f"record {record_id} is not canonical JSON")
-        return value
+        with self.anchor.operation():
+            try:
+                raw = self.read(record_id)
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise StoreError(f"record {record_id} is not canonical JSON") from error
+            if canonical_bytes(value) != raw:
+                raise StoreError(f"record {record_id} is not canonical JSON")
+            return value
 
     def has(self, record_id: str) -> bool:
-        try:
-            self.anchor.stat("records", f"{_validate_id(record_id)}.bin")
-        except (UnsafeStoreError, OSError, ValueError):
-            return False
-        return True
+        with self.anchor.operation():
+            try:
+                self.anchor.stat("records", f"{_validate_id(record_id)}.bin")
+            except (UnsafeStoreError, OSError, ValueError):
+                return False
+            return True
 
     def record_ids(self) -> list[str]:
-        names = self.anchor.listdir("records")
-        result = []
-        for name in names:
-            if not name.endswith(".bin") or len(name) <= 4:
-                raise UnsafeStoreError(f"unexpected record path {self.records / name}")
-            result.append(name[:-4])
-        return result
+        with self.anchor.operation():
+            names = self.anchor.listdir("records")
+            result = []
+            for name in names:
+                if not name.endswith(".bin") or len(name) <= 4:
+                    raise UnsafeStoreError(f"unexpected record path {self.records / name}")
+                result.append(name[:-4])
+            return result
 
     def blob(self, data: bytes) -> str:
         return self.blobs.put(data)
 
     def verify_record(self, record_id: str, expected_sha256: str | None = None) -> bool:
-        try:
-            data = self.read(record_id)
-        except StoreError:
-            return False
-        digest = hashlib.sha256(data).hexdigest()
-        if expected_sha256 is not None and expected_sha256 != digest:
-            return False
-        manifest_path = self.legacy / f"{_validate_id(record_id)}.json"
-        try:
-            manifest_bytes = self.anchor.read_bytes("legacy", f"{_validate_id(record_id)}.json")
-        except (UnsafeStoreError, StoreError, OSError):
-            manifest_bytes = None
-        if manifest_bytes is not None:
+        with self.anchor.operation():
             try:
-                manifest = json.loads(manifest_bytes.decode("utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
+                data = self.read(record_id)
+            except StoreError:
                 return False
-            return (
-                isinstance(manifest, dict)
-                and manifest == {"record_id": record_id, "sha256": digest, "byte_length": len(data)}
-            )
-        return record_id == digest
+            digest = hashlib.sha256(data).hexdigest()
+            if expected_sha256 is not None and expected_sha256 != digest:
+                return False
+            try:
+                manifest_bytes = self.anchor.read_bytes("legacy", f"{_validate_id(record_id)}.json")
+            except (UnsafeStoreError, StoreError, OSError):
+                manifest_bytes = None
+            if manifest_bytes is not None:
+                try:
+                    manifest = json.loads(manifest_bytes.decode("utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    return False
+                return (
+                    isinstance(manifest, dict)
+                    and manifest == {"record_id": record_id, "sha256": digest, "byte_length": len(data)}
+                )
+            return record_id == digest
 
     def is_legacy(self, record_id: str) -> bool:
-        try:
-            self.anchor.stat("legacy", f"{_validate_id(record_id)}.json")
-        except (UnsafeStoreError, OSError, ValueError):
-            return False
-        return True
+        with self.anchor.operation():
+            try:
+                self.anchor.stat("legacy", f"{_validate_id(record_id)}.json")
+            except (UnsafeStoreError, OSError, ValueError):
+                return False
+            return True
 
 
 __all__ = [

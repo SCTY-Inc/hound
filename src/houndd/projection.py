@@ -22,27 +22,21 @@ class Projection:
     _TEMP_PREFIX = ".index.sqlite.tmp."
 
     def __init__(self, root: str | os.PathLike[str], *, create: bool = False) -> None:
-        root_path = Path(root)
-        if root_path.is_symlink():
-            raise UnsafeStoreError(f"{root_path} must not be a symlink")
-        self.root = root_path.resolve(strict=False)
+        self.root = Path(os.path.abspath(os.fspath(root)))
         self.path = self.root / "index.sqlite"
         self.anchor: AnchoredRoot | None = None
         try:
-            if self.root.exists():
-                info = self.root.stat()
-                if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                    raise UnsafeStoreError(f"{self.root} is not owned by the current user")
-                if info.st_mode & 0o077:
-                    raise UnsafeStoreError(f"{self.root} has group/world permissions")
-                self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
-            elif create:
-                self.root.mkdir(exist_ok=True)
-                self.root.chmod(0o700)
-                self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+            self.anchor = AnchoredRoot(root, error_type=UnsafeStoreError, create=create)
+            self.root = self.anchor.path
+            self.path = self.root / "index.sqlite"
             if self.anchor is not None:
-                if "index.sqlite" in self.anchor.listdir():
-                    check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+                with self.anchor.operation():
+                    if "index.sqlite" in self.anchor.listdir():
+                        check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+        except UnsafeStoreError:
+            if create or self.root.exists():
+                self.close()
+                raise
         except Exception:
             self.close()
             raise
@@ -50,12 +44,9 @@ class Projection:
     def _ensure_anchor(self, *, create: bool = False) -> AnchoredRoot:
         if self.anchor is not None:
             return self.anchor
-        if not self.root.exists():
-            if not create:
-                raise UnsafeStoreError(f"{self.root} is missing")
-            self.root.mkdir(exist_ok=True)
-            self.root.chmod(0o700)
-        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError, create=create)
+        self.root = self.anchor.path
+        self.path = self.root / "index.sqlite"
         return self.anchor
 
     def close(self) -> None:
@@ -382,12 +373,12 @@ class Projection:
         """Replace all rows in one SQLite transaction from committed events."""
 
         anchor = self._ensure_anchor(create=True)
-        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
-        self._reclaim_stale_temps(anchor)
-        events = journal.entries()
-        directory_before_build = anchor.stat()
-        connection: sqlite3.Connection | None = None
-        try:
+        with anchor.operation():
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            self._reclaim_stale_temps(anchor)
+            events = journal.entries()
+            directory_before_build = anchor.stat()
+            connection: sqlite3.Connection | None = None
             # Build the whole database in memory before touching the visible
             # leaf.  A failed build or temp write therefore leaves the prior
             # projection byte-for-byte usable.
@@ -468,60 +459,58 @@ class Projection:
             # directory generation.  Keep this explicit final identity check
             # so success is never returned through a renamed-away root.
             check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
-            return {"valid": True, "entries": len(events), "database": str(self.path)}
-        except Exception:
-            if connection is not None:
-                connection.rollback()
-            raise
-        finally:
+            result = {"valid": True, "entries": len(events), "database": "index.sqlite"}
             if connection is not None:
                 connection.close()
+            return result
 
     def rows(self) -> list[dict[str, Any]]:
         if self.anchor is None and not self.root.exists():
             return []
         anchor = self._ensure_anchor()
-        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
-        if "index.sqlite" not in anchor.listdir():
-            self._assert_index_absent(anchor)
-            return []
-        descriptor, opened = self._open_index(anchor)
-        connection: sqlite3.Connection | None = None
-        try:
-            connection = self._connect(descriptor, opened, read_only=True)
-            rows = [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
-            self._validate_bound_index(anchor, descriptor, opened)
-            return rows
-        except sqlite3.Error as error:
-            raise ProjectionError("projection is unreadable") from error
-        finally:
-            if connection is not None:
-                connection.close()
-            os.close(descriptor)
+        with anchor.operation():
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            if "index.sqlite" not in anchor.listdir():
+                self._assert_index_absent(anchor)
+                return []
+            descriptor, opened = self._open_index(anchor)
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect(descriptor, opened, read_only=True)
+                rows = [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
+                self._validate_bound_index(anchor, descriptor, opened)
+                return rows
+            except sqlite3.Error as error:
+                raise ProjectionError("projection is unreadable") from error
+            finally:
+                if connection is not None:
+                    connection.close()
+                os.close(descriptor)
 
     def delete(self) -> None:
         if self.anchor is None and not self.root.exists():
             return
         anchor = self._ensure_anchor()
-        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
-        if "index.sqlite" not in anchor.listdir():
-            self._assert_index_absent(anchor)
-            return
-        descriptor, opened = self._open_index(anchor)
-        directory_fd = anchor.dirfd()
-        try:
-            self._validate_bound_index(anchor, descriptor, opened)
-            os.unlink("index.sqlite", dir_fd=directory_fd)
-            # Successful unlink plus this sync is the delete linearization
-            # point.  Everything below is validation, not a retry loop.
-            os.fsync(directory_fd)
-            held = os.fstat(descriptor)
-            if held.st_nlink != 0:
-                raise UnsafeStoreError(f"{self.path} was not unlinked")
-            self._assert_index_absent(anchor)
-        finally:
-            os.close(directory_fd)
-            os.close(descriptor)
+        with anchor.operation():
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            if "index.sqlite" not in anchor.listdir():
+                self._assert_index_absent(anchor)
+                return
+            descriptor, opened = self._open_index(anchor)
+            directory_fd = anchor.dirfd()
+            try:
+                self._validate_bound_index(anchor, descriptor, opened)
+                os.unlink("index.sqlite", dir_fd=directory_fd)
+                # Successful unlink plus this sync is the delete linearization
+                # point.  Everything below is validation, not a retry loop.
+                os.fsync(directory_fd)
+                held = os.fstat(descriptor)
+                if held.st_nlink != 0:
+                    raise UnsafeStoreError(f"{self.path} was not unlinked")
+                self._assert_index_absent(anchor)
+            finally:
+                os.close(directory_fd)
+                os.close(descriptor)
 
 
 __all__ = ["Projection", "ProjectionError"]
