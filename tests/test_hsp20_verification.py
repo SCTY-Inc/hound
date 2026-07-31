@@ -79,6 +79,12 @@ def _swap_index(root: Path, kind: str, *, outside: Path | None = None, swap_back
     """Replace the visible projection leaf while a held descriptor remains open."""
 
     index = root / "index.sqlite"
+    if not index.exists():
+        # Rebuild now intentionally has no visible leaf until the complete
+        # in-memory database is ready for atomic publication.  Create an
+        # attacker leaf here so the empty-projection race remains covered.
+        index.write_bytes(b"attacker leaf")
+        index.chmod(0o600)
     original = root / ".index.sqlite.original"
     index.rename(original)
     if kind == "symlink":
@@ -592,3 +598,166 @@ def test_hsp20_projection_rebuild_rolls_back_on_fault_and_unsafe_modes_fail_clos
     unsafe.chmod(0o755)
     with pytest.raises(UnsafeStoreError):
         HounddStore(unsafe)
+
+
+def test_hsp20_rebuild_mid_temp_write_preserves_prior_projection_bytes_and_rows(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=2)
+    before_bytes = store.projection.path.read_bytes()
+    before_rows = store.projection.rows()
+
+    def partial_write_then_fail(descriptor: int, data: bytes) -> None:
+        assert os.write(descriptor, data[:32]) == 32
+        raise OSError("injected partial temp write")
+
+    monkeypatch.setattr(store.projection, "_write_descriptor", partial_write_then_fail)
+
+    with pytest.raises(OSError, match="partial temp write"):
+        store.rebuild_index()
+
+    assert store.projection.path.read_bytes() == before_bytes
+    assert store.projection.rows() == before_rows
+    assert not list(store.root.glob(".index.sqlite.tmp.*"))
+
+
+@pytest.mark.parametrize("failure_point", ["temp_write", "temp_fsync", "replace"])
+def test_hsp20_rebuild_pre_replace_failures_leave_prior_projection_intact(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    before_bytes = store.projection.path.read_bytes()
+    before_rows = store.projection.rows()
+
+    if failure_point == "temp_write":
+        monkeypatch.setattr(store.projection, "_write_descriptor", lambda *_args: (_ for _ in ()).throw(OSError("temp write failed")))
+    elif failure_point == "temp_fsync":
+        monkeypatch.setattr("houndd.projection.os.fsync", lambda _fd: (_ for _ in ()).throw(OSError("temp fsync failed")))
+    else:
+        monkeypatch.setattr("houndd.projection.os.replace", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")))
+
+    with pytest.raises(OSError):
+        store.rebuild_index()
+
+    assert store.projection.path.read_bytes() == before_bytes
+    assert store.projection.rows() == before_rows
+    assert not list(store.root.glob(".index.sqlite.tmp.*"))
+
+
+def test_hsp20_successful_rebuild_publishes_private_bytes_and_syncs_directory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        synced.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("houndd.projection.os.fsync", recording_fsync)
+    report = store.rebuild_index()
+
+    assert report["valid"] is True
+    assert store.projection.rows()
+    assert stat.S_IMODE(store.projection.path.stat().st_mode) == 0o600
+    assert len(synced) >= 2  # private temp, then anchored root directory
+
+
+@pytest.mark.parametrize("operation", ["rows", "verify"])
+def test_hsp20_post_lstat_leaf_swap_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    original_visible = type(store.projection)._visible_index_stat
+    swapped = False
+
+    def visible_then_swap(projection, anchor):
+        nonlocal swapped
+        visible = original_visible(projection, anchor)
+        if not swapped:
+            _swap_index(store.root, "different-file")
+            swapped = True
+        return visible
+
+    monkeypatch.setattr(type(store.projection), "_visible_index_stat", visible_then_swap)
+    if operation == "rows":
+        with pytest.raises(UnsafeStoreError):
+            store.projection.rows()
+    else:
+        report = store.verify()
+        assert report["valid"] is False
+        assert report["failures"]
+
+
+def test_hsp20_post_lstat_swap_back_is_rejected_by_directory_generation(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    original_visible = type(store.projection)._visible_index_stat
+    swapped = False
+
+    def visible_then_swap_back(projection, anchor):
+        nonlocal swapped
+        visible = original_visible(projection, anchor)
+        if not swapped:
+            _swap_index(store.root, "different-file", swap_back=True)
+            swapped = True
+        return visible
+
+    monkeypatch.setattr(type(store.projection), "_visible_index_stat", visible_then_swap_back)
+    with pytest.raises(UnsafeStoreError):
+        store.projection.rows()
+
+
+@pytest.mark.parametrize("operation", ["rows", "delete", "rebuild"])
+def test_hsp20_initialized_projection_fails_closed_when_root_is_renamed_away(tmp_path, operation: str) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    store.root.rename(tmp_path / "moved-store")
+
+    with pytest.raises(UnsafeStoreError):
+        if operation == "rows":
+            store.projection.rows()
+        elif operation == "delete":
+            store.projection.delete()
+        else:
+            store.projection.rebuild(store.journal, store.records)
+
+
+def test_hsp20_delete_rejects_replacement_created_during_final_absence_check(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    original_visible = store.projection._visible_index_stat
+    replaced = False
+
+    def absent_then_replace(anchor):
+        nonlocal replaced
+        try:
+            return original_visible(anchor)
+        except FileNotFoundError:
+            if not replaced:
+                store.projection.path.write_bytes(b"replacement")
+                store.projection.path.chmod(0o600)
+                replaced = True
+            raise
+
+    monkeypatch.setattr(store.projection, "_visible_index_stat", absent_then_replace)
+    with pytest.raises(UnsafeStoreError):
+        store.projection.delete()
+    assert store.projection.path.read_bytes() == b"replacement"
+
+
+def test_hsp20_clean_delete_syncs_and_leaves_an_absent_projection(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        synced.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("houndd.projection.os.fsync", recording_fsync)
+    store.projection.delete()
+
+    assert not store.projection.path.exists()
+    assert store.projection.rows() == []
+    assert synced
