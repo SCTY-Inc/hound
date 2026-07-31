@@ -19,6 +19,8 @@ class ProjectionError(StoreError):
 class Projection:
     """A query aid whose rows are never used as canonical truth."""
 
+    _TEMP_PREFIX = ".index.sqlite.tmp."
+
     def __init__(self, root: str | os.PathLike[str], *, create: bool = False) -> None:
         root_path = Path(root)
         if root_path.is_symlink():
@@ -140,8 +142,62 @@ class Projection:
             directory_after = anchor.stat()
             if not self._same_directory_generation(directory_before, directory_after):
                 raise UnsafeStoreError(f"{self.path} changed while its absence was checked")
+        else:
+            raise UnsafeStoreError(f"{self.path} unexpectedly exists")
+        # Filesystem directory timestamps can have coarser granularity than
+        # this operation.  Recheck the no-follow name once so a replacement
+        # created after the first absent lstat cannot be acknowledged absent.
+        try:
+            self._visible_index_stat(anchor)
+        except FileNotFoundError:
             return
         raise UnsafeStoreError(f"{self.path} unexpectedly exists")
+
+    def _check_private_temp(self, info: os.stat_result, name: str) -> None:
+        path = self.root / name
+        check_private_stat(info, path, directory=False, error_type=UnsafeStoreError)
+        if info.st_nlink != 1:
+            raise UnsafeStoreError(f"{path} must have exactly one link")
+
+    def _reclaim_stale_temps(self, anchor: AnchoredRoot) -> None:
+        """Remove prior private publication temps before a new rebuild.
+
+        Temp names are never followed.  A candidate must remain the exact
+        private inode opened through the anchored root before it is removed;
+        anything else fails closed rather than being treated as recoverable.
+        """
+
+        names = [name for name in anchor.listdir() if name.startswith(self._TEMP_PREFIX)]
+        directory_fd = anchor.dirfd()
+        try:
+            for name in names:
+                descriptor = anchor.open_file(name, flags=os.O_RDONLY)
+                try:
+                    held = os.fstat(descriptor)
+                    self._check_private_temp(held, name)
+                    visible = self._visible_stat(anchor, name)
+                    self._check_private_temp(visible, name)
+                    visible_after_open = self._visible_stat(anchor, name)
+                    if (
+                        not self._same_file(visible, held)
+                        or visible.st_ctime_ns != held.st_ctime_ns
+                        or not self._same_file(visible_after_open, held)
+                        or visible_after_open.st_ctime_ns != held.st_ctime_ns
+                    ):
+                        raise UnsafeStoreError(f"{self.root / name} changed while stale state was reclaimed")
+                    os.unlink(name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    if os.fstat(descriptor).st_nlink != 0:
+                        raise UnsafeStoreError(f"{self.root / name} was not reclaimed")
+                    try:
+                        self._visible_stat(anchor, name)
+                    except FileNotFoundError:
+                        continue
+                    raise UnsafeStoreError(f"{self.root / name} was replaced while stale state was reclaimed")
+                finally:
+                    os.close(descriptor)
+        finally:
+            os.close(directory_fd)
 
     def _validate_bound_index(self, anchor: AnchoredRoot, descriptor: int, opened: os.stat_result) -> None:
         """Reject replacement, symlink, or swap-back races before acknowledging work."""
@@ -251,7 +307,7 @@ class Projection:
         """Atomically replace the visible projection from a private temp leaf."""
 
         directory_fd = anchor.dirfd()
-        temp_name = f".index.sqlite.tmp.{os.urandom(16).hex()}"
+        temp_name = f"{self._TEMP_PREFIX}{os.urandom(16).hex()}"
         temp_fd: int | None = None
         replaced = False
         try:
@@ -327,6 +383,7 @@ class Projection:
 
         anchor = self._ensure_anchor(create=True)
         check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+        self._reclaim_stale_temps(anchor)
         events = journal.entries()
         directory_before_build = anchor.stat()
         connection: sqlite3.Connection | None = None
@@ -461,15 +518,7 @@ class Projection:
             held = os.fstat(descriptor)
             if held.st_nlink != 0:
                 raise UnsafeStoreError(f"{self.path} was not unlinked")
-            directory_before_absence = anchor.stat()
-            try:
-                self._visible_index_stat(anchor)
-            except FileNotFoundError:
-                directory_after_absence = anchor.stat()
-                if not self._same_directory_generation(directory_before_absence, directory_after_absence):
-                    raise UnsafeStoreError(f"{self.path} changed while its absence was checked")
-            else:
-                raise UnsafeStoreError(f"{self.path} still exists after deletion")
+            self._assert_index_absent(anchor)
         finally:
             os.close(directory_fd)
             os.close(descriptor)

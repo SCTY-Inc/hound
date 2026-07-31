@@ -29,25 +29,46 @@ class AnchoredRoot:
     def __init__(self, root: Path, *, error_type: Type[BaseException]) -> None:
         self.path = Path(root)
         self.error_type = error_type
+        self.fd: int | None = None
+        self._parent_fd: int | None = None
         if self.path.is_symlink():
             _raise(self.error_type, self.path, "must not be a symlink")
+        self._root_name = self.path.name
+        if not self._root_name:
+            _raise(self.error_type, self.path, "must have a parent directory")
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            self.fd = os.open(self.path, flags)
+            self._parent_fd = os.open(self.path.parent, flags)
+            self._parent_stat = os.fstat(self._parent_fd)
+            self.fd = os.open(self._root_name, flags, dir_fd=self._parent_fd)
         except OSError as error:
+            self.close()
             _raise(self.error_type, self.path, "cannot be anchored")
             raise error  # pragma: no cover
-        self._root_stat = os.fstat(self.fd)
-        check_private_stat(self._root_stat, self.path, directory=True, error_type=self.error_type)
+        try:
+            self._root_stat = os.fstat(self.fd)
+            check_private_stat(self._root_stat, self.path, directory=True, error_type=self.error_type)
+            self._check_root_identity()
+        except Exception:
+            self.close()
+            raise
 
     def _require_open(self) -> None:
-        if self.fd is None:
+        if self.fd is None or self._parent_fd is None:
             _raise(self.error_type, self.path, "has been closed")
 
     def _check_root_identity(self) -> None:
         self._require_open()
         try:
-            current = os.lstat(self.path)
+            parent = os.fstat(self._parent_fd)
+            if (
+                parent.st_dev != self._parent_stat.st_dev
+                or parent.st_ino != self._parent_stat.st_ino
+                or parent.st_ctime_ns != self._parent_stat.st_ctime_ns
+                or parent.st_mtime_ns != self._parent_stat.st_mtime_ns
+            ):
+                _raise(self.error_type, self.path, "parent directory changed while it was anchored")
+            current = os.stat(self._root_name, dir_fd=self._parent_fd, follow_symlinks=False)
         except OSError as error:
             raise self.error_type(f"{self.path} is no longer the anchored root directory") from error
         if not stat.S_ISDIR(current.st_mode):
@@ -64,6 +85,9 @@ class AnchoredRoot:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        if self._parent_fd is not None:
+            os.close(self._parent_fd)
+            self._parent_fd = None
 
     def __enter__(self) -> "AnchoredRoot":
         return self

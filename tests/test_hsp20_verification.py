@@ -53,6 +53,16 @@ def _swap_root(root: Path, replacement_kind: str) -> tuple[Path, Path]:
     return backup, replacement
 
 
+def _swap_root_back(root: Path, outside: Path, *, unlink=os.unlink) -> None:
+    """Momentarily replace ``root`` with a symlink, then restore its inode."""
+
+    backup = root.with_name(f"{root.name}.swap-back")
+    root.rename(backup)
+    root.symlink_to(outside, target_is_directory=True)
+    unlink(root)
+    backup.rename(root)
+
+
 def _swap_root_with_copy(root: Path, replacement_kind: str, *, tamper_record: bool = False) -> tuple[Path, Path]:
     backup = root.with_name(f"{root.name}.backup")
     root.rename(backup)
@@ -135,6 +145,52 @@ def test_hsp20_projection_rows_fails_closed_when_root_swaps_during_sqlite_open(
 
     with pytest.raises(UnsafeStoreError):
         store.projection.rows()
+
+
+@pytest.mark.parametrize("operation", ["rows", "verify", "delete", "rebuild"])
+def test_hsp20_projection_rejects_root_symlink_swap_back_at_mutation_boundaries(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+
+    if operation in {"rows", "verify"}:
+        real_connect = sqlite3.connect
+
+        def connect_with_swap_back(*args, **kwargs):
+            _swap_root_back(store.root, outside)
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
+        if operation == "rows":
+            with pytest.raises(UnsafeStoreError):
+                store.projection.rows()
+        else:
+            assert store.verify()["valid"] is False
+    elif operation == "delete":
+        real_unlink = os.unlink
+
+        def unlink_with_swap_back(*args, **kwargs):
+            _swap_root_back(store.root, outside)
+            return real_unlink(*args, **kwargs)
+
+        monkeypatch.setattr("houndd.projection.os.unlink", unlink_with_swap_back)
+        with pytest.raises(UnsafeStoreError):
+            store.projection.delete()
+    else:
+        real_replace = os.replace
+
+        def replace_with_swap_back(*args, **kwargs):
+            _swap_root_back(store.root, outside)
+            return real_replace(*args, **kwargs)
+
+        monkeypatch.setattr("houndd.projection.os.replace", replace_with_swap_back)
+        with pytest.raises(UnsafeStoreError):
+            store.rebuild_index()
+
+    assert not any(outside.iterdir())
 
 
 @pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
@@ -475,6 +531,7 @@ def test_hsp20_verify_store_closes_verifier_anchors_on_success_and_failure(tmp_p
 def test_hsp20_swapped_parents_fail_closed_after_init(tmp_path, component: str, operation: str) -> None:
     store = HounddStore(tmp_path / "store")
     _populate(store, count=1)
+    record_id = store.journal.entries()[0]["artifact"]["record_id"]
     outside = tmp_path / f"{component}-outside"
     outside.mkdir()
     original = store.root / component
@@ -483,7 +540,6 @@ def test_hsp20_swapped_parents_fail_closed_after_init(tmp_path, component: str, 
     original.symlink_to(outside, target_is_directory=True)
 
     if component == "records" and operation == "read":
-        record_id = store.journal.entries()[0]["artifact"]["record_id"]
         with pytest.raises(StoreError):
             store.records.read(record_id)
     elif component == "legacy" and operation == "write":
@@ -661,6 +717,58 @@ def test_hsp20_successful_rebuild_publishes_private_bytes_and_syncs_directory(tm
     assert store.projection.rows()
     assert stat.S_IMODE(store.projection.path.stat().st_mode) == 0o600
     assert len(synced) >= 2  # private temp, then anchored root directory
+
+
+def test_hsp20_rebuild_reclaims_private_stale_projection_temps(tmp_path) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    stale = store.root / ".index.sqlite.tmp.stale"
+    stale.write_bytes(b"incomplete projection")
+    stale.chmod(0o600)
+
+    assert store.rebuild_index()["valid"] is True
+    assert not stale.exists()
+    assert len(store.projection.rows()) == 1
+
+
+def test_hsp20_rebuild_refuses_unsafe_stale_projection_temp_without_outside_write(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    stale = store.root / ".index.sqlite.tmp.unsafe"
+    stale.symlink_to(outside / "index.sqlite")
+
+    with pytest.raises(UnsafeStoreError):
+        store.rebuild_index()
+
+    assert stale.is_symlink()
+    assert not any(outside.iterdir())
+
+
+def test_hsp20_rebuild_preserves_stale_temp_replaced_during_reclamation(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    stale = store.root / ".index.sqlite.tmp.stale"
+    stale.write_bytes(b"original")
+    stale.chmod(0o600)
+    original_visible = store.projection._visible_stat
+    replaced = False
+
+    def visible_then_replace(anchor, name):
+        nonlocal replaced
+        visible = original_visible(anchor, name)
+        if name == stale.name and not replaced:
+            stale.unlink()
+            stale.write_bytes(b"replacement")
+            stale.chmod(0o600)
+            replaced = True
+        return visible
+
+    monkeypatch.setattr(store.projection, "_visible_stat", visible_then_replace)
+    with pytest.raises(UnsafeStoreError):
+        store.rebuild_index()
+    assert stale.read_bytes() == b"replacement"
 
 
 @pytest.mark.parametrize("operation", ["rows", "verify"])
