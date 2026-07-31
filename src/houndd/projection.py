@@ -21,8 +21,22 @@ class Projection:
 
     _TEMP_PREFIX = ".index.sqlite.tmp."
 
+    @staticmethod
+    def _supplied_path_has_symlink(path: Path) -> bool:
+        """Detect a dangling symlink in any lexical root component."""
+
+        current = Path(os.sep)
+        for part in path.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                return True
+        return False
+
     def __init__(self, root: str | os.PathLike[str], *, create: bool = False) -> None:
-        self.root = Path(os.path.abspath(os.fspath(root)))
+        raw = os.fspath(root)
+        supplied_parts = [part for part in raw.split(os.sep) if part]
+        self._unsafe_supplied_spelling = not raw or any(part in {".", ".."} for part in supplied_parts)
+        self.root = Path(os.path.abspath(raw))
         self.path = self.root / "index.sqlite"
         self.anchor: AnchoredRoot | None = None
         try:
@@ -34,7 +48,10 @@ class Projection:
                     if "index.sqlite" in self.anchor.listdir():
                         check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
         except UnsafeStoreError:
-            if create or self.root.exists():
+            # A dangling root symlink reports false from ``Path.exists()``,
+            # but it is still an unsafe supplied component, not a missing
+            # optional projection directory.
+            if create or self._unsafe_supplied_spelling or os.path.lexists(self.root) or self._supplied_path_has_symlink(self.root):
                 self.close()
                 raise
         except Exception:

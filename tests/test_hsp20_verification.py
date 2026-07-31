@@ -11,7 +11,21 @@ from pathlib import Path
 
 import pytest
 
-from houndd import HounddStore, ProjectionError, StoreError, TransactionError, UnsafeStoreError, make_journal_envelope, verify_store
+from houndd import (
+    HounddStore,
+    Journal,
+    Projection,
+    ProjectionError,
+    RecordStore,
+    StoreError,
+    TransactionCoordinator,
+    TransactionError,
+    UnsafeStoreError,
+    canonical_bytes,
+    make_journal_envelope,
+    verify_store,
+)
+from houndd._safety import AnchoredRoot
 
 
 def _request(index: int) -> dict[str, object]:
@@ -61,6 +75,37 @@ def _swap_root_back(root: Path, outside: Path, *, unlink=os.unlink) -> None:
     root.symlink_to(outside, target_is_directory=True)
     unlink(root)
     backup.rename(root)
+
+
+def _swap_ancestor(ancestor: Path, outside: Path) -> Path:
+    """Leave one supplied root-path component pointing outside its old tree."""
+
+    detached = ancestor.with_name(f"{ancestor.name}.detached")
+    ancestor.rename(detached)
+    ancestor.symlink_to(outside, target_is_directory=True)
+    return detached
+
+
+def _journal_entry(sequence: int) -> dict[str, object]:
+    return make_journal_envelope(
+        sequence=sequence,
+        appended_at=f"2026-07-31T00:00:{sequence:02d}Z",
+        producer={"owner_id": "owner", "capability": "capture", "run_id": f"append-{sequence}"},
+        artifact={
+            "kind": "failure",
+            "schema": "houndd.failure.v1",
+            "record_id": "f" * 64,
+            "hash": "e" * 64,
+            "authorized_uri": "houndd://append",
+        },
+        lineage={"relation": "none", "record_id": "f" * 64, "lead_id": "none"},
+        source={"provider": "provider", "native_id": f"append-{sequence}", "canonical_url": "none"},
+        classification={"outcome": "failed", "evidence_status": "failure"},
+        access="restricted",
+        policy_id="policy",
+        dedupe={"object_key": f"append:{sequence}", "content_sha256": "d" * 64},
+        usage={},
+    )
 
 
 def _swap_root_with_copy(root: Path, replacement_kind: str, *, tamper_record: bool = False) -> tuple[Path, Path]:
@@ -158,34 +203,49 @@ def test_hsp20_projection_swap_back_uses_held_root_and_never_writes_outside(
 
     if operation in {"rows", "verify"}:
         real_connect = sqlite3.connect
+        swapped = False
 
         def connect_with_swap_back(*args, **kwargs):
-            _swap_root_back(store.root, outside)
+            nonlocal swapped
+            if not swapped:
+                _swap_root_back(store.root, outside)
+                swapped = True
             return real_connect(*args, **kwargs)
 
-            monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
-            if operation == "rows":
-                assert store.projection.rows()
-            else:
-                assert store.verify()["valid"] is True
+        monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap_back)
+        if operation == "rows":
+            assert store.projection.rows()
+        else:
+            assert store.verify()["valid"] is True
+        assert swapped
     elif operation == "delete":
         real_unlink = os.unlink
+        swapped = False
 
         def unlink_with_swap_back(*args, **kwargs):
-            _swap_root_back(store.root, outside)
+            nonlocal swapped
+            if not swapped:
+                _swap_root_back(store.root, outside)
+                swapped = True
             return real_unlink(*args, **kwargs)
 
         monkeypatch.setattr("houndd.projection.os.unlink", unlink_with_swap_back)
         store.projection.delete()
+        assert swapped
     else:
         real_replace = os.replace
+        swapped = False
 
         def replace_with_swap_back(*args, **kwargs):
-            _swap_root_back(store.root, outside)
+            nonlocal swapped
+            if not swapped:
+                _swap_root_back(store.root, outside)
+                swapped = True
             return real_replace(*args, **kwargs)
 
         monkeypatch.setattr("houndd.projection.os.replace", replace_with_swap_back)
         assert store.rebuild_index()["valid"] is True
+        assert swapped
 
     assert not any(outside.iterdir())
 
@@ -422,6 +482,226 @@ def test_hsp20_projection_rows_are_read_only_and_projection_fds_are_flat(tmp_pat
         with pytest.raises(ProjectionError):
             store.projection.rows()
     assert _fd_count() == failure_baseline
+
+
+@pytest.mark.parametrize("component", ["root", "parent", "intermediate", "grandparent"])
+@pytest.mark.parametrize("entry_point", ["houndd", "records", "journal", "transactions", "projection"])
+def test_hsp20_preexisting_symlink_in_any_supplied_root_component_has_no_effects(
+    tmp_path, component: str, entry_point: str
+) -> None:
+    root = tmp_path / "supplied" / "grandparent" / "intermediate" / "parent" / "store"
+    ancestors = {
+        "root": root,
+        "parent": root.parent,
+        "intermediate": root.parents[1],
+        "grandparent": root.parents[2],
+    }
+    unsafe = ancestors[component]
+    unsafe.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    unsafe.symlink_to(outside / unsafe.name, target_is_directory=True)
+    before = _tree_snapshot(outside)
+
+    with pytest.raises(StoreError):
+        if entry_point == "houndd":
+            HounddStore(root)
+        elif entry_point == "records":
+            RecordStore(root)
+        elif entry_point == "journal":
+            Journal(root)
+        elif entry_point == "transactions":
+            TransactionCoordinator(root)
+        else:
+            # A dangling root symlink is unsafe, not the normal optional
+            # missing-projection case.
+            Projection(root)
+
+    assert _tree_snapshot(outside) == before
+
+
+@pytest.mark.parametrize("supplied", ["", "safe/../missing", "safe/./missing"])
+def test_hsp20_projection_rejects_unsafe_missing_root_spelling_but_allows_normal_absence(tmp_path, supplied: str) -> None:
+    (tmp_path / "safe").mkdir()
+    root = supplied if not supplied else f"{tmp_path}/{supplied}"
+
+    with pytest.raises(UnsafeStoreError):
+        Projection(root)
+
+    assert Projection(tmp_path / "normally-missing").rows() == []
+
+
+def test_hsp20_rejected_root_construction_keeps_ancestor_fds_flat(tmp_path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o755)
+    baseline = _fd_count()
+
+    for _ in range(100):
+        with pytest.raises(UnsafeStoreError):
+            AnchoredRoot(unsafe, error_type=UnsafeStoreError)
+
+    assert _fd_count() == baseline
+
+
+@pytest.mark.parametrize("ancestor_name", ["parent", "intermediate", "grandparent"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "record_read",
+        "record_write",
+        "record_list",
+        "blob_write",
+        "journal_read",
+        "journal_append",
+        "transaction_begin",
+        "transaction_commit",
+        "projection_rows",
+        "projection_verify",
+        "projection_delete",
+        "projection_rebuild",
+    ],
+)
+def test_hsp20_lasting_ancestry_replacement_refuses_before_public_operation_effects(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, ancestor_name: str, operation: str
+) -> None:
+    root = tmp_path / "supplied" / "grandparent" / "intermediate" / "parent" / "store"
+    root.parent.mkdir(parents=True)
+    store = HounddStore(root)
+    _populate(store, count=1)
+    record_id = store.journal.entries()[0]["artifact"]["record_id"]
+    pending = (
+        store.begin(_request(50), principal="peer:50", capability="capture") if operation == "transaction_commit" else None
+    )
+    ancestors = {
+        "parent": store.root.parent,
+        "intermediate": store.root.parents[1],
+        "grandparent": store.root.parents[2],
+    }
+    outside = tmp_path / f"outside-{ancestor_name}-{operation}"
+    outside.mkdir()
+    detached_before = _tree_snapshot(ancestors[ancestor_name])
+    detached: Path | None = None
+    swapped = False
+
+    def swap_once() -> None:
+        nonlocal detached, swapped
+        if not swapped:
+            detached = _swap_ancestor(ancestors[ancestor_name], outside)
+            swapped = True
+
+    if operation == "projection_verify":
+        original_walk = AnchoredRoot._walk
+
+        def walk_then_swap(anchor, *, create):
+            links = original_walk(anchor, create=create)
+            if anchor.path == store.root and not create:
+                swap_once()
+            return links
+
+        monkeypatch.setattr(AnchoredRoot, "_walk", walk_then_swap)
+        report = store.verify()
+        assert report["valid"] is False
+    else:
+        anchor = {
+            "record_read": store.records.anchor,
+            "record_write": store.records.anchor,
+            "record_list": store.records.anchor,
+            "blob_write": store.records.blobs.anchor,
+            "journal_read": store.journal.anchor,
+            "journal_append": store.journal.anchor,
+            "transaction_begin": store.transactions.anchor,
+            "transaction_commit": store.transactions.anchor,
+            "projection_rows": store.projection.anchor,
+            "projection_delete": store.projection.anchor,
+            "projection_rebuild": store.projection.anchor,
+        }[operation]
+        assert anchor is not None
+        original_walk = anchor._walk
+
+        def walk_then_swap(*, create):
+            links = original_walk(create=create)
+            if not create:
+                swap_once()
+            return links
+
+        monkeypatch.setattr(anchor, "_walk", walk_then_swap)
+        expected = TransactionError if operation.startswith("transaction_") else UnsafeStoreError
+        with pytest.raises(expected):
+            if operation == "record_read":
+                store.records.read(record_id)
+            elif operation == "record_write":
+                store.records.put_bytes("lasting-write", b"lasting-write")
+            elif operation == "record_list":
+                store.records.record_ids()
+            elif operation == "blob_write":
+                store.records.blob(b"lasting-blob")
+            elif operation == "journal_read":
+                store.journal.entries()
+            elif operation == "journal_append":
+                store.journal.append(_journal_entry(1))
+            elif operation == "transaction_begin":
+                store.begin(_request(51), principal="peer:51", capability="capture")
+            elif operation == "transaction_commit":
+                assert pending is not None
+                pending.commit(record={"schema_version": "houndd.capture.v1", "value": "lasting"}, blob=b"lasting")
+            elif operation == "projection_rows":
+                store.projection.rows()
+            elif operation == "projection_delete":
+                store.projection.delete()
+            else:
+                store.rebuild_index()
+
+    assert swapped
+    assert detached is not None
+    assert _tree_snapshot(outside) == []
+    assert _tree_snapshot(detached) == detached_before
+
+
+def test_hsp20_unrelated_parent_sibling_churn_does_not_poison_initialized_store(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "sibling-parent" / "store"
+    root.parent.mkdir()
+    store = HounddStore(root)
+    _populate(store, count=1)
+    record_id = store.journal.entries()[0]["artifact"]["record_id"]
+    sibling = store.root.parent / "unrelated-sibling"
+    original_walk = store.records.anchor._walk
+    churn_during_read = False
+
+    def walk_with_sibling_churn(*, create):
+        links = original_walk(create=create)
+        if churn_during_read:
+            sibling.mkdir()
+            sibling.rmdir()
+        return links
+
+    monkeypatch.setattr(store.records.anchor, "_walk", walk_with_sibling_churn)
+    baseline = _fd_count()
+    for _ in range(100):
+        sibling.mkdir()
+        sibling.rmdir()
+        churn_during_read = True
+        assert store.records.read(record_id)
+        churn_during_read = False
+        sibling.mkdir()
+        sibling.rmdir()
+        assert store.journal.entries()
+        assert store.projection.rows()
+    assert _fd_count() == baseline
+
+
+def test_hsp20_canonical_store_bytes_never_include_the_absolute_filesystem_path(tmp_path) -> None:
+    root = tmp_path / "absolute-path" / "store"
+    root.parent.mkdir()
+    store = HounddStore(root)
+    response = store.begin(_request(1), principal="peer:1", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "portable"}, blob=b"portable"
+    )
+    record_id = response["record_ids"][0]
+    absolute = os.fspath(tmp_path).encode()
+
+    assert absolute not in store.records.read(record_id)
+    assert absolute not in store.journal.events_path.read_bytes()
+    assert absolute not in canonical_bytes(response)
 
 
 def test_hsp20_tamper_and_orphans_fail_independent_verification(tmp_path) -> None:

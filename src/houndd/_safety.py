@@ -70,6 +70,7 @@ class AnchoredRoot:
         # A facade can be shared by callers.  An operation guard is not
         # transferable across threads, so serialize its descriptor lifetime.
         self._operation_lock = threading.RLock()
+        links: list[_AncestryLink] = []
         try:
             links = self._walk(create=create)
             self.fd = links[-1].child_fd
@@ -77,7 +78,15 @@ class AnchoredRoot:
             check_private_stat(self._root_stat, self.path, directory=True, error_type=self.error_type)
             # Ownership of the root fd transfers to us; close only ancestors.
             self._close_links(links, keep={self.fd})
+            links = []
         except Exception:
+            # ``_walk`` deliberately keeps every lexical ancestor open until
+            # the root has been checked.  If that check rejects the root,
+            # close the whole just-walked chain before ``close`` handles any
+            # already-owned root descriptor.
+            if links:
+                self._close_links(links)
+                self.fd = None
             self.close()
             raise
 
