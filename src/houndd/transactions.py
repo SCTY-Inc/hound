@@ -19,8 +19,11 @@ from .contracts import (
     canonical_request_hash,
     make_journal_envelope,
     make_response,
+    validate_journal_envelope,
     validate_request,
+    validate_response,
 )
+from ._safety import AnchoredRoot, check_private_stat
 from .journal import FaultHook, Journal, JournalError
 from .store import RecordStore, StoreError
 
@@ -42,14 +45,39 @@ FAULT_AFTER_PROVIDER = "after_provider_return_before_publish"
 FAULT_AFTER_RECORD = "after_record_publish_before_journal_fsync"
 FAULT_AFTER_JOURNAL = "after_journal_fsync_before_response"
 
+_IDEMPOTENCY_REQUIRED = {"scope_id", "principal", "capability", "idempotency_key", "request_hash", "transaction_id", "status"}
+_IDEMPOTENCY_OPTIONAL = {"response"}
+_STAGE_REQUIRED = {"transaction_id", "scope_id", "principal", "capability", "idempotency_key", "request", "request_hash", "status", "context", "appended_at"}
+_STAGE_OPTIONAL = {"prepared", "record_id", "record_hash", "content_sha256", "envelope", "response"}
+_META_STATUSES = {"open", "prepared", "published", "complete"}
+_COMPLETE_STATUSES = {"complete"}
 
-def _private_directory(path: Path) -> None:
+
+def _strict_object(value: Any, required: set[str], optional: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TransactionError(f"{label} must be an object")
+    unknown = set(value) - required - optional
+    missing = required - set(value)
+    if missing or unknown:
+        parts = []
+        if missing:
+            parts.append(f"missing {sorted(missing)!r}")
+        if unknown:
+            parts.append(f"unknown {sorted(unknown)!r}")
+        raise TransactionError(f"{label} has {' and '.join(parts)}")
+    return value
+
+
+def _private_directory(path: Path, *, create: bool = True) -> None:
     if path.is_symlink():
         raise TransactionError(f"{path} must not be a symlink")
     existed = path.exists()
-    path.mkdir(exist_ok=existed)
-    if not existed:
-        path.chmod(0o700)
+    if create:
+        path.mkdir(exist_ok=existed)
+        if not existed:
+            path.chmod(0o700)
+    elif not existed:
+        raise TransactionError(f"{path} is missing")
     info = path.stat()
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise TransactionError(f"{path} is not owned by the current user")
@@ -57,8 +85,12 @@ def _private_directory(path: Path) -> None:
         raise TransactionError(f"{path} has group/world permissions")
 
 
-def _private_file(path: Path) -> None:
-    if path.is_symlink() or not path.is_file():
+def _private_file(path: Path, *, create: bool = True) -> None:
+    if path.is_symlink() or not path.exists():
+        if create:
+            raise TransactionError(f"{path} is not a safe regular file")
+        raise TransactionError(f"{path} is missing")
+    if not path.is_file():
         raise TransactionError(f"{path} is not a safe regular file")
     info = path.stat()
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
@@ -94,6 +126,11 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 class Transaction:
     coordinator: "TransactionCoordinator"
     transaction_id: str
+    request: dict[str, Any]
+    principal: str
+    capability: str
+    request_hash: str
+    scope_id: str
     existing_response: dict[str, Any] | None = None
 
     def commit(
@@ -120,28 +157,34 @@ class Transaction:
 class TransactionCoordinator:
     """Coordinate one durable attempt per authenticated scope and key."""
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
-        self.root = Path(root)
-        _private_directory(self.root)
+    def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
+        root_path = Path(root)
+        if root_path.is_symlink():
+            raise TransactionError(f"{root_path} must not be a symlink")
+        self.root = root_path.resolve(strict=False)
+        _private_directory(self.root, create=create)
         self.transactions = self.root / "transactions"
         self.stages = self.transactions / "stages"
         self.idempotency = self.transactions / "idempotency"
         for directory in (self.transactions, self.stages, self.idempotency):
-            _private_directory(directory)
+            _private_directory(directory, create=create)
         self.lock_path = self.transactions / "lock"
         if not self.lock_path.exists():
+            if not create:
+                raise TransactionError(f"{self.lock_path} is missing")
             descriptor = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
-        _private_file(self.lock_path)
+        _private_file(self.lock_path, create=create)
         for directory in (self.stages, self.idempotency):
             for path in directory.glob("*.json"):
-                _private_file(path)
-        self.records = RecordStore(self.root)
-        self.journal = Journal(self.root)
+                _private_file(path, create=create)
+        self.records = RecordStore(self.root, create=create)
+        self.journal = Journal(self.root, create=create)
+        self.anchor = AnchoredRoot(self.root, error_type=TransactionError)
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        descriptor = os.open(self.lock_path, os.O_RDWR)
+        descriptor = self.anchor.open_file("transactions", "lock", flags=os.O_RDWR)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
@@ -159,16 +202,141 @@ class TransactionCoordinator:
     def _idempotency_path(self, scope_id: str) -> Path:
         return self.idempotency / f"{scope_id}.json"
 
-    @staticmethod
-    def _load(path: Path) -> dict[str, Any]:
-        _private_file(path)
+    def _load_metadata(self, *parts: str) -> dict[str, Any]:
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(self.anchor.read_bytes(*parts).decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise TransactionError(f"cannot read transaction metadata {path}") from error
+            raise TransactionError(f"cannot read transaction metadata {self.root.joinpath(*parts)}") from error
         if not isinstance(value, dict):
-            raise TransactionError(f"transaction metadata {path} is not an object")
+            raise TransactionError(f"transaction metadata {self.root.joinpath(*parts)} is not an object")
         return value
+
+    def _write_metadata(self, *parts: str, value: Mapping[str, Any]) -> None:
+        try:
+            self.anchor.write_bytes_atomic(*parts, data=canonical_bytes(value))
+        except OSError as error:
+            raise TransactionError(f"cannot persist {self.root.joinpath(*parts)}") from error
+
+    def _validate_reservation(
+        self,
+        stage: Mapping[str, Any],
+        idempotency: Mapping[str, Any],
+        *,
+        request: Mapping[str, Any],
+        principal: str,
+        capability: str,
+        request_hash: str,
+        scope_id: str,
+        transaction_id: str,
+        require_complete: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        stage = _strict_object(stage, _STAGE_REQUIRED, _STAGE_OPTIONAL, "transaction stage")
+        idempotency = _strict_object(idempotency, _IDEMPOTENCY_REQUIRED, _IDEMPOTENCY_OPTIONAL, "idempotency metadata")
+        if stage["transaction_id"] != transaction_id or idempotency["transaction_id"] != transaction_id:
+            raise TransactionError("transaction identity drifted")
+        if stage["scope_id"] != scope_id or idempotency["scope_id"] != scope_id:
+            raise TransactionError("reservation scope drifted")
+        if stage["principal"] != principal or idempotency["principal"] != principal:
+            raise TransactionError("reservation principal drifted")
+        if stage["capability"] != capability or idempotency["capability"] != capability:
+            raise TransactionError("reservation capability drifted")
+        if stage["idempotency_key"] != request["idempotency_key"] or idempotency["idempotency_key"] != request["idempotency_key"]:
+            raise TransactionError("reservation key drifted")
+        if stage["request_hash"] != request_hash or idempotency["request_hash"] != request_hash:
+            raise TransactionError("reservation request hash drifted")
+        validate_request(stage["request"])
+        if canonical_request_hash(stage["request"]) != request_hash:
+            raise TransactionError("reservation request payload drifted")
+        if stage["status"] not in _META_STATUSES:
+            raise TransactionError("reservation stage status is invalid")
+        expected_idempotency_status = "complete" if stage["status"] == "complete" else "open"
+        if idempotency["status"] != expected_idempotency_status:
+            raise TransactionError("reservation idempotency status drifted")
+        if require_complete and stage["status"] != "complete":
+            raise TransactionError("reservation is not complete")
+        response = None
+        if stage["status"] != "open":
+            prepared = _strict_object(stage.get("prepared"), {"record_body", "outcome", "evidence_status", "blob", "context"}, set(), "transaction prepared")
+            record_bytes = base64.b64decode(prepared["record_body"])
+            if stage["status"] == "complete":
+                if "record_id" not in stage or "record_hash" not in stage or "content_sha256" not in stage or "envelope" not in stage or "response" not in stage:
+                    raise TransactionError("complete reservation metadata is incomplete")
+                response = validate_response(stage["response"])
+                if response != validate_response(idempotency.get("response")):
+                    raise TransactionError("idempotency response drifted")
+                ok = prepared["outcome"] == "completed"
+                expected_response = make_response(
+                    stage["request"]["request_id"],
+                    ok=ok,
+                    outcome=prepared["outcome"],
+                    record_ids=[stage["record_id"]],
+                    entry_ids=[stage["envelope"]["entry_id"]],
+                    usage={"requests": 1, "bytes": len(record_bytes)},
+                    error=None if ok else {"code": prepared["outcome"], "retryable": prepared["outcome"] in {"interrupted", "degraded"}, "message": "durable operation outcome"},
+                )
+                if response != expected_response:
+                    raise TransactionError("reservation response drifted")
+                envelope = validate_journal_envelope(stage["envelope"])
+                if envelope != stage["envelope"]:
+                    raise TransactionError("reservation envelope drifted")
+                expected_envelope = make_journal_envelope(
+                    sequence=envelope["sequence"],
+                    appended_at=stage["appended_at"],
+                    producer=request["producer"],
+                    artifact={
+                        "kind": prepared["context"]["kind"],
+                        "schema": prepared["context"]["schema"],
+                        "record_id": stage["record_id"],
+                        "hash": stage["record_hash"],
+                        "authorized_uri": prepared["context"]["authorized_uri"],
+                    },
+                    lineage=prepared["context"]["lineage"],
+                    source=prepared["context"]["source"],
+                    classification={"outcome": prepared["outcome"], "evidence_status": prepared["evidence_status"]},
+                    access=prepared["context"]["access"],
+                    policy_id=prepared["context"]["policy_id"],
+                    dedupe={"object_key": prepared["context"]["object_key"], "content_sha256": stage["content_sha256"]},
+                    usage={"requests": 1, "bytes": len(record_bytes)},
+                )
+                if envelope != expected_envelope:
+                    raise TransactionError("reservation envelope drifted")
+                if self.journal.get(envelope["entry_id"]) != envelope:
+                    raise TransactionError("reservation journal entry drifted")
+                if not self.records.verify_record(stage["record_id"], stage["record_hash"]):
+                    raise TransactionError("reservation record drifted")
+                self.records.blobs.get(stage["content_sha256"])
+        return stage, idempotency
+
+    def _load_validated_reservation(
+        self,
+        request: Mapping[str, Any],
+        *,
+        principal: str,
+        capability: str,
+        require_complete: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, str, str]:
+        request = validate_request(request)
+        if not isinstance(principal, str) or not principal:
+            raise TransactionError("authenticated principal is required")
+        if not isinstance(capability, str) or not capability:
+            raise TransactionError("authenticated capability is required")
+        request_hash = canonical_request_hash(request)
+        scope_id = self._scope_id(principal, capability, request["idempotency_key"])
+        transaction_id = canonical_hash({"scope": scope_id, "request_hash": request_hash})
+        stage = self._load_metadata("transactions", "stages", f"{transaction_id}.json")
+        idempotency = self._load_metadata("transactions", "idempotency", f"{scope_id}.json")
+        stage, idempotency = self._validate_reservation(
+            stage,
+            idempotency,
+            request=request,
+            principal=principal,
+            capability=capability,
+            request_hash=request_hash,
+            scope_id=scope_id,
+            transaction_id=transaction_id,
+            require_complete=require_complete,
+        )
+        return stage, idempotency, request, request_hash, scope_id, transaction_id
 
     @staticmethod
     def _neutral_context(request: Mapping[str, Any], request_hash: str) -> dict[str, Any]:
@@ -200,13 +368,25 @@ class TransactionCoordinator:
         idempotency_path = self._idempotency_path(scope_id)
         with self._lock():
             if idempotency_path.exists():
-                existing = self._load(idempotency_path)
-                if existing.get("request_hash") != request_hash:
+                stored_idempotency = self._load_metadata("transactions", "idempotency", f"{scope_id}.json")
+                if stored_idempotency.get("request_hash") != request_hash:
                     raise IdempotencyConflict("idempotency key was reused for a different request")
-                if existing.get("principal") != principal or existing.get("capability") != capability:
-                    raise TransactionError("idempotency scope metadata is inconsistent")
-                response = existing.get("response") if existing.get("status") == "complete" else None
-                return Transaction(self, transaction_id, response)
+                stage = self._load_metadata("transactions", "stages", f"{transaction_id}.json")
+                stage, _ = self._validate_reservation(
+                    stage,
+                    stored_idempotency,
+                    request=request,
+                    principal=principal,
+                    capability=capability,
+                    request_hash=request_hash,
+                    scope_id=scope_id,
+                    transaction_id=transaction_id,
+                    require_complete=False,
+                )
+                response = stage.get("response") if stage["status"] == "complete" else None
+                return Transaction(self, transaction_id, request, principal, capability, request_hash, scope_id, response)
+            if stage_path.exists():
+                raise TransactionError("reservation counterpart is missing")
             context = self._neutral_context(request, request_hash)
             stage = {
                 "transaction_id": transaction_id,
@@ -220,10 +400,12 @@ class TransactionCoordinator:
                 "context": context,
                 "appended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
-            _atomic_json(stage_path, stage)
-            _atomic_json(
-                idempotency_path,
-                {
+            self._write_metadata("transactions", "stages", f"{transaction_id}.json", value=stage)
+            self._write_metadata(
+                "transactions",
+                "idempotency",
+                f"{scope_id}.json",
+                value={
                     "scope_id": scope_id,
                     "principal": principal,
                     "capability": capability,
@@ -233,15 +415,17 @@ class TransactionCoordinator:
                     "status": "open",
                 },
             )
-        return Transaction(self, transaction_id)
+        return Transaction(self, transaction_id, request, principal, capability, request_hash, scope_id)
 
     def _write_stage(self, stage: dict[str, Any]) -> None:
-        _atomic_json(self._stage_path(stage["transaction_id"]), stage)
+        self._write_metadata("transactions", "stages", f"{stage['transaction_id']}.json", value=stage)
 
     def _write_idempotency(self, stage: Mapping[str, Any]) -> None:
-        _atomic_json(
-            self._idempotency_path(stage["scope_id"]),
-            {
+        self._write_metadata(
+            "transactions",
+            "idempotency",
+            f"{stage['scope_id']}.json",
+            value={
                 "scope_id": stage["scope_id"],
                 "principal": stage["principal"],
                 "capability": stage["capability"],
@@ -272,7 +456,12 @@ class TransactionCoordinator:
         if transaction.existing_response is not None:
             return transaction.existing_response
         with self._lock():
-            stage = self._load(self._stage_path(transaction.transaction_id))
+            stage, _, _, _, _, _ = self._load_validated_reservation(
+                transaction.request,
+                principal=transaction.principal,
+                capability=transaction.capability,
+                require_complete=False,
+            )
             if stage.get("status") == "complete":
                 return stage["response"]
             self._hook(fault, FAULT_BEFORE_PROVIDER)
@@ -358,6 +547,21 @@ class TransactionCoordinator:
             return response
 
     def _recover_stage(self, stage: dict[str, Any]) -> dict[str, Any]:
+        request = validate_request(stage["request"])
+        request_hash = canonical_request_hash(request)
+        scope_id = self._scope_id(stage["principal"], stage["capability"], request["idempotency_key"])
+        transaction_id = canonical_hash({"scope": scope_id, "request_hash": request_hash})
+        stage, _ = self._validate_reservation(
+            stage,
+            self._load_metadata("transactions", "idempotency", f"{scope_id}.json"),
+            request=request,
+            principal=stage["principal"],
+            capability=stage["capability"],
+            request_hash=request_hash,
+            scope_id=scope_id,
+            transaction_id=transaction_id,
+            require_complete=False,
+        )
         if stage.get("status") == "complete":
             return stage["response"]
         if "prepared" not in stage:
@@ -425,8 +629,10 @@ class TransactionCoordinator:
         self.journal.reconcile()
         recovered = []
         with self._lock():
-            for path in sorted(self.stages.glob("*.json")):
-                stage = self._load(path)
+            for name in self.anchor.listdir("transactions", "stages"):
+                if not name.endswith(".json"):
+                    continue
+                stage = self._load_metadata("transactions", "stages", name)
                 if stage.get("status") != "complete":
                     recovered.append(self._recover_stage(stage))
         return recovered

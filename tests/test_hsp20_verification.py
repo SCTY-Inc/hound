@@ -8,7 +8,7 @@ import stat
 
 import pytest
 
-from houndd import HounddStore, ProjectionError, TransactionError, UnsafeStoreError, make_journal_envelope
+from houndd import HounddStore, ProjectionError, StoreError, TransactionError, UnsafeStoreError, make_journal_envelope, verify_store
 
 
 def _request(index: int) -> dict[str, object]:
@@ -57,6 +57,44 @@ def test_hsp20_tamper_and_orphans_fail_independent_verification(tmp_path) -> Non
     _populate(clean, count=1)
     clean.records.blob(b"orphan")
     assert clean.verify()["valid"] is False
+
+
+@pytest.mark.parametrize(
+    ("component", "operation"),
+    [
+        ("records", "read"),
+        ("legacy", "write"),
+        ("journal", "read"),
+        ("transactions", "begin"),
+    ],
+)
+def test_hsp20_swapped_parents_fail_closed_after_init(tmp_path, component: str, operation: str) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    outside = tmp_path / f"{component}-outside"
+    outside.mkdir()
+    original = store.root / component
+    backup = tmp_path / f"{component}-backup"
+    original.rename(backup)
+    original.symlink_to(outside, target_is_directory=True)
+
+    if component == "records" and operation == "read":
+        record_id = store.journal.entries()[0]["artifact"]["record_id"]
+        with pytest.raises(StoreError):
+            store.records.read(record_id)
+    elif component == "legacy" and operation == "write":
+        with pytest.raises(StoreError):
+            store.records.put_bytes("legacy-record", b"legacy-bytes")
+    elif component == "journal" and operation == "read":
+        with pytest.raises(StoreError):
+            store.journal.entries()
+    elif component == "transactions" and operation == "begin":
+        with pytest.raises(StoreError):
+            store.begin(_request(99), principal="peer:99", capability="capture")
+    else:  # pragma: no cover
+        raise AssertionError("unexpected swap case")
+
+    assert not any(outside.iterdir())
 
 
 def test_hsp20_journal_chain_sequence_and_orphan_event_tampering_fails_closed(tmp_path) -> None:
@@ -117,7 +155,19 @@ def test_hsp20_idempotency_stage_and_existing_file_modes_are_verified(tmp_path) 
     assert clean.verify()["valid"] is False
     clean.projection.path.chmod(0o644)
     with pytest.raises(UnsafeStoreError):
+        clean.projection.rows()
+    assert stat.S_IMODE(clean.projection.path.stat().st_mode) == 0o644
+    assert clean.verify()["valid"] is False
+    assert stat.S_IMODE(clean.projection.path.stat().st_mode) == 0o644
+    with pytest.raises(UnsafeStoreError):
         HounddStore(clean.root)
+
+
+def test_hsp20_verify_missing_store_is_invalid_without_creating_root(tmp_path) -> None:
+    missing = tmp_path / "missing"
+    report = verify_store(missing)
+    assert report["valid"] is False
+    assert not missing.exists()
 
 
 def test_hsp20_new_sqlite_is_owner_only(tmp_path) -> None:

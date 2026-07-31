@@ -8,6 +8,7 @@ import stat
 from pathlib import Path
 from typing import Any, Callable
 
+from ._safety import AnchoredRoot, check_private_stat
 from .journal import Journal
 from .store import RecordStore, StoreError, UnsafeStoreError
 
@@ -19,27 +20,43 @@ class ProjectionError(StoreError):
 class Projection:
     """A query aid whose rows are never used as canonical truth."""
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
-        self.root = Path(root)
-        if self.root.is_symlink():
-            raise UnsafeStoreError(f"{self.root} must not be a symlink")
-        existed = self.root.exists()
-        self.root.mkdir(exist_ok=existed)
-        if not existed:
-            self.root.chmod(0o700)
-        info = self.root.stat()
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise UnsafeStoreError(f"{self.root} is not owned by the current user")
-        if info.st_mode & 0o077:
-            raise UnsafeStoreError(f"{self.root} has group/world permissions")
+    def __init__(self, root: str | os.PathLike[str], *, create: bool = False) -> None:
+        root_path = Path(root)
+        if root_path.is_symlink():
+            raise UnsafeStoreError(f"{root_path} must not be a symlink")
+        self.root = root_path.resolve(strict=False)
         self.path = self.root / "index.sqlite"
-        if self.path.exists():
-            if self.path.is_symlink() or stat.S_IMODE(self.path.stat().st_mode) & 0o077:
-                raise UnsafeStoreError(f"{self.path} has unsafe permissions")
+        self.anchor: AnchoredRoot | None = None
+        if self.root.exists():
+            info = self.root.stat()
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise UnsafeStoreError(f"{self.root} is not owned by the current user")
+            if info.st_mode & 0o077:
+                raise UnsafeStoreError(f"{self.root} has group/world permissions")
+            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        elif create:
+            self.root.mkdir(exist_ok=True)
+            self.root.chmod(0o700)
+            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        if self.anchor is not None:
+            if "index.sqlite" in self.anchor.listdir():
+                check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
 
-    def _connect(self) -> sqlite3.Connection:
+    def _ensure_anchor(self, *, create: bool = False) -> AnchoredRoot:
+        if self.anchor is not None:
+            return self.anchor
+        if not self.root.exists():
+            if not create:
+                raise UnsafeStoreError(f"{self.root} is missing")
+            self.root.mkdir(exist_ok=True)
+            self.root.chmod(0o700)
+        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        return self.anchor
+
+    def _connect(self, *, normalize_mode: bool) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
-        self.path.chmod(0o600)
+        if normalize_mode:
+            self.path.chmod(0o600)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA secure_delete=ON")
         return connection
@@ -53,8 +70,10 @@ class Projection:
     ) -> dict[str, Any]:
         """Replace all rows in one SQLite transaction from committed events."""
 
+        anchor = self._ensure_anchor(create=True)
+        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
         events = journal.entries()
-        connection = self._connect()
+        connection = self._connect(normalize_mode=True)
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DROP TABLE IF EXISTS entries")
@@ -130,9 +149,14 @@ class Projection:
             connection.close()
 
     def rows(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if not self.root.exists():
             return []
-        connection = self._connect()
+        anchor = self._ensure_anchor()
+        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+        if "index.sqlite" not in anchor.listdir():
+            return []
+        check_private_stat(anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+        connection = self._connect(normalize_mode=False)
         try:
             return [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
         except sqlite3.Error as error:
@@ -141,10 +165,17 @@ class Projection:
             connection.close()
 
     def delete(self) -> None:
-        if self.path.exists():
-            if self.path.is_symlink():
-                raise UnsafeStoreError(f"{self.path} must not be a symlink")
-            self.path.unlink()
+        if not self.root.exists():
+            return
+        anchor = self._ensure_anchor()
+        if "index.sqlite" not in anchor.listdir():
+            return
+        check_private_stat(anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+        directory_fd = anchor.dirfd()
+        try:
+            os.unlink("index.sqlite", dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 __all__ = ["Projection", "ProjectionError"]

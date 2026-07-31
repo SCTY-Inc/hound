@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import pytest
 import os
 import subprocess
@@ -13,9 +14,11 @@ from houndd import (
     FAULT_AFTER_PROVIDER,
     FAULT_AFTER_RECORD,
     FAULT_BEFORE_PROVIDER,
+    canonical_hash,
     HounddStore,
     IdempotencyConflict,
     InjectedCrash,
+    TransactionError,
 )
 
 
@@ -114,6 +117,78 @@ def test_hsp05_failures_are_records_and_key_collision_fails_closed(tmp_path) -> 
         store.begin(_request(key="failure", value="changed"), principal="peer:one", capability="capture")
 
 
+def test_hsp05_idempotency_replay_tamper_matrix_fails_closed(tmp_path) -> None:
+    store = HounddStore(tmp_path / "store")
+    request = _request(key="matrix")
+    expected = store.begin(request, principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same"
+    )
+    stage_file = next((store.root / "transactions" / "stages").glob("*.json"))
+    idempotency_file = next((store.root / "transactions" / "idempotency").glob("*.json"))
+    original_stage = stage_file.read_text(encoding="utf-8")
+    original_idempotency = idempotency_file.read_text(encoding="utf-8")
+
+    cases = [
+        (
+            "forged_response",
+            lambda stage, idempotency: (
+                idempotency["response"].__setitem__("entry_ids", ["forged-entry"]),
+                idempotency["response"].__setitem__("record_ids", ["forged-record"]),
+            ),
+        ),
+        (
+            "scope_fields",
+            lambda stage, idempotency: idempotency.__setitem__("principal", "forged-principal"),
+        ),
+        (
+            "transaction_id",
+            lambda stage, idempotency: stage.__setitem__("transaction_id", "forged-transaction"),
+        ),
+        (
+            "stage_envelope",
+            lambda stage, idempotency: (
+                stage["envelope"]["classification"].__setitem__("outcome", "failed"),
+                stage["envelope"].__setitem__(
+                    "entry_id",
+                    canonical_hash({key: value for key, value in stage["envelope"].items() if key != "entry_id"}),
+                ),
+            ),
+        ),
+        (
+            "missing_counterpart",
+            lambda stage, idempotency: idempotency_file.unlink(),
+        ),
+    ]
+
+    for _, mutate in cases:
+        stage_file.write_text(original_stage, encoding="utf-8")
+        stage_file.chmod(0o600)
+        idempotency_file.write_text(original_idempotency, encoding="utf-8")
+        idempotency_file.chmod(0o600)
+        stage = json.loads(stage_file.read_text(encoding="utf-8"))
+        idempotency = json.loads(idempotency_file.read_text(encoding="utf-8"))
+        mutate(stage, idempotency)
+        if stage_file.exists():
+            stage_file.write_text(json.dumps(stage), encoding="utf-8")
+            stage_file.chmod(0o600)
+        if idempotency_file.exists():
+            idempotency_file.write_text(json.dumps(idempotency), encoding="utf-8")
+            idempotency_file.chmod(0o600)
+        with pytest.raises(TransactionError):
+            store.begin(request, principal="peer:one", capability="capture").commit(
+                record={"schema_version": "houndd.capture.v1", "value": "retry"}, blob=b"retry"
+            )
+        assert store.verify()["valid"] is False
+
+    stage_file.write_text(original_stage, encoding="utf-8")
+    stage_file.chmod(0o600)
+    idempotency_file.write_text(original_idempotency, encoding="utf-8")
+    idempotency_file.chmod(0o600)
+    assert store.begin(request, principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same"
+    ) == expected
+
+
 @pytest.mark.parametrize(
     ("outcome", "diagnostic"),
     [
@@ -138,6 +213,32 @@ def test_hsp05_provider_failure_matrix_is_explicit_and_durable(tmp_path, outcome
     assert len(store.journal.entries()) == 1
     assert store.records.read_json(response["record_ids"][0])["payload"]["diagnostic"] == diagnostic
     store.rebuild_index()
+    assert store.verify()["valid"] is True
+
+
+@pytest.mark.parametrize("head_state", ["missing", "stale"])
+def test_hsp05_missing_or_stale_head_reconciles_without_verify_repair(tmp_path, head_state: str) -> None:
+    store = HounddStore(tmp_path / "store")
+    response = store.begin(_request(key=head_state), principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same"
+    )
+    head_path = store.journal.head_path
+    original_head = json.loads(head_path.read_text(encoding="utf-8"))
+    if head_state == "missing":
+        head_path.unlink()
+    else:
+        original_head["sequence"] = 99
+        head_path.write_text(json.dumps(original_head), encoding="utf-8")
+
+    assert store.verify()["valid"] is False
+    if head_state == "missing":
+        assert not head_path.exists()
+    else:
+        assert head_path.exists()
+
+    recovered = store.recover()
+    assert recovered == []
+    assert store.journal.entries()[0]["entry_id"] == response["entry_ids"][0]
     assert store.verify()["valid"] is True
 
 

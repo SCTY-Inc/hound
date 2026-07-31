@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .contracts import canonical_bytes, canonical_hash, validate_journal_envelope
+from ._safety import AnchoredRoot, check_private_stat
 from .store import StoreError, UnsafeStoreError
 
 try:
@@ -25,47 +26,35 @@ class JournalError(StoreError):
 FaultHook = Callable[[str], None]
 
 
-def _private_directory(path: Path) -> None:
+def _private_directory(path: Path, *, create: bool = True) -> None:
     if path.is_symlink():
         raise UnsafeStoreError(f"{path} must not be a symlink")
     existed = path.exists()
-    path.mkdir(exist_ok=existed)
-    if not existed:
-        path.chmod(0o700)
+    if create:
+        path.mkdir(exist_ok=existed)
+        if not existed:
+            path.chmod(0o700)
+    elif not existed:
+        raise UnsafeStoreError(f"{path} is missing")
     info = path.stat()
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
-        raise UnsafeStoreError(f"{path} is not owned by the current user")
-    if info.st_mode & 0o077:
-        raise UnsafeStoreError(f"{path} has group/world permissions")
+    check_private_stat(info, path, directory=True, error_type=UnsafeStoreError)
 
 
-def _atomic_bytes(path: Path, data: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except OSError as error:
-        temporary.unlink(missing_ok=True)
-        raise JournalError(f"cannot persist {path}") from error
+def _atomic_bytes(anchor: AnchoredRoot, *parts: str, data: bytes) -> None:
+    anchor.write_bytes_atomic(*parts, data=data)
 
 
 class Journal:
     """A single-writer logical journal backed by a process-safe file lock."""
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
-        self.root = Path(root)
-        _private_directory(self.root)
+    def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
+        root_path = Path(root)
+        if root_path.is_symlink():
+            raise UnsafeStoreError(f"{root_path} must not be a symlink")
+        self.root = root_path.resolve(strict=False)
+        _private_directory(self.root, create=create)
         self.directory = self.root / "journal"
-        _private_directory(self.directory)
+        _private_directory(self.directory, create=create)
         self.events_path = self.directory / "events.jsonl"
         self.chain_path = self.directory / "chain.jsonl"
         self.head_path = self.directory / "head.json"
@@ -74,27 +63,28 @@ class Journal:
             if path.is_symlink():
                 raise UnsafeStoreError(f"{path} must not be a symlink")
             if not path.exists():
+                if not create:
+                    raise UnsafeStoreError(f"{path} is missing")
                 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 os.close(descriptor)
             info = path.stat()
             if not stat.S_ISREG(info.st_mode):
                 raise UnsafeStoreError(f"{path} is not a regular file")
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise UnsafeStoreError(f"{path} is not owned by the current user")
-            if info.st_mode & 0o077:
-                raise UnsafeStoreError(f"{path} has group/world permissions")
+            check_private_stat(info, path, directory=False, error_type=UnsafeStoreError)
         if self.head_path.exists() and self.head_path.is_symlink():
             raise UnsafeStoreError(f"{self.head_path} must not be a symlink")
         if self.head_path.exists():
             info = self.head_path.stat()
-            if not stat.S_ISREG(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()) or info.st_mode & 0o077:
+            if not stat.S_ISREG(info.st_mode):
                 raise UnsafeStoreError(f"{self.head_path} is unsafe")
+            check_private_stat(info, self.head_path, directory=False, error_type=UnsafeStoreError)
+        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
         if fcntl is None:
             raise JournalError("journal locking is unavailable")
-        descriptor = os.open(self.lock_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+        descriptor = self.anchor.open_file("journal", "lock", flags=os.O_RDWR)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
@@ -102,12 +92,26 @@ class Journal:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    @staticmethod
-    def _read_lines(path: Path) -> list[dict[str, Any]]:
+    def _event_values_unlocked(self) -> list[dict[str, Any]]:
         try:
-            raw = path.read_bytes()
+            raw = self.anchor.read_bytes("journal", "events.jsonl")
         except OSError as error:
-            raise JournalError(f"cannot read journal file {path}") from error
+            raise JournalError(f"cannot read journal file {self.events_path}") from error
+        values = self._read_lines_from_raw(self.events_path, raw)
+        try:
+            return [validate_journal_envelope(value) for value in values]
+        except ValueError as error:
+            raise JournalError(f"journal envelope is invalid: {error}") from error
+
+    def _chain_values_unlocked(self) -> list[dict[str, Any]]:
+        try:
+            raw = self.anchor.read_bytes("journal", "chain.jsonl")
+        except OSError as error:
+            raise JournalError(f"cannot read journal file {self.chain_path}") from error
+        return self._read_lines_from_raw(self.chain_path, raw)
+
+    @staticmethod
+    def _read_lines_from_raw(path: Path, raw: bytes) -> list[dict[str, Any]]:
         if raw and not raw.endswith(b"\n"):
             raise JournalError(f"journal file {path} has a partial final line")
         result = []
@@ -124,16 +128,6 @@ class Journal:
                 raise JournalError(f"journal file {path} contains non-canonical JSON")
             result.append(value)
         return result
-
-    def _event_values_unlocked(self) -> list[dict[str, Any]]:
-        values = self._read_lines(self.events_path)
-        try:
-            return [validate_journal_envelope(value) for value in values]
-        except ValueError as error:
-            raise JournalError(f"journal envelope is invalid: {error}") from error
-
-    def _chain_values_unlocked(self) -> list[dict[str, Any]]:
-        return self._read_lines(self.chain_path)
 
     @staticmethod
     def _chain_value(event: dict[str, Any], previous: str) -> dict[str, Any]:
@@ -159,10 +153,7 @@ class Journal:
                 if chains[index] != expected:
                     raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
             else:
-                with self.chain_path.open("ab") as stream:
-                    stream.write(canonical_bytes(expected) + b"\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(expected) + b"\n")
                 chains.append(expected)
             previous = expected["chain_sha256"]
         if events:
@@ -173,17 +164,19 @@ class Journal:
             try:
                 import json
 
-                persisted = json.loads(self.head_path.read_text(encoding="utf-8"))
+                persisted = json.loads(self.anchor.read_bytes("journal", "head.json").decode("utf-8"))
             except (OSError, UnicodeError, ValueError) as error:
                 raise JournalError("journal head is unreadable") from error
             if persisted != head:
                 if not repair_missing:
                     raise JournalError("journal head does not match journal chain")
-                _atomic_bytes(self.head_path, canonical_bytes(head))
+                _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
         elif events:
-            raise JournalError("journal head is missing")
+            if not repair_missing:
+                raise JournalError("journal head is missing")
+            _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
         else:
-            _atomic_bytes(self.head_path, canonical_bytes(head))
+            _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
         return events, chains
 
     def reconcile(self) -> dict[str, Any]:
@@ -208,20 +201,28 @@ class Journal:
             if envelope["sequence"] != expected_sequence:
                 raise JournalError(f"expected sequence {expected_sequence}, got {envelope['sequence']}")
             event_bytes = canonical_bytes(envelope) + b"\n"
-            with self.events_path.open("ab") as stream:
-                stream.write(event_bytes)
-                stream.flush()
-                if before_fsync is not None:
-                    before_fsync("after_record_publish_before_journal_fsync")
-                os.fsync(stream.fileno())
+            parent_fd = self.anchor.dirfd("journal")
+            try:
+                fd = os.open(
+                    "events.jsonl",
+                    os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                check_private_stat(os.fstat(fd), self.events_path, directory=False, error_type=UnsafeStoreError)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(event_bytes)
+                    stream.flush()
+                    if before_fsync is not None:
+                        before_fsync("after_record_publish_before_journal_fsync")
+                    os.fsync(stream.fileno())
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
             previous = chains[-1]["chain_sha256"] if chains else "0" * 64
             chain = self._chain_value(envelope, previous)
-            with self.chain_path.open("ab") as stream:
-                stream.write(canonical_bytes(chain) + b"\n")
-                stream.flush()
-                os.fsync(stream.fileno())
+            self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(chain) + b"\n")
             head = {"sequence": envelope["sequence"], "chain_sha256": chain["chain_sha256"], "entry_id": envelope["entry_id"]}
-            _atomic_bytes(self.head_path, canonical_bytes(head))
+            _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
             return envelope
 
     def entries(self) -> list[dict[str, Any]]:

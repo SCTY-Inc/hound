@@ -44,7 +44,7 @@ class HounddStore:
         self.records = RecordStore(self.root)
         self.journal = Journal(self.root)
         self.transactions = TransactionCoordinator(self.root)
-        self.projection = Projection(self.root)
+        self.projection = Projection(self.root, create=True)
 
     def begin(self, request: Mapping[str, Any], *, principal: str, capability: str) -> Transaction:
         return self.transactions.begin(request, principal=principal, capability=capability)
