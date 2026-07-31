@@ -6,6 +6,7 @@ import os
 import sqlite3
 import json
 import stat
+import shutil
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,24 @@ def _swap_root(root: Path, replacement_kind: str) -> tuple[Path, Path]:
     return backup, replacement
 
 
+def _swap_root_with_copy(root: Path, replacement_kind: str, *, tamper_record: bool = False) -> tuple[Path, Path]:
+    backup = root.with_name(f"{root.name}.backup")
+    root.rename(backup)
+    if replacement_kind == "symlink":
+        replacement = root.with_name(f"{root.name}.replacement")
+        shutil.copytree(backup, replacement)
+        root.symlink_to(replacement, target_is_directory=True)
+    elif replacement_kind == "directory":
+        shutil.copytree(backup, root)
+        replacement = root
+    else:  # pragma: no cover - defensive parameter guard
+        raise AssertionError(f"unknown replacement kind: {replacement_kind}")
+    if tamper_record:
+        record_path = next((replacement / "records").glob("*.bin"))
+        record_path.write_bytes(record_path.read_bytes() + b"tampered")
+    return backup, replacement
+
+
 def _fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
@@ -68,6 +87,117 @@ def test_hsp20_delete_rebuild_projection_matches_journal_and_detects_drift(tmp_p
     connection.commit()
     connection.close()
     assert store.verify()["valid"] is False
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_hsp20_projection_rows_fails_closed_when_root_swaps_during_sqlite_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def connect_with_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_root_with_copy(store.root, replacement_kind)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.projection.rows()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_hsp20_verify_store_never_accepts_replacement_truth_during_projection_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def connect_with_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_root_with_copy(store.root, replacement_kind, tamper_record=True)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap)
+
+    report = verify_store(store.root)
+    assert report["valid"] is False
+    assert report["failures"]
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_hsp20_projection_rebuild_fails_closed_when_root_swaps_during_sqlite_open_empty(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def connect_with_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_root_with_copy(store.root, replacement_kind)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.rebuild_index()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_hsp20_projection_rebuild_fails_closed_when_root_swaps_during_sqlite_open_populated(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    monkeypatch.setattr(store.records, "verify_record", lambda *_args, **_kwargs: True)
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def connect_with_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_root_with_copy(store.root, replacement_kind)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.sqlite3.connect", connect_with_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.rebuild_index()
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_hsp20_projection_delete_fails_closed_when_root_swaps_around_unlink(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+    real_unlink = os.unlink
+    swapped = False
+
+    def unlink_with_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            _swap_root_with_copy(store.root, replacement_kind)
+            swapped = True
+        return real_unlink(*args, **kwargs)
+
+    monkeypatch.setattr("houndd.projection.os.unlink", unlink_with_swap)
+
+    with pytest.raises(UnsafeStoreError):
+        store.projection.delete()
 
 
 def test_hsp20_tamper_and_orphans_fail_independent_verification(tmp_path) -> None:

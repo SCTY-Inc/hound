@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import stat
 from pathlib import Path
 from typing import Any, Callable
 
@@ -57,6 +56,10 @@ class Projection:
         self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
         return self.anchor
 
+    @staticmethod
+    def _sqlite_path(anchor: AnchoredRoot) -> str:
+        return f"/proc/self/fd/{anchor.fd}/index.sqlite"
+
     def close(self) -> None:
         anchor = getattr(self, "anchor", None)
         if anchor is not None:
@@ -68,16 +71,27 @@ class Projection:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _connect(self, *, normalize_mode: bool, read_only: bool = False) -> sqlite3.Connection:
+    def _connect(self, anchor: AnchoredRoot, *, normalize_mode: bool, read_only: bool = False) -> sqlite3.Connection:
+        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+        sqlite_path = self._sqlite_path(anchor)
         if read_only:
-            connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            connection = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
         else:
-            connection = sqlite3.connect(self.path)
-        if normalize_mode:
-            self.path.chmod(0o600)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA secure_delete=ON")
-        return connection
+            connection = sqlite3.connect(sqlite_path)
+        try:
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            if normalize_mode:
+                directory_fd = anchor.dirfd()
+                try:
+                    os.chmod("index.sqlite", 0o600, dir_fd=directory_fd)
+                finally:
+                    os.close(directory_fd)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA secure_delete=ON")
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
     def rebuild(
         self,
@@ -91,7 +105,7 @@ class Projection:
         anchor = self._ensure_anchor(create=True)
         check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
         events = journal.entries()
-        connection = self._connect(normalize_mode=True)
+        connection = self._connect(anchor, normalize_mode=True)
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DROP TABLE IF EXISTS entries")
@@ -159,6 +173,7 @@ class Projection:
                     (content_sha256, len(blob)),
                 )
             connection.commit()
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
             return {"valid": True, "entries": len(events), "database": str(self.path)}
         except Exception:
             connection.rollback()
@@ -174,9 +189,11 @@ class Projection:
         if "index.sqlite" not in anchor.listdir():
             return []
         check_private_stat(anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
-        connection = self._connect(normalize_mode=False, read_only=True)
+        connection = self._connect(anchor, normalize_mode=False, read_only=True)
         try:
-            return [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
+            rows = [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            return rows
         except sqlite3.Error as error:
             raise ProjectionError("projection is unreadable") from error
         finally:
@@ -186,12 +203,14 @@ class Projection:
         if not self.root.exists():
             return
         anchor = self._ensure_anchor()
+        check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
         if "index.sqlite" not in anchor.listdir():
             return
         check_private_stat(anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
         directory_fd = anchor.dirfd()
         try:
             os.unlink("index.sqlite", dir_fd=directory_fd)
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
         finally:
             os.close(directory_fd)
 
