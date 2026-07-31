@@ -1,0 +1,57 @@
+{
+  "schema_version": "houndd.slice2b.acceptance.v1",
+  "slice": "2B",
+  "status": "partial_hsp_coverage",
+  "completed_whole_hsps": [],
+  "partial_hsps": [
+    "HSP-08",
+    "HSP-09",
+    "HSP-20"
+  ],
+  "artifacts": {
+    "src/houndd/__init__.py": "HSP-08",
+    "src/houndd/provenance.py": "HSP-08",
+    "src/houndd/query_engine.py": "HSP-08",
+    "tests/test_hsp08_query_engine.py": "HSP-08",
+    "tests/test_hsp09_query_authorization.py": "HSP-09",
+    "tests/test_hsp20_query_snapshot.py": "HSP-20",
+    "tests/acceptance_slice2b.json": "HSP-20"
+  },
+  "coverage": {
+    "HSP-08": {
+      "status": "partial",
+      "covers": [
+        "pure immutable in-memory canonical journal query snapshots",
+        "all HSP-08 filter families with AND across fields, OR within values, exact UTC boundaries, stable chronological ordering, fixed high-watermarks, and stateless cursors",
+        "immutable lane/topic/entity provenance that never enters canonical journal envelopes",
+        "pure consumer replay dedupe by entry_id with returned new state only"
+      ],
+      "deferred": [
+        "daemon, Unix-socket API, CLI, streaming, and consumer integration",
+        "Journal, Projection, RecordStore, blob, filesystem, persistence, queue, acknowledgement, subscriber, and saved-query integration"
+      ]
+    },
+    "HSP-09": {
+      "status": "partial",
+      "covers": [
+        "header-only authorization before high-watermark, resume, filters, provenance, pagination, or returned metadata",
+        "non-disclosing identical empty pages for absent/unauthorized/scope-none queries",
+        "access-scoped provenance context hashes excluding unauthorized annotations"
+      ],
+      "deferred": [
+        "Unix peer credential transport and local caller-scope allowlist integration",
+        "ingestion visibility clamping, promotion, tombstones, retention, erasure, and PHI handling"
+      ]
+    },
+    "HSP-20": {
+      "status": "partial",
+      "covers": [
+        "independently validated immutable in-memory envelope/candidate snapshots with contiguous sequence, entry identity, canonical bytes, and chain commitments",
+        "same-generation stateless cursor recovery across independently rebuilt equivalent snapshots and signing-key overlap or retirement"
+      ],
+      "deferred": [
+        "crash recovery, index rebuild, backup restore, local migration, service-generation persistence, and durable policy/journal/record verification integration"
+      ]
+    }
+  }
+}
