@@ -37,7 +37,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hound_cli", "src/hound_research", "src/hound_web_adapters"]
+packages = ["src/hound_cli", "src/hound_research", "src/hound_web_adapters", "src/houndd"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

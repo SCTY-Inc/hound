@@ -1,0 +1,153 @@
+"""HSP-05: atomic/idempotent transaction and crash-recovery evidence."""
+
+from __future__ import annotations
+
+import pytest
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from houndd import (
+    FAULT_AFTER_JOURNAL,
+    FAULT_AFTER_PROVIDER,
+    FAULT_AFTER_RECORD,
+    FAULT_BEFORE_PROVIDER,
+    HounddStore,
+    IdempotencyConflict,
+    InjectedCrash,
+)
+
+
+def _request(*, request_id: str = "request", key: str = "key", value: str = "x") -> dict[str, object]:
+    return {
+        "schema_version": "houndd.request.v1",
+        "request_id": request_id,
+        "idempotency_key": key,
+        "producer": {"owner_id": "owner", "capability": "capture", "run_id": "run"},
+        "requested_access": "workspace",
+        "policy_id": "policy",
+        "operation": {"name": "capture", "payload": {"value": value}},
+    }
+
+
+@pytest.mark.parametrize("fault", [FAULT_BEFORE_PROVIDER, FAULT_AFTER_PROVIDER, FAULT_AFTER_RECORD, FAULT_AFTER_JOURNAL])
+def test_hsp05_process_kill_equivalent_crash_points_recover_one_durable_commit(tmp_path, fault: str) -> None:
+    store = HounddStore(tmp_path / "store")
+    request = _request()
+    transaction = store.begin(request, principal="peer:one", capability="capture")
+    with pytest.raises(InjectedCrash):
+        transaction.commit(record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same", fault=fault)
+
+    recovered = store.recover()
+    assert len(recovered) == 1
+    assert len(store.journal.entries()) == 1
+    response = recovered[0]
+    assert response["record_ids"] and response["entry_ids"]
+    assert response["outcome"] == ("interrupted" if fault == FAULT_BEFORE_PROVIDER else "completed")
+    retry = store.begin(request, principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "different"}, blob=b"different"
+    )
+    assert retry == response
+    assert store.verify()["valid"] is True
+
+
+@pytest.mark.parametrize("fault", [FAULT_BEFORE_PROVIDER, FAULT_AFTER_PROVIDER, FAULT_AFTER_RECORD, FAULT_AFTER_JOURNAL])
+def test_hsp05_real_process_kill_recovers_once_and_preserves_retry_identity(tmp_path, fault: str) -> None:
+    root = tmp_path / "killed-store"
+    request = _request()
+    child = """
+import os
+import sys
+from houndd import HounddStore, InjectedCrash
+
+root, fault = sys.argv[1:]
+request = {
+    "schema_version": "houndd.request.v1",
+    "request_id": "request",
+    "idempotency_key": "key",
+    "producer": {"owner_id": "owner", "capability": "capture", "run_id": "run"},
+    "requested_access": "workspace",
+    "policy_id": "policy",
+    "operation": {"name": "capture", "payload": {"value": "x"}},
+}
+try:
+    HounddStore(root).begin(request, principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same", fault=fault
+    )
+except InjectedCrash:
+    os._exit(90)
+os._exit(2)
+"""
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+    killed = subprocess.run(
+        [sys.executable, "-c", child, str(root), fault],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode == 90
+
+    recovered_store = HounddStore(root)
+    recovered = recovered_store.recover()
+    assert len(recovered) == 1
+    assert len(recovered_store.records.record_ids()) == 1
+    assert len(recovered_store.journal.entries()) == 1
+    retry = recovered_store.begin(request, principal="peer:one", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "different"}, blob=b"different"
+    )
+    assert retry == recovered[0]
+    assert recovered_store.verify()["valid"] is True
+
+
+def test_hsp05_failures_are_records_and_key_collision_fails_closed(tmp_path) -> None:
+    store = HounddStore(tmp_path / "store")
+    request = _request(key="failure")
+    response = store.begin(request, principal="peer:one", capability="capture").commit(
+        outcome="failed", evidence_status="failure", record={"schema_version": "houndd.failure.v1", "code": "timeout"}
+    )
+    assert response["ok"] is False
+    assert response["outcome"] == "failed"
+    assert response["record_ids"] and response["entry_ids"]
+    with pytest.raises(IdempotencyConflict):
+        store.begin(_request(key="failure", value="changed"), principal="peer:one", capability="capture")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "diagnostic"),
+    [
+        ("failed", {"error_kind": "http", "http_status": 429}),
+        ("failed", {"error_kind": "timeout", "elapsed_seconds": 30}),
+        ("partial", {"error_kind": "truncated", "received_bytes": 5, "expected_bytes": 10}),
+        ("partial", {"error_kind": "partial", "received_bytes": 5}),
+        ("refused", {"error_kind": "policy_refusal"}),
+        ("interrupted", {"error_kind": "process_interrupted"}),
+    ],
+)
+def test_hsp05_provider_failure_matrix_is_explicit_and_durable(tmp_path, outcome: str, diagnostic: dict[str, object]) -> None:
+    store = HounddStore(tmp_path / outcome)
+    key = f"{outcome}-{diagnostic['error_kind']}"
+    response = store.begin(_request(key=key), principal="peer:one", capability="capture").commit(
+        outcome=outcome,
+        evidence_status="failure" if outcome in {"failed", "refused", "interrupted"} else "partial",
+        record={"schema_version": "houndd.failure.v1", "provider_outcome": outcome, "diagnostic": diagnostic},
+    )
+    assert response["ok"] is False
+    assert response["outcome"] == outcome
+    assert len(store.journal.entries()) == 1
+    assert store.records.read_json(response["record_ids"][0])["payload"]["diagnostic"] == diagnostic
+    store.rebuild_index()
+    assert store.verify()["valid"] is True
+
+
+def test_hsp05_idempotency_scope_uses_authenticated_principal_not_request_owner(tmp_path) -> None:
+    store = HounddStore(tmp_path / "store")
+    request = _request()
+    first = store.begin(request, principal="transport:actual", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"x"
+    )
+    second = store.begin({**request, "request_id": "retry"}, principal="transport:actual", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "forged-owner"}, blob=b"other"
+    )
+    assert second == first

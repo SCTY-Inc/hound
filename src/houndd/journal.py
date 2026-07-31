@@ -1,0 +1,247 @@
+"""HSP-05: serialized append-only journal with sequence and chain integrity."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+from .contracts import canonical_bytes, canonical_hash, validate_journal_envelope
+from .store import StoreError, UnsafeStoreError
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+
+class JournalError(StoreError):
+    """The journal is invalid, unavailable, or cannot preserve ordering."""
+
+
+FaultHook = Callable[[str], None]
+
+
+def _private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise UnsafeStoreError(f"{path} must not be a symlink")
+    existed = path.exists()
+    path.mkdir(exist_ok=existed)
+    if not existed:
+        path.chmod(0o700)
+    info = path.stat()
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise UnsafeStoreError(f"{path} is not owned by the current user")
+    if info.st_mode & 0o077:
+        raise UnsafeStoreError(f"{path} has group/world permissions")
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise JournalError(f"cannot persist {path}") from error
+
+
+class Journal:
+    """A single-writer logical journal backed by a process-safe file lock."""
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self.root = Path(root)
+        _private_directory(self.root)
+        self.directory = self.root / "journal"
+        _private_directory(self.directory)
+        self.events_path = self.directory / "events.jsonl"
+        self.chain_path = self.directory / "chain.jsonl"
+        self.head_path = self.directory / "head.json"
+        self.lock_path = self.directory / "lock"
+        for path in (self.events_path, self.chain_path, self.lock_path):
+            if path.is_symlink():
+                raise UnsafeStoreError(f"{path} must not be a symlink")
+            if not path.exists():
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(descriptor)
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise UnsafeStoreError(f"{path} is not a regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise UnsafeStoreError(f"{path} is not owned by the current user")
+            if info.st_mode & 0o077:
+                raise UnsafeStoreError(f"{path} has group/world permissions")
+        if self.head_path.exists() and self.head_path.is_symlink():
+            raise UnsafeStoreError(f"{self.head_path} must not be a symlink")
+        if self.head_path.exists():
+            info = self.head_path.stat()
+            if not stat.S_ISREG(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()) or info.st_mode & 0o077:
+                raise UnsafeStoreError(f"{self.head_path} is unsafe")
+
+    @contextmanager
+    def _lock(self) -> Iterator[None]:
+        if fcntl is None:
+            raise JournalError("journal locking is unavailable")
+        descriptor = os.open(self.lock_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @staticmethod
+    def _read_lines(path: Path) -> list[dict[str, Any]]:
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise JournalError(f"cannot read journal file {path}") from error
+        if raw and not raw.endswith(b"\n"):
+            raise JournalError(f"journal file {path} has a partial final line")
+        result = []
+        for line in raw.splitlines():
+            try:
+                import json
+
+                value = json.loads(line.decode("utf-8"))
+            except (UnicodeError, ValueError) as error:
+                raise JournalError(f"journal file {path} has invalid JSON") from error
+            if not isinstance(value, dict):
+                raise JournalError(f"journal file {path} contains a non-object")
+            if canonical_bytes(value) != line:
+                raise JournalError(f"journal file {path} contains non-canonical JSON")
+            result.append(value)
+        return result
+
+    def _event_values_unlocked(self) -> list[dict[str, Any]]:
+        values = self._read_lines(self.events_path)
+        try:
+            return [validate_journal_envelope(value) for value in values]
+        except ValueError as error:
+            raise JournalError(f"journal envelope is invalid: {error}") from error
+
+    def _chain_values_unlocked(self) -> list[dict[str, Any]]:
+        return self._read_lines(self.chain_path)
+
+    @staticmethod
+    def _chain_value(event: dict[str, Any], previous: str) -> dict[str, Any]:
+        body = {
+            "sequence": event["sequence"],
+            "entry_id": event["entry_id"],
+            "event_sha256": hashlib.sha256(canonical_bytes(event)).hexdigest(),
+            "previous_chain_sha256": previous,
+        }
+        return {**body, "chain_sha256": canonical_hash(body)}
+
+    def _validate_chain_unlocked(self, *, repair_missing: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        events = self._event_values_unlocked()
+        chains = self._chain_values_unlocked()
+        if len(chains) > len(events):
+            raise JournalError("journal chain has entries without events")
+        if len(chains) < len(events) and not repair_missing:
+            raise JournalError("journal chain is incomplete")
+        previous = "0" * 64
+        for index, event in enumerate(events):
+            expected = self._chain_value(event, previous)
+            if index < len(chains):
+                if chains[index] != expected:
+                    raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
+            else:
+                with self.chain_path.open("ab") as stream:
+                    stream.write(canonical_bytes(expected) + b"\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                chains.append(expected)
+            previous = expected["chain_sha256"]
+        if events:
+            head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
+        else:
+            head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
+        if self.head_path.exists():
+            try:
+                import json
+
+                persisted = json.loads(self.head_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as error:
+                raise JournalError("journal head is unreadable") from error
+            if persisted != head:
+                if not repair_missing:
+                    raise JournalError("journal head does not match journal chain")
+                _atomic_bytes(self.head_path, canonical_bytes(head))
+        elif events:
+            raise JournalError("journal head is missing")
+        else:
+            _atomic_bytes(self.head_path, canonical_bytes(head))
+        return events, chains
+
+    def reconcile(self) -> dict[str, Any]:
+        """Repair only crash-left chain/head suffixes; reject content tampering."""
+
+        with self._lock():
+            events, chains = self._validate_chain_unlocked(repair_missing=True)
+            return {"valid": True, "sequence": events[-1]["sequence"] if events else -1, "entries": len(events), "chain_entries": len(chains)}
+
+    def append(self, envelope: dict[str, Any], *, before_fsync: FaultHook | None = None) -> dict[str, Any]:
+        """Append one validated envelope and fsync event, chain, and head."""
+
+        try:
+            envelope = validate_journal_envelope(envelope)
+        except ValueError as error:
+            raise JournalError(str(error)) from error
+        with self._lock():
+            events, chains = self._validate_chain_unlocked(repair_missing=True)
+            if any(item["entry_id"] == envelope["entry_id"] for item in events):
+                return envelope
+            expected_sequence = events[-1]["sequence"] + 1 if events else 0
+            if envelope["sequence"] != expected_sequence:
+                raise JournalError(f"expected sequence {expected_sequence}, got {envelope['sequence']}")
+            event_bytes = canonical_bytes(envelope) + b"\n"
+            with self.events_path.open("ab") as stream:
+                stream.write(event_bytes)
+                stream.flush()
+                if before_fsync is not None:
+                    before_fsync("after_record_publish_before_journal_fsync")
+                os.fsync(stream.fileno())
+            previous = chains[-1]["chain_sha256"] if chains else "0" * 64
+            chain = self._chain_value(envelope, previous)
+            with self.chain_path.open("ab") as stream:
+                stream.write(canonical_bytes(chain) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            head = {"sequence": envelope["sequence"], "chain_sha256": chain["chain_sha256"], "entry_id": envelope["entry_id"]}
+            _atomic_bytes(self.head_path, canonical_bytes(head))
+            return envelope
+
+    def entries(self) -> list[dict[str, Any]]:
+        with self._lock():
+            events, _ = self._validate_chain_unlocked(repair_missing=False)
+            previous = -1
+            seen: set[str] = set()
+            for event in events:
+                if event["sequence"] != previous + 1 or event["entry_id"] in seen:
+                    raise JournalError("journal sequence or entry IDs are not strictly ordered")
+                previous = event["sequence"]
+                seen.add(event["entry_id"])
+            return events
+
+    def get(self, entry_id: str) -> dict[str, Any] | None:
+        return next((event for event in self.entries() if event["entry_id"] == entry_id), None)
+
+    def high_watermark(self) -> int:
+        events = self.entries()
+        return events[-1]["sequence"] if events else -1
+
+
+__all__ = ["FaultHook", "Journal", "JournalError"]

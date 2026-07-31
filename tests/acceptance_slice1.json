@@ -1,0 +1,21 @@
+{
+  "schema_version": "houndd.slice1.acceptance.v1",
+  "artifacts": {
+    "src/houndd/__init__.py": "HSP-04",
+    "src/houndd/contracts.py": "HSP-04",
+    "src/houndd/store.py": "HSP-07",
+    "src/houndd/journal.py": "HSP-05",
+    "src/houndd/transactions.py": "HSP-05",
+    "src/houndd/projection.py": "HSP-20",
+    "src/houndd/verify.py": "HSP-20",
+    "pyproject.toml": "HSP-20",
+    "tests/test_hsp04_contract.py": "HSP-04",
+    "tests/test_hsp05_transactions.py": "HSP-05",
+    "tests/test_hsp07_dedupe.py": "HSP-07",
+    "tests/fixtures/hsp14_legacy_record.json": "HSP-14",
+    "tests/test_hsp14_legacy_portability.py": "HSP-14",
+    "tests/test_hsp20_verification.py": "HSP-20",
+    "tests/acceptance_slice1.json": "HSP-21"
+  },
+  "required_ids": ["HSP-04", "HSP-05", "HSP-07", "HSP-14", "HSP-20"]
+}
