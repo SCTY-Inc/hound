@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import json
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +31,29 @@ def _populate(store: HounddStore, count: int = 3) -> None:
             record={"schema_version": "houndd.capture.v1", "index": index}, blob=f"blob-{index}".encode()
         )
     store.rebuild_index()
+
+
+def _tree_snapshot(path: Path) -> list[str]:
+    return sorted(str(child.relative_to(path)) for child in path.rglob("*"))
+
+
+def _swap_root(root: Path, replacement_kind: str) -> tuple[Path, Path]:
+    backup = root.with_name(f"{root.name}.backup")
+    root.rename(backup)
+    if replacement_kind == "symlink":
+        replacement = root.with_name(f"{root.name}.replacement")
+        replacement.mkdir()
+        root.symlink_to(replacement, target_is_directory=True)
+    elif replacement_kind == "directory":
+        root.mkdir()
+        replacement = root
+    else:  # pragma: no cover - defensive parameter guard
+        raise AssertionError(f"unknown replacement kind: {replacement_kind}")
+    return backup, replacement
+
+
+def _fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
 
 
 def test_hsp20_delete_rebuild_projection_matches_journal_and_detects_drift(tmp_path) -> None:
@@ -57,6 +82,84 @@ def test_hsp20_tamper_and_orphans_fail_independent_verification(tmp_path) -> Non
     _populate(clean, count=1)
     clean.records.blob(b"orphan")
     assert clean.verify()["valid"] is False
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+@pytest.mark.parametrize(
+    ("operation", "expected_error"),
+    [
+        ("record_read", UnsafeStoreError),
+        ("record_write", UnsafeStoreError),
+        ("record_list", UnsafeStoreError),
+        ("blob_write", UnsafeStoreError),
+        ("journal_entries", UnsafeStoreError),
+        ("journal_append", UnsafeStoreError),
+        ("transaction_begin", TransactionError),
+        ("transaction_commit", TransactionError),
+        ("projection_rows", UnsafeStoreError),
+        ("projection_rebuild", UnsafeStoreError),
+    ],
+)
+def test_hsp20_root_swap_fails_closed_for_all_public_store_operations(
+    tmp_path, replacement_kind: str, operation: str, expected_error: type[BaseException]
+) -> None:
+    store = HounddStore(tmp_path / "store")
+    response = store.begin(_request(0), principal="peer:0", capability="capture").commit(
+        record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"x"
+    )
+    pending = store.begin(_request(1), principal="peer:1", capability="capture")
+    store.rebuild_index()
+    entry = store.journal.entries()[0]
+    record_id = response["record_ids"][0]
+    backup, replacement = _swap_root(store.root, replacement_kind)
+    backup_snapshot = _tree_snapshot(backup)
+    replacement_snapshot = _tree_snapshot(replacement)
+
+    with pytest.raises(expected_error):
+        if operation == "record_read":
+            store.records.read(record_id)
+        elif operation == "record_write":
+            store.records.put_bytes("legacy-swap", b"legacy")
+        elif operation == "record_list":
+            store.records.record_ids()
+        elif operation == "blob_write":
+            store.records.blob(b"blob-swap")
+        elif operation == "journal_entries":
+            store.journal.entries()
+        elif operation == "journal_append":
+            store.journal.append(entry)
+        elif operation == "transaction_begin":
+            store.begin(_request(2), principal="peer:2", capability="capture")
+        elif operation == "transaction_commit":
+            pending.commit(record={"schema_version": "houndd.capture.v1", "value": "later"}, blob=b"later")
+        elif operation == "projection_rows":
+            store.projection.rows()
+        elif operation == "projection_rebuild":
+            store.projection.rebuild(store.journal, store.records)
+        else:  # pragma: no cover - exhaustive guard
+            raise AssertionError(f"unknown operation: {operation}")
+
+    assert _tree_snapshot(backup) == backup_snapshot
+    assert _tree_snapshot(replacement) == replacement_snapshot
+
+
+def test_hsp20_verify_store_closes_verifier_anchors_on_success_and_failure(tmp_path) -> None:
+    store = HounddStore(tmp_path / "store")
+    _populate(store, count=1)
+
+    for _ in range(3):
+        assert verify_store(store.root)["valid"] is True
+    baseline = _fd_count()
+    for _ in range(25):
+        assert verify_store(store.root)["valid"] is True
+    assert _fd_count() == baseline
+
+    store.journal.directory.chmod(0o755)
+    failure_baseline = _fd_count()
+    for _ in range(5):
+        report = verify_store(store.root)
+        assert report["valid"] is False
+        assert _fd_count() == failure_baseline
 
 
 @pytest.mark.parametrize(

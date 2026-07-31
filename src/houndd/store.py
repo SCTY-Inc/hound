@@ -110,9 +110,24 @@ class BlobStore:
 
     def __init__(self, root: Path, *, create: bool = True) -> None:
         self.root = Path(root).resolve(strict=False)
-        _mkdir_private(self.root, create=create)
-        _mkdir_private(self.root / "blobs", create=create)
-        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        try:
+            _mkdir_private(self.root, create=create)
+            _mkdir_private(self.root / "blobs", create=create)
+            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        anchor = getattr(self, "anchor", None)
+        if anchor is not None:
+            anchor.close()
+
+    def __enter__(self) -> "BlobStore":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def path_for(self, digest: str) -> Path:
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
@@ -153,13 +168,31 @@ class RecordStore:
         if root_path.is_symlink():
             raise UnsafeStoreError(f"{root_path} must not be a symlink")
         self.root = root_path.resolve(strict=False)
-        _mkdir_private(self.root, create=create)
-        self.records = self.root / "records"
-        self.legacy = self.root / "legacy"
-        _mkdir_private(self.records, create=create)
-        _mkdir_private(self.legacy, create=create)
-        self.blobs = BlobStore(self.root, create=create)
-        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        try:
+            _mkdir_private(self.root, create=create)
+            self.records = self.root / "records"
+            self.legacy = self.root / "legacy"
+            _mkdir_private(self.records, create=create)
+            _mkdir_private(self.legacy, create=create)
+            self.blobs = BlobStore(self.root, create=create)
+            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        blobs = getattr(self, "blobs", None)
+        if blobs is not None:
+            blobs.close()
+        anchor = getattr(self, "anchor", None)
+        if anchor is not None:
+            anchor.close()
+
+    def __enter__(self) -> "RecordStore":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def record_path(self, record_id: str) -> Path:
         return self.records / f"{_validate_id(record_id)}.bin"

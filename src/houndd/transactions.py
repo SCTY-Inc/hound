@@ -162,25 +162,46 @@ class TransactionCoordinator:
         if root_path.is_symlink():
             raise TransactionError(f"{root_path} must not be a symlink")
         self.root = root_path.resolve(strict=False)
-        _private_directory(self.root, create=create)
-        self.transactions = self.root / "transactions"
-        self.stages = self.transactions / "stages"
-        self.idempotency = self.transactions / "idempotency"
-        for directory in (self.transactions, self.stages, self.idempotency):
-            _private_directory(directory, create=create)
-        self.lock_path = self.transactions / "lock"
-        if not self.lock_path.exists():
-            if not create:
-                raise TransactionError(f"{self.lock_path} is missing")
-            descriptor = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(descriptor)
-        _private_file(self.lock_path, create=create)
-        for directory in (self.stages, self.idempotency):
-            for path in directory.glob("*.json"):
-                _private_file(path, create=create)
-        self.records = RecordStore(self.root, create=create)
-        self.journal = Journal(self.root, create=create)
-        self.anchor = AnchoredRoot(self.root, error_type=TransactionError)
+        try:
+            _private_directory(self.root, create=create)
+            self.transactions = self.root / "transactions"
+            self.stages = self.transactions / "stages"
+            self.idempotency = self.transactions / "idempotency"
+            for directory in (self.transactions, self.stages, self.idempotency):
+                _private_directory(directory, create=create)
+            self.lock_path = self.transactions / "lock"
+            if not self.lock_path.exists():
+                if not create:
+                    raise TransactionError(f"{self.lock_path} is missing")
+                descriptor = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(descriptor)
+            _private_file(self.lock_path, create=create)
+            for directory in (self.stages, self.idempotency):
+                for path in directory.glob("*.json"):
+                    _private_file(path, create=create)
+            self.records = RecordStore(self.root, create=create)
+            self.journal = Journal(self.root, create=create)
+            self.anchor = AnchoredRoot(self.root, error_type=TransactionError)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        records = getattr(self, "records", None)
+        if records is not None:
+            records.close()
+        journal = getattr(self, "journal", None)
+        if journal is not None:
+            journal.close()
+        anchor = getattr(self, "anchor", None)
+        if anchor is not None:
+            anchor.close()
+
+    def __enter__(self) -> "TransactionCoordinator":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     @contextmanager
     def _lock(self) -> Iterator[None]:

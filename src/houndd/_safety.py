@@ -37,7 +37,28 @@ class AnchoredRoot:
         except OSError as error:
             _raise(self.error_type, self.path, "cannot be anchored")
             raise error  # pragma: no cover
-        check_private_stat(os.fstat(self.fd), self.path, directory=True, error_type=self.error_type)
+        self._root_stat = os.fstat(self.fd)
+        check_private_stat(self._root_stat, self.path, directory=True, error_type=self.error_type)
+
+    def _require_open(self) -> None:
+        if self.fd is None:
+            _raise(self.error_type, self.path, "has been closed")
+
+    def _check_root_identity(self) -> None:
+        self._require_open()
+        try:
+            current = os.lstat(self.path)
+        except OSError as error:
+            raise self.error_type(f"{self.path} is no longer the anchored root directory") from error
+        if not stat.S_ISDIR(current.st_mode):
+            _raise(self.error_type, self.path, "is no longer the anchored root directory")
+        if (
+            current.st_dev != self._root_stat.st_dev
+            or current.st_ino != self._root_stat.st_ino
+            or current.st_uid != self._root_stat.st_uid
+            or stat.S_IMODE(current.st_mode) != stat.S_IMODE(self._root_stat.st_mode)
+        ):
+            _raise(self.error_type, self.path, "is no longer the anchored root directory")
 
     def close(self) -> None:
         if self.fd is not None:
@@ -56,6 +77,7 @@ class AnchoredRoot:
             raise ValueError("path components must be safe relative names")
 
     def dirfd(self, *parts: str) -> int:
+        self._check_root_identity()
         fd = os.dup(self.fd)
         try:
             for part in parts:
@@ -70,6 +92,7 @@ class AnchoredRoot:
                     raise self.error_type(f"{self.path.joinpath(*parts)} is not a safe directory") from error
                 os.close(fd)
                 fd = next_fd
+            self._check_root_identity()
             return fd
         except Exception:
             os.close(fd)
@@ -78,12 +101,14 @@ class AnchoredRoot:
     def open_file(self, *parts: str, flags: int, mode: int = 0o600) -> int:
         if not parts:
             raise ValueError("a file path is required")
+        self._check_root_identity()
         parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
+        fd: int | None = None
         try:
             leaf = parts[-1]
             self._validate_part(leaf)
             try:
-                return os.open(
+                fd = os.open(
                     leaf,
                     flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
                     mode,
@@ -91,21 +116,31 @@ class AnchoredRoot:
                 )
             except OSError as error:
                 raise self.error_type(f"{self.path.joinpath(*parts)} is not a safe file") from error
+            self._check_root_identity()
+            return fd
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            raise
         finally:
             os.close(parent_fd)
 
     def read_bytes(self, *parts: str) -> bytes:
+        self._check_root_identity()
         fd = self.open_file(*parts, flags=os.O_RDONLY)
         try:
             check_private_stat(os.fstat(fd), self.path.joinpath(*parts), directory=False, error_type=self.error_type)
             with os.fdopen(fd, "rb") as stream:
-                return stream.read()
+                data = stream.read()
+            self._check_root_identity()
+            return data
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be read") from error
 
     def write_bytes_atomic(self, *parts: str, data: bytes, mode: int = 0o600) -> None:
         if not parts:
             raise ValueError("a file path is required")
+        self._check_root_identity()
         parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
         leaf = parts[-1]
         self._validate_part(leaf)
@@ -127,6 +162,7 @@ class AnchoredRoot:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self._check_root_identity()
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be written") from error
         finally:
@@ -135,6 +171,7 @@ class AnchoredRoot:
     def append_bytes(self, *parts: str, data: bytes) -> None:
         if not parts:
             raise ValueError("a file path is required")
+        self._check_root_identity()
         parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
         leaf = parts[-1]
         self._validate_part(leaf)
@@ -154,23 +191,32 @@ class AnchoredRoot:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self._check_root_identity()
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be written") from error
         finally:
             os.close(parent_fd)
 
     def listdir(self, *parts: str) -> list[str]:
+        self._check_root_identity()
         fd = self.dirfd(*parts)
         try:
-            return sorted(os.listdir(fd))
+            entries = sorted(os.listdir(fd))
         finally:
             os.close(fd)
+        self._check_root_identity()
+        return entries
 
     def stat(self, *parts: str) -> os.stat_result:
+        self._check_root_identity()
         if not parts:
-            return os.fstat(self.fd)
+            info = os.fstat(self.fd)
+            self._check_root_identity()
+            return info
         fd = self.open_file(*parts, flags=os.O_RDONLY)
         try:
-            return os.fstat(fd)
+            info = os.fstat(fd)
         finally:
             os.close(fd)
+        self._check_root_identity()
+        return info

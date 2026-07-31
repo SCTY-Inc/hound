@@ -27,20 +27,24 @@ class Projection:
         self.root = root_path.resolve(strict=False)
         self.path = self.root / "index.sqlite"
         self.anchor: AnchoredRoot | None = None
-        if self.root.exists():
-            info = self.root.stat()
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise UnsafeStoreError(f"{self.root} is not owned by the current user")
-            if info.st_mode & 0o077:
-                raise UnsafeStoreError(f"{self.root} has group/world permissions")
-            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
-        elif create:
-            self.root.mkdir(exist_ok=True)
-            self.root.chmod(0o700)
-            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
-        if self.anchor is not None:
-            if "index.sqlite" in self.anchor.listdir():
-                check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+        try:
+            if self.root.exists():
+                info = self.root.stat()
+                if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                    raise UnsafeStoreError(f"{self.root} is not owned by the current user")
+                if info.st_mode & 0o077:
+                    raise UnsafeStoreError(f"{self.root} has group/world permissions")
+                self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+            elif create:
+                self.root.mkdir(exist_ok=True)
+                self.root.chmod(0o700)
+                self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+            if self.anchor is not None:
+                if "index.sqlite" in self.anchor.listdir():
+                    check_private_stat(self.anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
+        except Exception:
+            self.close()
+            raise
 
     def _ensure_anchor(self, *, create: bool = False) -> AnchoredRoot:
         if self.anchor is not None:
@@ -53,8 +57,22 @@ class Projection:
         self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
         return self.anchor
 
-    def _connect(self, *, normalize_mode: bool) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+    def close(self) -> None:
+        anchor = getattr(self, "anchor", None)
+        if anchor is not None:
+            anchor.close()
+
+    def __enter__(self) -> "Projection":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _connect(self, *, normalize_mode: bool, read_only: bool = False) -> sqlite3.Connection:
+        if read_only:
+            connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        else:
+            connection = sqlite3.connect(self.path)
         if normalize_mode:
             self.path.chmod(0o600)
         connection.row_factory = sqlite3.Row
@@ -156,7 +174,7 @@ class Projection:
         if "index.sqlite" not in anchor.listdir():
             return []
         check_private_stat(anchor.stat("index.sqlite"), self.path, directory=False, error_type=UnsafeStoreError)
-        connection = self._connect(normalize_mode=False)
+        connection = self._connect(normalize_mode=False, read_only=True)
         try:
             return [dict(row) for row in connection.execute("SELECT * FROM entries ORDER BY sequence, entry_id")]
         except sqlite3.Error as error:

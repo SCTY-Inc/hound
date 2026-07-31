@@ -52,33 +52,48 @@ class Journal:
         if root_path.is_symlink():
             raise UnsafeStoreError(f"{root_path} must not be a symlink")
         self.root = root_path.resolve(strict=False)
-        _private_directory(self.root, create=create)
-        self.directory = self.root / "journal"
-        _private_directory(self.directory, create=create)
-        self.events_path = self.directory / "events.jsonl"
-        self.chain_path = self.directory / "chain.jsonl"
-        self.head_path = self.directory / "head.json"
-        self.lock_path = self.directory / "lock"
-        for path in (self.events_path, self.chain_path, self.lock_path):
-            if path.is_symlink():
-                raise UnsafeStoreError(f"{path} must not be a symlink")
-            if not path.exists():
-                if not create:
-                    raise UnsafeStoreError(f"{path} is missing")
-                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.close(descriptor)
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode):
-                raise UnsafeStoreError(f"{path} is not a regular file")
-            check_private_stat(info, path, directory=False, error_type=UnsafeStoreError)
-        if self.head_path.exists() and self.head_path.is_symlink():
-            raise UnsafeStoreError(f"{self.head_path} must not be a symlink")
-        if self.head_path.exists():
-            info = self.head_path.stat()
-            if not stat.S_ISREG(info.st_mode):
-                raise UnsafeStoreError(f"{self.head_path} is unsafe")
-            check_private_stat(info, self.head_path, directory=False, error_type=UnsafeStoreError)
-        self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        try:
+            _private_directory(self.root, create=create)
+            self.directory = self.root / "journal"
+            _private_directory(self.directory, create=create)
+            self.events_path = self.directory / "events.jsonl"
+            self.chain_path = self.directory / "chain.jsonl"
+            self.head_path = self.directory / "head.json"
+            self.lock_path = self.directory / "lock"
+            for path in (self.events_path, self.chain_path, self.lock_path):
+                if path.is_symlink():
+                    raise UnsafeStoreError(f"{path} must not be a symlink")
+                if not path.exists():
+                    if not create:
+                        raise UnsafeStoreError(f"{path} is missing")
+                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.close(descriptor)
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise UnsafeStoreError(f"{path} is not a regular file")
+                check_private_stat(info, path, directory=False, error_type=UnsafeStoreError)
+            if self.head_path.exists() and self.head_path.is_symlink():
+                raise UnsafeStoreError(f"{self.head_path} must not be a symlink")
+            if self.head_path.exists():
+                info = self.head_path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise UnsafeStoreError(f"{self.head_path} is unsafe")
+                check_private_stat(info, self.head_path, directory=False, error_type=UnsafeStoreError)
+            self.anchor = AnchoredRoot(self.root, error_type=UnsafeStoreError)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        anchor = getattr(self, "anchor", None)
+        if anchor is not None:
+            anchor.close()
+
+    def __enter__(self) -> "Journal":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     @contextmanager
     def _lock(self) -> Iterator[None]:

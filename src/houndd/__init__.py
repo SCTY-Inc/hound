@@ -41,10 +41,34 @@ class HounddStore:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
-        self.records = RecordStore(self.root)
-        self.journal = Journal(self.root)
-        self.transactions = TransactionCoordinator(self.root)
-        self.projection = Projection(self.root, create=True)
+        try:
+            self.records = RecordStore(self.root)
+            self.journal = Journal(self.root)
+            self.transactions = TransactionCoordinator(self.root)
+            self.projection = Projection(self.root, create=True)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        projection = getattr(self, "projection", None)
+        if projection is not None:
+            projection.close()
+        transactions = getattr(self, "transactions", None)
+        if transactions is not None:
+            transactions.close()
+        journal = getattr(self, "journal", None)
+        if journal is not None:
+            journal.close()
+        records = getattr(self, "records", None)
+        if records is not None:
+            records.close()
+
+    def __enter__(self) -> "HounddStore":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def begin(self, request: Mapping[str, Any], *, principal: str, capability: str) -> Transaction:
         return self.transactions.begin(request, principal=principal, capability=capability)
