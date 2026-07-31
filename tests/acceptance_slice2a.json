@@ -1,0 +1,62 @@
+{
+  "schema_version": "houndd.slice2a.acceptance.v1",
+  "slice": "2A",
+  "status": "partial_hsp_coverage",
+  "completed_whole_hsps": [],
+  "partial_hsps": [
+    "HSP-08",
+    "HSP-09",
+    "HSP-20"
+  ],
+  "artifacts": {
+    "src/houndd/__init__.py": "HSP-08",
+    "src/houndd/access.py": "HSP-09",
+    "src/houndd/cursor.py": "HSP-20",
+    "src/houndd/query_contracts.py": "HSP-08",
+    "tests/acceptance_slice2a.json": "HSP-20",
+    "tests/test_hsp08_cursor.py": "HSP-08",
+    "tests/test_hsp08_query_contracts.py": "HSP-08",
+    "tests/test_hsp09_access.py": "HSP-09"
+  },
+  "coverage": {
+    "HSP-08": {
+      "status": "partial",
+      "covers": [
+        "strict immutable query request and filter contracts",
+        "canonical filter hashing and UTC time boundaries",
+        "opaque stateless cursor commitments and bounded recovery contracts"
+      ],
+      "not_covered": [
+        "query engine or API/CLI integration",
+        "annotation projection provenance",
+        "authorized result evaluation, streaming, replay, or consumer dedupe"
+      ]
+    },
+    "HSP-09": {
+      "status": "partial",
+      "covers": [
+        "principal and request producer-claim separation",
+        "immutable in-memory policy bundles and explicit reader scopes",
+        "header-only authorization and pure effective-access decisions"
+      ],
+      "not_covered": [
+        "Unix peer transport authentication or service integration",
+        "lookup, search, count, pagination, metadata, or snippet execution",
+        "promotion, tombstone persistence, retention, erasure, or PHI ingestion"
+      ]
+    },
+    "HSP-20": {
+      "status": "partial",
+      "covers": [
+        "pure cursor verification over an injected verified recovery snapshot",
+        "journal sequence, chain-anchor, chronological tuple, and high-watermark commitments",
+        "restart and signing-key overlap or retirement behavior"
+      ],
+      "not_covered": [
+        "service generation or key persistence",
+        "journal, record, projection, or policy recovery integration",
+        "crash, rebuild, backup restore, or local migration workflows"
+      ]
+    }
+  }
+}
