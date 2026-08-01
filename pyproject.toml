@@ -30,6 +30,7 @@ Issues = "https://github.com/SCTY-Inc/hound/issues"
 hound = "hound_cli.cli:main"
 hound-research = "hound_research.cli:main"
 hound-web-adapter = "hound_web_adapters.cli:main"
+houndd = "houndd.cli:main"
 
 [dependency-groups]
 dev = [

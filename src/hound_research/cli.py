@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import socket
 import sys
 from typing import Any, Sequence
 
@@ -12,6 +14,9 @@ from hound_cli.cli import _HoundArgumentParser, _emit, _exit_for_result, _input_
 from hound_cli.contracts import ContractError
 from hound_cli.orchestrator import HoundError
 from hound_cli.runtime import RuntimeErrorHound
+from houndd.contracts import canonical_bytes
+from houndd.query_contracts import parse_query_request
+from houndd.service import MAX_FRAME_BYTES, RESPONSE_SCHEMA, WIRE_VERSION
 
 from .evidence import EvidenceError, store_capture, verify_capture
 from .source import capture_sources, discover_sources, inspect_sources
@@ -61,6 +66,20 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--root", required=True)
     check.add_argument("--capture-id", required=True)
     check.set_defaults(handler=_handle_capture_verify)
+
+    journal = top.add_parser("journal", help="Read the local houndd journal")
+    journal_sub = journal.add_subparsers(dest="journal_command", required=True)
+    query = journal_sub.add_parser("query", help="Query canonical journal events through houndd")
+    query.add_argument("--socket", required=True)
+    query.add_argument("--owner-id", required=True)
+    query.add_argument("--run-id", required=True)
+    query.add_argument("--policy-id", required=True)
+    query.add_argument("--requested-access", choices=("public", "workspace", "restricted"), default="restricted")
+    query.add_argument("--filter-json", default="{}")
+    query.add_argument("--limit", type=int, default=50)
+    query.add_argument("--cursor")
+    query.add_argument("--request-id", default="hound-research-query")
+    query.set_defaults(handler=_handle_journal_query)
     return parser
 
 
@@ -123,6 +142,89 @@ def _handle_capture_verify(args: argparse.Namespace) -> dict[str, Any]:
         "capture_id": args.capture_id,
         "valid": verify_capture(args.root, args.capture_id),
     }
+
+
+def _read_socket_exact(connection: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise HoundError("houndd response was truncated", exit_code=5)
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _strict_response(raw: bytes) -> dict[str, Any]:
+    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite number")))
+    except (UnicodeError, ValueError) as error:
+        raise HoundError("houndd response is invalid", exit_code=5) from error
+    if type(value) is not dict or canonical_bytes(value) != raw:
+        raise HoundError("houndd response is not canonical", exit_code=5)
+    if set(value) != {"wire_version", "status", "body"} or value["wire_version"] != WIRE_VERSION or value["status"] not in {200, 400, 404, 503}:
+        raise HoundError("houndd response has an invalid wire contract", exit_code=5)
+    body = value["body"]
+    required = {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"}
+    optional = {"result", "cursor", "error"}
+    if type(body) is not dict or set(body) - required - optional or required - set(body) or body["schema_version"] != RESPONSE_SCHEMA:
+        raise HoundError("houndd response has an invalid body contract", exit_code=5)
+    return value
+
+
+def _handle_journal_query(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        filter_value = json.loads(args.filter_json)
+        payload: dict[str, Any] = {"filter": filter_value, "limit": args.limit}
+        if args.cursor is not None:
+            payload["cursor"] = args.cursor
+        parse_query_request(payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HoundError("journal query payload is invalid", exit_code=2) from error
+    socket_path = Path(args.socket)
+    if not socket_path.is_absolute():
+        raise HoundError("--socket must be an absolute path", exit_code=2)
+    request = {
+        "wire_version": WIRE_VERSION,
+        "method": "GET",
+        "path": "/v1/journal",
+        "body": {
+            "schema_version": "houndd.read-request.v1",
+            "request_id": args.request_id,
+            "producer": {"owner_id": args.owner_id, "capability": "journal.query", "run_id": args.run_id},
+            "requested_access": args.requested_access,
+            "policy_id": args.policy_id,
+            "operation": {"name": "journal.query", "payload": payload},
+        },
+    }
+    raw = canonical_bytes(request)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(5)
+            connection.connect(os.fspath(socket_path))
+            connection.sendall(len(raw).to_bytes(4, "big") + raw)
+            connection.shutdown(socket.SHUT_WR)
+            length = int.from_bytes(_read_socket_exact(connection, 4), "big")
+            if not 0 < length <= MAX_FRAME_BYTES:
+                raise HoundError("houndd response frame is invalid", exit_code=5)
+            response = _strict_response(_read_socket_exact(connection, length))
+            if connection.recv(1):
+                raise HoundError("houndd returned multiple response frames", exit_code=5)
+    except HoundError:
+        raise
+    except OSError as error:
+        raise HoundError("houndd is unavailable", exit_code=5) from error
+    status = response["status"]
+    if status == 200:
+        return response["body"]
+    raise HoundError(json.dumps(response["body"], sort_keys=True, separators=(",", ":")), exit_code={400: 2, 404: 3, 503: 5}[status])
 
 
 def main(argv: Sequence[str] | None = None) -> int:

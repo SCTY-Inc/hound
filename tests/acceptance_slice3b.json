@@ -1,0 +1,52 @@
+{
+  "schema_version": "houndd.slice3b.acceptance.v1",
+  "slice": "3B",
+  "status": "partial_hsp_coverage",
+  "provisional": true,
+  "partial_hsps": ["HSP-03", "HSP-08", "HSP-09", "HSP-20", "HSP-21"],
+  "no_new_claim_hsps": ["HSP-01", "HSP-02", "HSP-04", "HSP-05", "HSP-06", "HSP-07", "HSP-10", "HSP-11", "HSP-12", "HSP-13", "HSP-14", "HSP-15", "HSP-16", "HSP-17", "HSP-18", "HSP-19", "HSP-22"],
+  "artifacts": {
+    "pyproject.toml": "HSP-03",
+    "src/houndd/cli.py": "HSP-03",
+    "src/houndd/service.py": "HSP-09",
+    "src/hound_research/cli.py": "HSP-03",
+    "tests/test_slice3b_service.py": "HSP-21",
+    "tests/generate_slice3b_evidence.py": "HSP-21",
+    "tests/acceptance_slice3b.json": "HSP-21",
+    "tests/evidence/slice3b/run-manifest.json": "HSP-21",
+    "tests/evidence/slice3b/slice3b-pytest.xml": "HSP-21"
+  },
+  "coverage": {
+    "HSP-03": {
+      "status": "partial",
+      "tests": ["tests/test_slice3b_service.py"],
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_slice3b_service.py",
+      "assertions": ["foreground houndd serve and thin hound-research journal query use only one AF_UNIX SOCK_STREAM request/response", "framing is canonical, bounded, EOF-gated, and route-bound", "CLI exits are exactly 0, 2, 3, or 5"],
+      "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json", "tests/evidence/slice3b/slice3b-pytest.xml"]
+    },
+    "HSP-08": {
+      "status": "partial",
+      "tests": ["tests/test_slice3b_service.py"],
+      "assertions": ["the durable query adapter remains the sole cursor/HWM evaluator", "unavailable derived filters are logical 400 before adapter state access"],
+      "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
+    },
+    "HSP-09": {
+      "status": "partial",
+      "tests": ["tests/test_slice3b_service.py"],
+      "assertions": ["accepted-socket SO_PEERCRED forms linux-uid principal", "frozen owner-only canonical policy selects one matching rule and applies a disclosure ceiling", "policy replacement and denied scopes fail closed without protected IDs"],
+      "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
+    },
+    "HSP-20": {
+      "status": "partial",
+      "tests": ["tests/test_slice3b_service.py"],
+      "assertions": ["recover and verify complete before identity creation and listener bind", "request-time query uses the verified durable query core without rebuilding SQLite"],
+      "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
+    },
+    "HSP-21": {
+      "status": "partial",
+      "tests": ["tests/generate_slice3b_evidence.py"],
+      "assertions": ["retained evidence binds the exact source commit/tree, command, test count, and JUnit result"],
+      "retained_artifacts": ["tests/acceptance_slice3b.json", "tests/evidence/slice3b/run-manifest.json", "tests/evidence/slice3b/slice3b-pytest.xml"]
+    }
+  }
+}
