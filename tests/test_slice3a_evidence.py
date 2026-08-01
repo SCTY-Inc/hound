@@ -153,6 +153,8 @@ def _copy_and_rebind_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 def _reseal_bundle(candidate: Path, repository: Path) -> None:
     manifest = _load(candidate / "run-manifest.json")
+    for suite in manifest["suites"].values():
+        suite["junit_sha256"] = _sha(candidate / suite["junit_file"])
     for name, artifact in manifest["artifacts"].items():
         artifact["sha256"] = _sha(candidate / name)
     _write_json(candidate / "run-manifest.json", manifest)
@@ -246,28 +248,24 @@ def _node_ids(path: Path) -> tuple[list[str], dict[str, int]]:
         suites = list(root)
         assert suites and all(suite.tag == "testsuite" for suite in suites)
         aggregate = root
-    assert len(list(root.iter("testsuite"))) == len(suites)
 
     counts = {key: 0 for key in count_keys}
     nodes: list[str] = []
     for suite in suites:
-        cases = [child for child in suite if child.tag == "testcase"]
-        assert len(list(suite.iter("testcase"))) == len(cases)
+        cases = list(suite)
+        assert all(case.tag == "testcase" for case in cases)
         derived = {key: 0 for key in count_keys}
         derived["tests"] = len(cases)
         for case in cases:
             classname, name = case.attrib.get("classname"), case.attrib.get("name")
             assert type(classname) is str and classname and type(name) is str and name
             nodes.append(f"{classname.replace('.', '/')}.py::{name}")
-            outcome_count = 0
-            for key in ("failures", "errors", "skipped"):
-                tag = key.removesuffix("s")
-                direct = [child for child in case if child.tag == tag]
-                assert len(direct) <= 1
-                assert len(list(case.iter(tag))) == len(direct)
-                derived[key] += len(direct)
-                outcome_count += len(direct)
-            assert outcome_count <= 1
+            outcomes = list(case)
+            assert len(outcomes) <= 1
+            assert all(outcome.tag in {"failure", "error", "skipped"} for outcome in outcomes)
+            if outcomes:
+                outcome_key = "skipped" if outcomes[0].tag == "skipped" else f"{outcomes[0].tag}s"
+                derived[outcome_key] += 1
         for key in count_keys:
             declared = suite.attrib.get(key)
             assert type(declared) is str and re.fullmatch(r"0|[1-9][0-9]*", declared)
@@ -736,6 +734,68 @@ def test_rebound_slice3a_bundle_passes_without_tampering(
     validate_bundle(candidate)
 
 
+def test_reseal_refreshes_suite_and_artifact_junit_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    _mutate_junit(candidate, lambda root: next(root.iter("testsuite")).set("time", "0.000"))
+    compatibility = candidate / "compatibility-pytest.xml"
+    compatibility_root = ElementTree.parse(compatibility).getroot()
+    next(compatibility_root.iter("testsuite")).set("time", "0.000")
+    ElementTree.ElementTree(compatibility_root).write(
+        compatibility,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+    _reseal_bundle(candidate, repository)
+
+    manifest = _load(candidate / "run-manifest.json")
+    for suite_name in ("focused", "compatibility"):
+        junit_file = manifest["suites"][suite_name]["junit_file"]
+        digest = _sha(candidate / junit_file)
+        assert manifest["suites"][suite_name]["junit_sha256"] == digest
+        assert manifest["artifacts"][junit_file]["sha256"] == digest
+
+
+@pytest.mark.parametrize("outcome", ["failure", "error", "skipped"])
+def test_node_ids_rejects_suite_level_outcome_children(tmp_path: Path, outcome: str) -> None:
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        (
+            '<testsuites tests="1" failures="0" errors="0" skipped="0">'
+            '<testsuite tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="tests.test_example" name="test_example" />'
+            f'<{outcome} />'
+            '</testsuite>'
+            '</testsuites>'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError):
+        _node_ids(path)
+
+
+def test_node_ids_rejects_unexpected_testcase_child(tmp_path: Path) -> None:
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        (
+            '<testsuite tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="tests.test_example" name="test_example">'
+            '<system-out>forged</system-out>'
+            '</testcase>'
+            '</testsuite>'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError):
+        _node_ids(path)
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -760,6 +820,12 @@ def test_rebound_slice3a_bundle_passes_without_tampering(
         "junit_error_child_with_zero_attrs",
         "junit_skipped_child_with_zero_attrs",
         "junit_failure_attr_without_child",
+        "junit_suite_failure_child",
+        "junit_suite_error_child",
+        "junit_suite_skipped_child",
+        "junit_unexpected_testcase_child",
+        "junit_unexpected_suite_child",
+        "junit_unexpected_root_child",
         "junit_nested_suite",
         "junit_noncanonical_count",
         "junit_aggregate_mismatch",
@@ -856,6 +922,31 @@ def test_rebound_slice3a_bundle_rejects_resealed_provenance_and_fd_tampering(
         _mutate_junit(
             candidate,
             lambda root: next(root.iter("testsuite")).set("failures", "1"),
+        )
+    elif case in {
+        "junit_suite_failure_child",
+        "junit_suite_error_child",
+        "junit_suite_skipped_child",
+    }:
+        outcome = case.removeprefix("junit_suite_").removesuffix("_child")
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(next(root.iter("testsuite")), outcome),
+        )
+    elif case == "junit_unexpected_testcase_child":
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(next(root.iter("testcase")), "system-out"),
+        )
+    elif case == "junit_unexpected_suite_child":
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(next(root.iter("testsuite")), "properties"),
+        )
+    elif case == "junit_unexpected_root_child":
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(root, "properties"),
         )
     elif case == "junit_nested_suite":
         _mutate_junit(
