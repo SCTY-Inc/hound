@@ -1,47 +1,305 @@
 {
-  "schema_version": "houndd.slice3a.evidence.v1",
-  "result": "pass",
-  "modes": {
-    "service_directory": "0700",
-    "identity": "0600",
-    "lock": "0600",
-    "transaction_marker_and_witnesses": "0600"
+  "observations": {
+    "lifetime": {
+      "child_exit": -9,
+      "child_phase": "locked",
+      "locked_result": "ServiceIdentityLocked",
+      "reopen_result": "opened",
+      "state": {
+        "entries": [
+          {
+            "blksize": 4096,
+            "blocks": 8,
+            "ctime_ns": 1785576242862262329,
+            "dev": 2049,
+            "gid": 1000,
+            "ino": 2217599,
+            "kind": "directory",
+            "mode": 448,
+            "mtime_ns": 1785576242862262329,
+            "nlink": 3,
+            "path": ".",
+            "rdev": 0,
+            "size": 4096,
+            "uid": 1000
+          },
+          {
+            "blksize": 4096,
+            "blocks": 8,
+            "ctime_ns": 1785576242896262374,
+            "dev": 2049,
+            "gid": 1000,
+            "ino": 2217600,
+            "kind": "directory",
+            "mode": 448,
+            "mtime_ns": 1785576242896262374,
+            "nlink": 2,
+            "path": "service",
+            "rdev": 0,
+            "size": 4096,
+            "uid": 1000
+          },
+          {
+            "blksize": 4096,
+            "blocks": 8,
+            "ctime_ns": 1785576242887262363,
+            "dev": 2049,
+            "gid": 1000,
+            "ino": 2217602,
+            "kind": "regular",
+            "mode": 384,
+            "mtime_ns": 1785576242864262332,
+            "nlink": 1,
+            "path": "service/identity.json",
+            "rdev": 0,
+            "sha256": "72a4f0a59b747786aff395eec84c4b65aaeab7f535f3ddace22b264905ae9ca1",
+            "size": 253,
+            "uid": 1000
+          },
+          {
+            "blksize": 4096,
+            "blocks": 0,
+            "ctime_ns": 1785576242863262331,
+            "dev": 2049,
+            "gid": 1000,
+            "ino": 2217601,
+            "kind": "regular",
+            "mode": 384,
+            "mtime_ns": 1785576242863262331,
+            "nlink": 1,
+            "path": "service/lock",
+            "rdev": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "size": 0,
+            "uid": 1000
+          }
+        ],
+        "root": "/tmp/pytest-of-deploy/pytest-685/test_service_identity_lifetime0/store"
+      }
+    },
+    "procfs": [
+      {
+        "calls": [
+          [
+            248,
+            "",
+            247,
+            ".identity.txn.26d3d3b9422cd3aae272eef0cbe26cee.new",
+            4096
+          ],
+          [
+            250,
+            "248",
+            247,
+            ".identity.txn.26d3d3b9422cd3aae272eef0cbe26cee.new",
+            1024
+          ],
+          [
+            248,
+            "",
+            247,
+            "identity.json",
+            4096
+          ],
+          [
+            250,
+            "248",
+            247,
+            "identity.json",
+            1024
+          ]
+        ],
+        "empty_path_errno": 1,
+        "fallback_destinations": [
+          ".identity.txn.26d3d3b9422cd3aae272eef0cbe26cee.new",
+          "identity.json"
+        ],
+        "state": {
+          "entries": [
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243519263201,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217622,
+              "kind": "directory",
+              "mode": 448,
+              "mtime_ns": 1785576243519263201,
+              "nlink": 3,
+              "path": ".",
+              "rdev": 0,
+              "size": 4096,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243553263246,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217623,
+              "kind": "directory",
+              "mode": 448,
+              "mtime_ns": 1785576243553263246,
+              "nlink": 2,
+              "path": "service",
+              "rdev": 0,
+              "size": 4096,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243544263234,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217625,
+              "kind": "regular",
+              "mode": 384,
+              "mtime_ns": 1785576243520263202,
+              "nlink": 1,
+              "path": "service/identity.json",
+              "rdev": 0,
+              "sha256": "49e271f0dcab3888393d904384fc5dc5fdc061728e222331cbee3eb356d6867c",
+              "size": 253,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 0,
+              "ctime_ns": 1785576243519263201,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217624,
+              "kind": "regular",
+              "mode": 384,
+              "mtime_ns": 1785576243519263201,
+              "nlink": 1,
+              "path": "service/lock",
+              "rdev": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "size": 0,
+              "uid": 1000
+            }
+          ],
+          "root": "/tmp/pytest-of-deploy/pytest-685/test_service_identity_exact_fd0/store"
+        }
+      },
+      {
+        "calls": [
+          [
+            248,
+            "",
+            247,
+            ".identity.txn.69d93b82c5afddbe99931d86cc7a1e8c.new",
+            4096
+          ],
+          [
+            250,
+            "248",
+            247,
+            ".identity.txn.69d93b82c5afddbe99931d86cc7a1e8c.new",
+            1024
+          ],
+          [
+            248,
+            "",
+            247,
+            "identity.json",
+            4096
+          ],
+          [
+            250,
+            "248",
+            247,
+            "identity.json",
+            1024
+          ]
+        ],
+        "empty_path_errno": 2,
+        "fallback_destinations": [
+          ".identity.txn.69d93b82c5afddbe99931d86cc7a1e8c.new",
+          "identity.json"
+        ],
+        "state": {
+          "entries": [
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243562263258,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217627,
+              "kind": "directory",
+              "mode": 448,
+              "mtime_ns": 1785576243562263258,
+              "nlink": 3,
+              "path": ".",
+              "rdev": 0,
+              "size": 4096,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243595263302,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217628,
+              "kind": "directory",
+              "mode": 448,
+              "mtime_ns": 1785576243595263302,
+              "nlink": 2,
+              "path": "service",
+              "rdev": 0,
+              "size": 4096,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 8,
+              "ctime_ns": 1785576243587263291,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217630,
+              "kind": "regular",
+              "mode": 384,
+              "mtime_ns": 1785576243564263261,
+              "nlink": 1,
+              "path": "service/identity.json",
+              "rdev": 0,
+              "sha256": "fc59ed08917c5fbcd10f657851a050be32cf0ec76493e70b109beb78002833c0",
+              "size": 253,
+              "uid": 1000
+            },
+            {
+              "blksize": 4096,
+              "blocks": 0,
+              "ctime_ns": 1785576243563263259,
+              "dev": 2049,
+              "gid": 1000,
+              "ino": 2217629,
+              "kind": "regular",
+              "mode": 384,
+              "mtime_ns": 1785576243563263259,
+              "nlink": 1,
+              "path": "service/lock",
+              "rdev": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "size": 0,
+              "uid": 1000
+            }
+          ],
+          "root": "/tmp/pytest-of-deploy/pytest-685/test_service_identity_exact_fd1/store"
+        }
+      }
+    ]
   },
-  "lifetime_lock": {
-    "subprocess_exclusion": true,
-    "sigkill_release": true,
-    "fork_child_rejected_before_mutex": true,
-    "fork_child_close_unlocks_parent": false,
-    "child_owned_reopen_before_parent_close": false,
-    "child_owned_reopen_after_parent_close": true
-  },
-  "exact_fd_publication": {
-    "source": "O_TMPFILE without O_EXCL",
-    "primary": "linkat AT_EMPTY_PATH",
-    "fallback_errnos": [
-      "EPERM",
-      "ENOENT"
-    ],
-    "fallback": "held /proc/self/fd directory FD plus numeric relative entry and AT_SYMLINK_FOLLOW",
-    "named_temp_fallback": false,
-    "closed_or_reused_source_rejected": true,
-    "masked_procfs_rejected": true,
-    "link_count_increment_verified": true
-  },
-  "lasting_and_live_replacements": [
-    "ancestor",
-    "root",
-    "service",
-    "lock",
-    "identity",
-    "marker",
-    "new witness",
-    "old witness",
-    "swap witness",
-    "cleanup quarantine"
+  "proving_node_ids": [
+    "tests/test_hsp20_durable_state.py::test_service_identity_exact_fd_procfs_fallback_uses_only_held_relative_dirfds[1]",
+    "tests/test_hsp20_durable_state.py::test_service_identity_exact_fd_procfs_fallback_uses_only_held_relative_dirfds[2]",
+    "tests/test_hsp20_durable_state.py::test_service_identity_lifetime_lock_survives_process_boundary_and_releases_on_kill"
   ],
-  "outside_writes": 0,
-  "destructive_replacement_removals": 0,
-  "fd_growth_after_repetition": 0,
-  "source": "tests/test_hsp20_durable_state.py"
+  "schema_version": "houndd.slice3a.evidence-seal.v2"
 }

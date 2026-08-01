@@ -1,23 +1,253 @@
 {
-  "schema_version": "houndd.slice3a.evidence.v1",
-  "result": "pass",
-  "canonical_filters": [
-    "time_range",
-    "producer",
-    "source",
-    "entry_id",
-    "record_id",
-    "object_key",
-    "content_sha256",
-    "classification",
-    "access"
+  "observations": {
+    "requests": [
+      {
+        "filter": {},
+        "ordered_entry_ids": [
+          "936bd653ca86c09a74279e56738cb831f26e3c4db2e2ea92f7f2edf74a1e7542",
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333",
+          "40eacc8410ea1d652860b139899c942e5e1ac24498cb2f561d750d23e61de512",
+          "1035b9e1177ee6746c8cf19991793bd4516415ca14f4d01f85a3cfe6e175d7ba"
+        ]
+      },
+      {
+        "filter": {
+          "time_range": {
+            "from": "2026-07-31T02:00:00Z",
+            "to": "2026-07-31T04:00:00Z"
+          }
+        },
+        "ordered_entry_ids": [
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333",
+          "40eacc8410ea1d652860b139899c942e5e1ac24498cb2f561d750d23e61de512"
+        ]
+      },
+      {
+        "filter": {
+          "producer": {
+            "capability": [
+              "capture"
+            ],
+            "owner_id": [
+              "owner"
+            ],
+            "run_id": [
+              "run-b"
+            ]
+          }
+        },
+        "ordered_entry_ids": [
+          "936bd653ca86c09a74279e56738cb831f26e3c4db2e2ea92f7f2edf74a1e7542"
+        ]
+      },
+      {
+        "filter": {
+          "source": {
+            "provider": [
+              "firecrawl"
+            ]
+          }
+        },
+        "ordered_entry_ids": [
+          "936bd653ca86c09a74279e56738cb831f26e3c4db2e2ea92f7f2edf74a1e7542",
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333"
+        ]
+      },
+      {
+        "filter": {
+          "source": {
+            "canonical_url": [
+              "https://example.test/2"
+            ]
+          }
+        },
+        "ordered_entry_ids": [
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e"
+        ]
+      },
+      {
+        "filter": {
+          "entry_id": [
+            "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333"
+          ]
+        },
+        "ordered_entry_ids": [
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333"
+        ]
+      },
+      {
+        "filter": {
+          "record_id": [
+            "record-4"
+          ]
+        },
+        "ordered_entry_ids": [
+          "1035b9e1177ee6746c8cf19991793bd4516415ca14f4d01f85a3cfe6e175d7ba"
+        ]
+      },
+      {
+        "filter": {
+          "object_key": [
+            "object-0"
+          ]
+        },
+        "ordered_entry_ids": [
+          "40eacc8410ea1d652860b139899c942e5e1ac24498cb2f561d750d23e61de512"
+        ]
+      },
+      {
+        "filter": {
+          "content_sha256": [
+            "3460ebae1c45bfd069074b365281354cfdf41b82ffb05c7eedd6775446fcd3a4"
+          ]
+        },
+        "ordered_entry_ids": [
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e"
+        ]
+      },
+      {
+        "filter": {
+          "classification": {
+            "outcome": [
+              "completed"
+            ]
+          }
+        },
+        "ordered_entry_ids": [
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+          "40eacc8410ea1d652860b139899c942e5e1ac24498cb2f561d750d23e61de512",
+          "1035b9e1177ee6746c8cf19991793bd4516415ca14f4d01f85a3cfe6e175d7ba"
+        ]
+      },
+      {
+        "filter": {
+          "classification": {
+            "evidence_status": [
+              "failure"
+            ]
+          }
+        },
+        "ordered_entry_ids": [
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333"
+        ]
+      },
+      {
+        "filter": {
+          "access": [
+            "workspace",
+            "restricted"
+          ]
+        },
+        "ordered_entry_ids": [
+          "936bd653ca86c09a74279e56738cb831f26e3c4db2e2ea92f7f2edf74a1e7542",
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+          "1035b9e1177ee6746c8cf19991793bd4516415ca14f4d01f85a3cfe6e175d7ba"
+        ]
+      },
+      {
+        "filter": {
+          "classification": {
+            "outcome": [
+              "completed",
+              "failed"
+            ]
+          },
+          "source": {
+            "provider": [
+              "exa",
+              "firecrawl"
+            ]
+          },
+          "time_range": {
+            "from": "2026-07-31T01:30:00Z",
+            "to": "2026-07-31T03:00:00Z"
+          }
+        },
+        "ordered_entry_ids": [
+          "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+          "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333"
+        ]
+      }
+    ],
+    "unsupported": [
+      {
+        "class_hook_calls": {
+          "Journal.verified_snapshot": 0,
+          "ServiceIdentity.lease": 0
+        },
+        "filter": {
+          "entity": [
+            "entity"
+          ]
+        },
+        "filter_keys": [
+          "entity"
+        ],
+        "result_type": "QueryFilterNotAvailable"
+      },
+      {
+        "class_hook_calls": {
+          "Journal.verified_snapshot": 0,
+          "ServiceIdentity.lease": 0
+        },
+        "filter": {
+          "entity": [
+            "entity"
+          ],
+          "lane": [
+            "pulse"
+          ],
+          "topic": [
+            "care"
+          ]
+        },
+        "filter_keys": [
+          "entity",
+          "lane",
+          "topic"
+        ],
+        "result_type": "QueryFilterNotAvailable"
+      },
+      {
+        "class_hook_calls": {
+          "Journal.verified_snapshot": 0,
+          "ServiceIdentity.lease": 0
+        },
+        "filter": {
+          "topic": [
+            "care"
+          ]
+        },
+        "filter_keys": [
+          "topic"
+        ],
+        "result_type": "QueryFilterNotAvailable"
+      },
+      {
+        "class_hook_calls": {
+          "Journal.verified_snapshot": 0,
+          "ServiceIdentity.lease": 0
+        },
+        "filter": {
+          "lane": [
+            "pulse"
+          ]
+        },
+        "filter_keys": [
+          "lane"
+        ],
+        "result_type": "QueryFilterNotAvailable"
+      }
+    ]
+  },
+  "proving_node_ids": [
+    "tests/test_hsp08_durable_query.py::test_durable_query_uses_exact_persisted_chain_and_all_canonical_filter_families",
+    "tests/test_hsp08_durable_query.py::test_projection_filters_fail_explicitly_before_identity_or_journal_access[filter_value0]",
+    "tests/test_hsp08_durable_query.py::test_projection_filters_fail_explicitly_before_identity_or_journal_access[filter_value1]",
+    "tests/test_hsp08_durable_query.py::test_projection_filters_fail_explicitly_before_identity_or_journal_access[filter_value2]",
+    "tests/test_hsp08_durable_query.py::test_projection_filters_fail_explicitly_before_identity_or_journal_access[filter_value3]"
   ],
-  "ordering": "appended_at UTC, sequence, entry_id",
-  "composition": "OR within a field and AND across fields",
-  "explicitly_unavailable": [
-    "entity",
-    "lane",
-    "topic"
-  ],
-  "source": "tests/test_hsp08_durable_query.py"
+  "schema_version": "houndd.slice3a.evidence-seal.v2"
 }

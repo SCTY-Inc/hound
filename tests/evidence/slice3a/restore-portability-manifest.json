@@ -1,26 +1,81 @@
 {
-  "schema_version": "houndd.slice3a.evidence.v1",
-  "result": "pass",
-  "claim_status": "provisional code and evidence only; canonical HSP-20 and security-boundary documentation amendment remains a separate acceptance gate",
-  "platform_claim": "Linux with O_TMPFILE, linkat, procfs, renameat2 RENAME_NOREPLACE, flock, and RENAME_EXCHANGE",
-  "exact_fd_fallback": "AT_EMPTY_PATH is attempted first; only EPERM or ENOENT permits a held /proc/self/fd dirfd plus numeric relative entry and AT_SYMLINK_FOLLOW",
-  "copied_components": [
-    "legacy record bytes and manifest",
-    "blob",
-    "journal events, chain, and head",
-    "service identity generation and key IDs"
+  "observations": {
+    "identity_sha256": "562349fd1ba7b76617d830d27a20fe829e186c96a1b54fefbadd0c87c2b9d81f",
+    "relocated_state": {
+      "entries": [
+        {
+          "blksize": 4096,
+          "blocks": 8,
+          "ctime_ns": 1785576264570290964,
+          "dev": 2049,
+          "gid": 1000,
+          "ino": 2447446,
+          "kind": "directory",
+          "mode": 448,
+          "mtime_ns": 1785576264533290915,
+          "nlink": 3,
+          "path": ".",
+          "rdev": 0,
+          "size": 4096,
+          "uid": 1000
+        },
+        {
+          "blksize": 4096,
+          "blocks": 8,
+          "ctime_ns": 1785576264570290964,
+          "dev": 2049,
+          "gid": 1000,
+          "ino": 2447447,
+          "kind": "directory",
+          "mode": 448,
+          "mtime_ns": 1785576264566290958,
+          "nlink": 2,
+          "path": "service",
+          "rdev": 0,
+          "size": 4096,
+          "uid": 1000
+        },
+        {
+          "blksize": 4096,
+          "blocks": 8,
+          "ctime_ns": 1785576264570290964,
+          "dev": 2049,
+          "gid": 1000,
+          "ino": 2447448,
+          "kind": "regular",
+          "mode": 384,
+          "mtime_ns": 1785576264534290916,
+          "nlink": 1,
+          "path": "service/identity.json",
+          "rdev": 0,
+          "sha256": "562349fd1ba7b76617d830d27a20fe829e186c96a1b54fefbadd0c87c2b9d81f",
+          "size": 253,
+          "uid": 1000
+        },
+        {
+          "blksize": 4096,
+          "blocks": 0,
+          "ctime_ns": 1785576264570290964,
+          "dev": 2049,
+          "gid": 1000,
+          "ino": 2447449,
+          "kind": "regular",
+          "mode": 384,
+          "mtime_ns": 1785576264533290915,
+          "nlink": 1,
+          "path": "service/lock",
+          "rdev": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0,
+          "uid": 1000
+        }
+      ],
+      "root": "/tmp/pytest-of-deploy/pytest-685/test_service_identity_relocati0/location-b"
+    },
+    "states_equal": true
+  },
+  "proving_node_ids": [
+    "tests/test_hsp20_durable_state.py::test_service_identity_relocation_preserves_identity_without_absolute_paths"
   ],
-  "projection_deleted_before_verification": true,
-  "projection_rebuilt_from_journal": true,
-  "cursor_from_path_a_resumes_at_path_b": true,
-  "generation_roll_at_b_affects_a": false,
-  "canonical_absolute_paths": 0,
-  "cleanup_boundary": "RENAME_NOREPLACE quarantine and exact inode/hash validation precede cleanup; no unlink-by-FD guarantee is claimed, and retaining validated quarantine is permitted under the cooperative same-UID boundary",
-  "explicitly_outside_portable_claim": [
-    "same-UID swap restored to the same inode before final validation",
-    "physical power-loss certification",
-    "non-Linux systems without required atomic namespace primitives",
-    "foreign-UID or privileged hostile deployment"
-  ],
-  "source": "tests/test_hsp08_durable_query.py"
+  "schema_version": "houndd.slice3a.evidence-seal.v2"
 }

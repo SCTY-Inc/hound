@@ -1,17 +1,21 @@
 {
-  "schema_version": "houndd.slice3a.evidence.v1",
-  "result": "pass",
-  "context_algorithm": "houndd.provenance-context-chain.v2",
-  "fixed_hwm": true,
-  "append_stable": true,
-  "restart_closes_all_state": true,
-  "limit_change_on_resume": true,
-  "hostile_cursor_prefix_hashes": 0,
-  "authenticated_wrong_context_events": 40,
-  "authenticated_wrong_context_recovery_scans": 0,
-  "linear_probe_events": 101,
-  "maximum_context_hashes": 204,
-  "position_candidates_scanned": 202,
-  "generic_rejection": "cursor rejected",
-  "source": "tests/test_hsp08_durable_query.py"
+  "observations": {
+    "first_cursor_sha256": "65f2aeee4d8fa7fa8cccc144863f925d6b3b780a0698b406edf42233fe9da29d",
+    "fresh_first": {
+      "entry_id": "fc4cc3e65c1de33146a824e45a8d506a02f0ea7832549c197f1e37ce3ef2713f",
+      "sequence": 5
+    },
+    "resumed_ids": [
+      "936bd653ca86c09a74279e56738cb831f26e3c4db2e2ea92f7f2edf74a1e7542",
+      "f4d989347ff6d501f6dd38c6d4a794605992d1af515adcea2d2d2c5a5023d19e",
+      "b0fd78ae1f23048fc07979abb17c5ca0f4141b3cf245b1b9a4465614cb5d2333",
+      "40eacc8410ea1d652860b139899c942e5e1ac24498cb2f561d750d23e61de512",
+      "1035b9e1177ee6746c8cf19991793bd4516415ca14f4d01f85a3cfe6e175d7ba"
+    ],
+    "terminal_cursor": null
+  },
+  "proving_node_ids": [
+    "tests/test_hsp08_durable_query.py::test_fixed_hwm_cursor_resumes_after_append_and_full_restart_with_limit_change"
+  ],
+  "schema_version": "houndd.slice3a.evidence-seal.v2"
 }
