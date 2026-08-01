@@ -38,6 +38,22 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+class _HostileString(str):
+    def __len__(self) -> int:
+        return 64
+
+    def __iter__(self):
+        return iter("0" * 64)
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
 def _event(
     sequence: int,
     *,
@@ -302,6 +318,11 @@ def test_hsp08_replay_dedupe_requires_collections_of_canonical_entry_ids(entry_i
         dedupe_replay_entry_ids(entry_ids, seen_entry_ids)
 
 
+def test_hsp08_replay_dedupe_rejects_a_str_subclass_that_spoofs_a_canonical_digest() -> None:
+    with pytest.raises(QueryEngineError):
+        dedupe_replay_entry_ids((_HostileString("not-a-digest"),))
+
+
 def test_hsp08_direct_query_item_clones_and_deeply_freezes_its_event() -> None:
     events, snapshot, projection, scope, _, _ = _matrix()
     event = events[0]
@@ -312,3 +333,12 @@ def test_hsp08_direct_query_item_clones_and_deeply_freezes_its_event() -> None:
     assert item.event["source"]["provider"] == "exa"
     with pytest.raises(TypeError):
         item.event["source"]["provider"] = "forged"  # type: ignore[index]
+
+
+def test_hsp08_direct_query_item_rejects_a_scalar_subclass_in_its_envelope() -> None:
+    events, snapshot, projection, scope, _, _ = _matrix()
+    event = events[0]
+    event["entry_id"] = _HostileString(event["entry_id"])
+
+    with pytest.raises(QueryEngineError):
+        QueryItem(event, projection.project(scope, snapshot.events[0]))

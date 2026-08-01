@@ -31,6 +31,16 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+class _EqualitySpoofingString(str):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
 def _event(sequence: int, when: str) -> dict[str, object]:
     return make_journal_envelope(
         sequence=sequence,
@@ -131,6 +141,20 @@ def test_hsp20_snapshot_rejects_gaps_duplicates_divergence_and_tampering(case: s
         events[1]["source"]["provider"] = "forged-provider"
     with pytest.raises(QuerySnapshotError):
         JournalQuerySnapshot(events, recovery)
+
+
+def test_hsp20_snapshot_rejects_a_candidate_str_subclass_before_identity_comparison() -> None:
+    event = _event(0, "2026-07-31T00:00:00Z")
+    trusted_candidate = _recovery([event]).candidates[0]
+    hostile_candidate = JournalCursorCandidate(
+        0,
+        _EqualitySpoofingString(_digest("different-entry")),
+        event["appended_at"],
+        trusted_candidate.chain_sha256,
+    )
+
+    with pytest.raises(QuerySnapshotError):
+        JournalQuerySnapshot([event], (hostile_candidate,))
 
 
 def test_hsp20_equivalent_rebuilt_snapshots_have_identical_manifests_and_semantic_cursor_recovery(tmp_path) -> None:

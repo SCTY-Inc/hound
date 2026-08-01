@@ -37,17 +37,17 @@ class QueryEngineError(ValueError):
 
 
 def _is_sha256(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+    return type(value) is str and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _sha256(value: object, label: str) -> str:
-    if not isinstance(value, str) or not _is_sha256(value):
+    if not _is_sha256(value):
         raise QueryContextError(f"{label} must be a lowercase SHA-256 digest")
     return value
 
 
 def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise QueryContextError(f"{label} must be a non-empty string")
     try:
         value.encode("utf-8")
@@ -58,24 +58,24 @@ def _text(value: object, label: str) -> str:
 
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
+        if any(type(key) is not str for key in value):
             raise QuerySnapshotError("canonical event mappings must have string keys")
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or type(value) is str or type(value) is bool or type(value) is int or type(value) is float:
         return value
     raise QuerySnapshotError("canonical event contains a non-JSON value")
 
 
 def _clone_json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
+        if any(type(key) is not str for key in value):
             raise QuerySnapshotError("canonical event mappings must have string keys")
         return {key: _clone_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_clone_json_value(item) for item in value]
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or type(value) is str or type(value) is bool or type(value) is int or type(value) is float:
         return value
     raise QuerySnapshotError("canonical event contains a non-JSON value")
 
@@ -124,6 +124,11 @@ class JournalQuerySnapshot:
                 raise QuerySnapshotError("cursor recovery candidates must be iterable") from error
         if any(not isinstance(candidate, JournalCursorCandidate) for candidate in raw_candidates):
             raise QuerySnapshotError("cursor recovery snapshot contains an invalid candidate")
+        if any(
+            not _is_sha256(candidate.entry_id) or not _is_sha256(candidate.chain_sha256)
+            for candidate in raw_candidates
+        ):
+            raise QuerySnapshotError("cursor recovery candidate identity is invalid")
 
         events = tuple(sorted(copied_events, key=lambda event: event["sequence"]))
         candidates = tuple(sorted(raw_candidates, key=lambda candidate: candidate.sequence))
