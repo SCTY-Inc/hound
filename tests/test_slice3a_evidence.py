@@ -594,6 +594,8 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         assert tuple(suite["source_paths"]) == files
         collect = _exact_keys(suite["collect_command"], {"id", "argv", "exit"})
         junit = _exact_keys(suite["junit_command"], {"id", "argv", "exit"})
+        _integer(collect["exit"])
+        _integer(junit["exit"])
         assert collect["id"] == f"{suite_name}-collect" and junit["id"] == f"{suite_name}-junit" and collect["exit"] == junit["exit"] == 0
         assert type(collect["argv"]) is list and type(junit["argv"]) is list
         assert collect["argv"][0] == junit["argv"][0] == sys.executable
@@ -601,7 +603,10 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         assert junit["argv"][1:4] == ["-m", "pytest", "-p"] and junit["argv"][4:6] == ["no:cacheprovider", f"--junitxml={evidence / suite['junit_file']}"] and junit["argv"][6:] == list(files)
         assert suite["junit_file"] in JUNITS and _sha(evidence / suite["junit_file"]) == suite["junit_sha256"] and suite["junit_sha256"] not in STALE_JUNIT_SHA256
         nodes, counts = _node_ids(evidence / suite["junit_file"])
-        assert nodes == suite["ordered_node_ids"] and counts == suite["counts"] and all(type(value) is int for value in counts.values())
+        manifest_counts = _exact_keys(suite["counts"], {"tests", "failures", "errors", "skipped"})
+        for value in manifest_counts.values():
+            _integer(value)
+        assert nodes == suite["ordered_node_ids"] and counts == manifest_counts
         assert counts["failures"] == counts["errors"] == counts["skipped"] == 0 and counts["tests"] == len(nodes)
         suite_nodes[suite_name] = nodes
     expected_report_nodes = _expected_report_nodes(suite_nodes["focused"])
@@ -758,6 +763,48 @@ def test_reseal_refreshes_suite_and_artifact_junit_hashes(
         digest = _sha(candidate / junit_file)
         assert manifest["suites"][suite_name]["junit_sha256"] == digest
         assert manifest["artifacts"][junit_file]["sha256"] == digest
+
+
+@pytest.mark.parametrize("suite_name", sorted(SUITE_FILES))
+@pytest.mark.parametrize(
+    "field",
+    [
+        "collect_exit",
+        "junit_exit",
+        "count_tests",
+        "count_failures",
+        "count_errors",
+        "count_skipped",
+    ],
+)
+@pytest.mark.parametrize("scalar_type", ["bool", "float"])
+def test_rebound_slice3a_bundle_rejects_resealed_noninteger_manifest_scalars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suite_name: str,
+    field: str,
+    scalar_type: str,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    manifest = _load(candidate / "run-manifest.json")
+    suite = manifest["suites"][suite_name]
+    if field == "collect_exit":
+        target = suite["collect_command"]
+        key = "exit"
+    elif field == "junit_exit":
+        target = suite["junit_command"]
+        key = "exit"
+    else:
+        target = suite["counts"]
+        key = field.removeprefix("count_")
+    honest = target[key]
+    target[key] = False if scalar_type == "bool" else float(honest)
+    _write_json(candidate / "run-manifest.json", manifest)
+    _reseal_bundle(candidate, repository)
+
+    with pytest.raises((AssertionError, subprocess.CalledProcessError)):
+        validate_bundle(candidate)
 
 
 @pytest.mark.parametrize("outcome", ["failure", "error", "skipped"])
