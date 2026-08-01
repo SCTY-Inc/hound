@@ -137,8 +137,6 @@ def _copy_and_rebind_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     manifest = _load(candidate / "run-manifest.json")
     manifest["reviewed"] = {"commit": commit, "tree": tree}
     manifest["cwd"] = str(repository)
-    for suite in manifest["suites"].values():
-        suite["junit_command"]["argv"][5] = f"--junitxml={candidate / suite['junit_file']}"
     manifest["sources"] = {}
     for relative in paths:
         raw = (repository / relative).read_bytes()
@@ -1618,6 +1616,9 @@ def _validate_manifest_and_junits(evidence: Path) -> tuple[dict[str, Any], dict[
         _check(blob == _git("rev-parse", f"{commit}:{relative}"), "run-manifest", f"blob mismatch for {relative}")
         _check(digest == hashlib.sha256(reviewed_bytes).hexdigest(), "run-manifest", f"digest mismatch for {relative}")
     suites = _object(manifest["suites"], "run-manifest.suites", set(SUITE_FILES))
+    validated_suites: dict[str, tuple[dict[str, Any], str]] = {}
+    junit_basenames: list[str] = []
+    junit_parents: set[str] = set()
     suite_nodes: dict[str, list[str]] = {}
     for suite_name, files in SUITE_FILES.items():
         suite = _object(suites[suite_name], f"run-manifest.suites.{suite_name}", {"source_paths", "collect_command", "junit_command", "junit_file", "junit_sha256", "counts", "ordered_node_ids"})
@@ -1636,7 +1637,33 @@ def _validate_manifest_and_junits(evidence: Path) -> tuple[dict[str, Any], dict[
             _string(item, "command.argv")
         _equal(collect_argv, [sys.executable, "-m", "pytest", "--collect-only", "-q", *files], f"run-manifest.{suite_name}.collect.argv")
         junit_file = _string(suite["junit_file"], f"run-manifest.{suite_name}.junit_file", choices=JUNITS)
-        _equal(junit_argv, [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", f"--junitxml={evidence / junit_file}", *files], f"run-manifest.{suite_name}.junit.argv")
+        _equal(junit_argv[:5], [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"], f"run-manifest.{suite_name}.junit.argv.prefix")
+        _equal(junit_argv[6:], list(files), f"run-manifest.{suite_name}.junit.argv.sources")
+        junit_option = junit_argv[5]
+        option_prefix = "--junitxml="
+        _check(junit_option.startswith(option_prefix), f"run-manifest.{suite_name}.junit.argv[5]", "must use exact --junitxml= prefix")
+        junit_target = junit_option[len(option_prefix):]
+        _string(junit_target, f"run-manifest.{suite_name}.junit.target")
+        _check(
+            junit_target.startswith("/") and not junit_target.startswith("//"),
+            f"run-manifest.{suite_name}.junit.target",
+            "must be an absolute Linux path with exactly one leading slash",
+        )
+        _check("\x00" not in junit_target, f"run-manifest.{suite_name}.junit.target", "must not contain NUL")
+        _check(not junit_target.endswith("/"), f"run-manifest.{suite_name}.junit.target", "must not have a trailing slash")
+        _check(os.path.normpath(junit_target) == junit_target, f"run-manifest.{suite_name}.junit.target", "must be canonical")
+        junit_basename = os.path.basename(junit_target)
+        _check(junit_basename == junit_file, f"run-manifest.{suite_name}.junit.target", "basename must match junit_file")
+        junit_basenames.append(junit_basename)
+        junit_parents.add(os.path.dirname(junit_target))
+        validated_suites[suite_name] = (suite, junit_file)
+
+    _check(len(junit_basenames) == len(set(junit_basenames)), "run-manifest.suites", "JUnit basenames must be distinct")
+    _equal(set(junit_basenames), JUNITS, "run-manifest.suites.junit_basenames")
+    _check(len(junit_parents) == 1, "run-manifest.suites", "JUnit targets must share one canonical parent")
+
+    for suite_name in SUITE_FILES:
+        suite, junit_file = validated_suites[suite_name]
         digest = _sha256(suite["junit_sha256"])
         _check(_sha(evidence / junit_file) == digest and digest not in STALE_JUNIT_SHA256, "run-manifest", "JUnit digest invalid")
         nodes, counts = _node_ids(evidence / junit_file)
@@ -1724,6 +1751,29 @@ def test_slice3a_retained_evidence_is_a_complete_e2_seal() -> None:
     validate_bundle()
 
 
+def test_slice3a_bundle_copy_preserves_historical_junit_argv_and_exact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    validate_bundle(source)
+    source_hashes = {name: _sha(source / name) for name in sorted(LEAVES)}
+    relocated = tmp_path / "relocated-candidate"
+    shutil.copytree(source, relocated)
+
+    manifest = _load(relocated / "run-manifest.json")
+    recorded_parents = {
+        Path(suite["junit_command"]["argv"][5].removeprefix("--junitxml=")).parent
+        for suite in manifest["suites"].values()
+    }
+    assert len(recorded_parents) == 1
+    assert len(source_hashes) == 16
+    assert recorded_parents != {source}
+    assert recorded_parents != {relocated}
+    assert {name: _sha(relocated / name) for name in sorted(LEAVES)} == source_hashes
+    validate_bundle(relocated)
+
+
 def test_inventory_allows_real_singleton_but_read_state_rejects_singletons_and_synthetic_roots() -> None:
     singleton = {
         "root": "/proc/self/fd",
@@ -1759,6 +1809,123 @@ def test_rebound_slice3a_bundle_passes_without_tampering(
 ) -> None:
     candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
     validate_bundle(candidate)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "relative_target",
+        "empty_target",
+        "dot_component",
+        "dotdot_component",
+        "duplicate_separator",
+        "duplicate_leading_slash",
+        "trailing_slash",
+        "wrong_basename",
+        "differing_parents",
+        "wrong_prefix",
+        "wrong_slot",
+        "duplicate_basename",
+        "extra_argv",
+        "short_argv",
+    ],
+)
+def test_rebound_slice3a_bundle_rejects_resealed_historical_junit_path_attacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    manifest = _load(candidate / "run-manifest.json")
+    focused = manifest["suites"]["focused"]
+    compatibility = manifest["suites"]["compatibility"]
+    focused_argv = focused["junit_command"]["argv"]
+    focused_file = focused["junit_file"]
+
+    if case == "relative_target":
+        focused_argv[5] = f"--junitxml=relative/{focused_file}"
+    elif case == "empty_target":
+        focused_argv[5] = "--junitxml="
+    elif case == "dot_component":
+        focused_argv[5] = f"--junitxml=/tmp/./{focused_file}"
+    elif case == "dotdot_component":
+        focused_argv[5] = f"--junitxml=/tmp/child/../{focused_file}"
+    elif case == "duplicate_separator":
+        focused_argv[5] = f"--junitxml=/tmp//{focused_file}"
+    elif case == "duplicate_leading_slash":
+        focused_argv[5] = f"--junitxml=//tmp/{focused_file}"
+    elif case == "trailing_slash":
+        focused_argv[5] = f"--junitxml=/tmp/{focused_file}/"
+    elif case == "wrong_basename":
+        focused_argv[5] = "--junitxml=/tmp/not-the-focused-junit.xml"
+    elif case == "differing_parents":
+        focused_argv[5] = f"--junitxml=/different-parent/{focused_file}"
+    elif case == "wrong_prefix":
+        focused_argv[5] = focused_argv[5].replace("--junitxml=", "--junit-xml=", 1)
+    elif case == "wrong_slot":
+        focused_argv[5], focused_argv[6] = focused_argv[6], focused_argv[5]
+    elif case == "duplicate_basename":
+        historical_parent = os.path.dirname(focused_argv[5].removeprefix("--junitxml="))
+        compatibility["junit_file"] = focused_file
+        compatibility["junit_command"]["argv"][5] = (
+            f"--junitxml={historical_parent}/{focused_file}"
+        )
+    elif case == "extra_argv":
+        focused_argv.append("tests/extra.py")
+    elif case == "short_argv":
+        focused_argv.pop()
+    else:  # pragma: no cover - parameter guard
+        raise AssertionError(case)
+
+    _write_json(candidate / "run-manifest.json", manifest)
+    _reseal_bundle(candidate, repository)
+    with pytest.raises(EvidenceValidationError):
+        validate_bundle(candidate)
+
+
+def test_optimized_checker_accepts_historical_path_and_rejects_noncanonical_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    check = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "import tests.test_slice3a_evidence as checker\n"
+        "checker.ROOT = Path(sys.argv[2])\n"
+        "checker.validate_bundle(Path(sys.argv[1]))\n"
+    )
+    command = [sys.executable, "-O", "-c", check, str(candidate), str(repository)]
+    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    positive = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert positive.returncode == 0, positive.stderr
+
+    manifest = _load(candidate / "run-manifest.json")
+    focused = manifest["suites"]["focused"]
+    focused["junit_command"]["argv"][5] = (
+        f"--junitxml=/tmp/./{focused['junit_file']}"
+    )
+    _write_json(candidate / "run-manifest.json", manifest)
+    _reseal_bundle(candidate, repository)
+    negative = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert negative.returncode != 0
+    assert "must be canonical" in negative.stderr
 
 
 def test_reseal_refreshes_suite_and_artifact_junit_hashes(
