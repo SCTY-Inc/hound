@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from xml.etree import ElementTree
 
 import pytest
@@ -42,6 +45,135 @@ SUITE_FILES = {
         "tests/test_hsp04_contract.py", "tests/test_hsp05_transactions.py", "tests/test_hsp07_dedupe.py", "tests/test_hsp14_legacy_portability.py", "tests/test_hsp20_verification.py", "tests/test_hsp08_cursor.py", "tests/test_hsp08_query_contracts.py", "tests/test_hsp09_access.py", "tests/test_hsp08_query_engine.py", "tests/test_hsp09_query_authorization.py", "tests/test_hsp20_query_snapshot.py",
     ),
 }
+
+_REPORT_NODE_BASES = {
+    "canonical-query-matrix.json": (
+        "tests/test_hsp08_durable_query.py::test_durable_query_uses_exact_persisted_chain_and_all_canonical_filter_families",
+        "tests/test_hsp08_durable_query.py::test_projection_filters_fail_explicitly_before_identity_or_journal_access",
+    ),
+    "sqlite-independence.json": (
+        "tests/test_hsp08_durable_query.py::test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes",
+    ),
+    "cursor-restart-hwm.json": (
+        "tests/test_hsp08_durable_query.py::test_fixed_hwm_cursor_resumes_after_append_and_full_restart_with_limit_change",
+    ),
+    "read-state-before.json": (
+        "tests/test_hsp08_durable_query.py::test_queries_and_replay_persist_no_server_read_state",
+    ),
+    "read-state-after.json": (
+        "tests/test_hsp08_durable_query.py::test_queries_and_replay_persist_no_server_read_state",
+    ),
+    "journal-snapshot-matrix.json": (
+        "tests/test_hsp20_durable_state.py::test_verified_snapshot_returns_exact_triplet_and_empty_read_creates_no_head",
+        "tests/test_hsp20_durable_state.py::test_verified_snapshot_reads_triplet_once_under_one_lock",
+        "tests/test_hsp20_durable_state.py::test_journal_operations_reject_noncanonical_sequence_scalars_without_changing_bytes",
+    ),
+    "recovery-vs-verification.json": (
+        "tests/test_hsp20_durable_state.py::test_verified_snapshot_is_non_repairing_and_explicit_reconcile_repairs_only_suffix",
+        "tests/test_hsp20_durable_state.py::test_verified_snapshot_tampering_fails_without_mutation",
+    ),
+    "fd-failure-path-matrix.json": (
+        "tests/test_hsp20_durable_state.py::test_verified_snapshot_unsafe_mode_failures_are_fd_flat_and_nonmutating",
+        "tests/test_hsp20_durable_state.py::test_journal_append_validation_failures_are_fd_flat_and_nonmutating",
+        "tests/test_hsp20_durable_state.py::test_procfs_fstat_failures_after_empty_path_fallback_are_fd_flat_and_nonmutating",
+        "tests/test_hsp20_verification.py::test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating",
+        "tests/test_hsp20_verification.py::test_hsp20_verify_store_closes_verifier_anchors_on_success_and_failure",
+    ),
+    "identity-mode-lock-path-report.json": (
+        "tests/test_hsp20_durable_state.py::test_service_identity_lifetime_lock_survives_process_boundary_and_releases_on_kill",
+        "tests/test_hsp20_durable_state.py::test_service_identity_exact_fd_procfs_fallback_uses_only_held_relative_dirfds",
+    ),
+    "identity-crash-matrix.json": (
+        "tests/test_hsp20_durable_state.py::test_service_identity_real_process_death_matrix",
+    ),
+    "identity-transition-report.json": (
+        "tests/test_hsp20_durable_state.py::test_service_identity_exact_fd_procfs_fallback_uses_only_held_relative_dirfds",
+    ),
+    "restore-portability-manifest.json": (
+        "tests/test_hsp20_durable_state.py::test_service_identity_relocation_preserves_identity_without_absolute_paths",
+    ),
+}
+assert set(_REPORT_NODE_BASES) == REPORTS
+
+
+_REBOUND_SOURCE = "HOUND_SLICE3A_REBOUND_SOURCE"
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _copy_and_rebind_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    source = Path(os.environ.get(_REBOUND_SOURCE, EVIDENCE))
+    if not source.is_dir() or {path.name for path in source.iterdir()} != LEAVES:
+        pytest.skip("complete Slice 3A candidate or retained E2 is required")
+    original_root = ROOT
+    original_commit = _git("rev-parse", "HEAD")
+    paths = source_paths(original_commit)
+    repository = tmp_path / "repo"
+    for relative in paths:
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original_root / relative, destination)
+    candidate = repository / "tests" / "evidence" / "candidate"
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, candidate)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Slice 3A checker"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "slice3a-checker@example.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "--", *paths], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Bind checker regression source"], cwd=repository, check=True)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repository, text=True).strip()
+
+    manifest = _load(candidate / "run-manifest.json")
+    manifest["reviewed"] = {"commit": commit, "tree": tree}
+    manifest["cwd"] = str(repository)
+    for suite in manifest["suites"].values():
+        suite["junit_command"]["argv"][5] = f"--junitxml={candidate / suite['junit_file']}"
+    manifest["sources"] = {}
+    for relative in paths:
+        raw = (repository / relative).read_bytes()
+        manifest["sources"][relative] = {
+            "blob": subprocess.check_output(
+                ["git", "rev-parse", f"{commit}:{relative}"], cwd=repository, text=True
+            ).strip(),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    for artifact in manifest["artifacts"].values():
+        artifact["source_paths"] = list(paths)
+    _write_json(candidate / "run-manifest.json", manifest)
+    _reseal_bundle(candidate, repository)
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", repository)
+    return candidate
+
+
+def _reseal_bundle(candidate: Path, repository: Path) -> None:
+    manifest = _load(candidate / "run-manifest.json")
+    for name, artifact in manifest["artifacts"].items():
+        artifact["sha256"] = _sha(candidate / name)
+    _write_json(candidate / "run-manifest.json", manifest)
+    bundle = _load(candidate / "bundle-source-digests.json")
+    for relative in tuple(bundle["files"]):
+        path = candidate / Path(relative).name if relative.startswith("tests/evidence/") else repository / relative
+        bundle["files"][relative] = _sha(path)
+    _write_json(candidate / "bundle-source-digests.json", bundle)
+
+
+def _tamper_report_nodes(candidate: Path, name: str, nodes: list[str], *, manifest_too: bool = True) -> None:
+    report = _load(candidate / name)
+    report["proving_node_ids"] = sorted(nodes)
+    _write_json(candidate / name, report)
+    if manifest_too:
+        manifest = _load(candidate / "run-manifest.json")
+        manifest["artifacts"][name]["proving_node_ids"] = sorted(nodes)
+        _write_json(candidate / "run-manifest.json", manifest)
+
+
+def _mutate_fd_report(candidate: Path, mutation: Callable[[dict[str, Any]], None]) -> None:
+    report = _load(candidate / "fd-failure-path-matrix.json")
+    mutation(report)
+    _write_json(candidate / "fd-failure-path-matrix.json", report)
 
 
 def source_paths(commit: str) -> tuple[str, ...]:
@@ -227,19 +359,112 @@ def _read_state_inventory(value: object) -> dict[str, Any]:
     return result
 
 
-def _report(evidence: Path, name: str, all_nodes: set[str]) -> dict[str, Any]:
+def _node_base(node: object) -> str:
+    assert type(node) is str
+    matched = re.fullmatch(r"(tests/[A-Za-z0-9_./-]+\.py::test_[A-Za-z0-9_]+)(?:\[.*\])?", node)
+    assert matched is not None
+    return matched.group(1)
+
+
+def _expected_report_nodes(focused_nodes: list[str]) -> dict[str, list[str]]:
+    expected: dict[str, list[str]] = {}
+    for report, bases in _REPORT_NODE_BASES.items():
+        selected = sorted(node for node in focused_nodes if _node_base(node) in bases)
+        assert {_node_base(node) for node in selected} == set(bases)
+        expected[report] = selected
+    return expected
+
+
+def _report(evidence: Path, name: str, expected_nodes: list[str]) -> dict[str, Any]:
     report = _load(evidence / name)
     _exact_keys(report, {"schema_version", "observations", "proving_node_ids"})
     assert report["schema_version"] == SCHEMA and type(report["observations"]) is dict
     proving = report["proving_node_ids"]
-    assert type(proving) is list and proving == sorted(set(proving)) and proving and all(type(node) is str and node in all_nodes for node in proving)
+    assert type(proving) is list and proving == expected_nodes
     return report
 
 
-def _require_nodes(report: dict[str, Any], *patterns: str) -> None:
-    proving = report["proving_node_ids"]
-    for pattern in patterns:
-        assert any(pattern in node for node in proving), f"missing proving node {pattern}"
+def _fd_descriptors(value: object) -> list[dict[str, Any]]:
+    assert type(value) is list
+    descriptors: list[dict[str, Any]] = []
+    for descriptor in value:
+        descriptor = _exact_keys(descriptor, {"fd", "target"})
+        _integer(descriptor["fd"])
+        assert type(descriptor["target"]) is str and descriptor["target"]
+        descriptors.append(descriptor)
+    assert [item["fd"] for item in descriptors] == sorted({item["fd"] for item in descriptors})
+    return descriptors
+
+
+def _outside_paths(value: object) -> list[str]:
+    assert type(value) is list and value
+    assert all(type(path) is str and path for path in value)
+    assert value == sorted(set(value))
+    return value
+
+
+def _outside_manifest(value: object) -> list[list[Any]]:
+    assert type(value) is list and value
+    paths: list[str] = []
+    for entry in value:
+        assert type(entry) is list and len(entry) == 12
+        path, kind, target, dev, ino, uid, gid, mode, size, mtime_ns, ctime_ns, digest = entry
+        assert type(path) is str and path
+        assert type(kind) is str and kind in {"directory", "file", "symlink"}
+        assert target is None if kind != "symlink" else type(target) is str
+        for field in (dev, ino, uid, gid, mode, size, mtime_ns, ctime_ns):
+            _integer(field)
+        if kind == "file":
+            _sha256(digest)
+        else:
+            assert digest is None
+        paths.append(path)
+    assert paths == sorted(set(paths)) and paths[0] == "."
+    return value
+
+
+def _fd_observations(value: object) -> None:
+    observations = _exact_keys(value, {"paths"})
+    rows = observations["paths"]
+    assert type(rows) is list and len(rows) == 6
+    expected = {
+        "anchored_read": (64, {"outside_before", "outside_after"}, "paths"),
+        "anchored_append": (64, {"outside_before", "outside_after"}, "paths"),
+        "verified_snapshot": (64, {"outside_before", "outside_after"}, "manifest"),
+        "direct_journal_append": (64, {"outside_before", "outside_after"}, "manifest"),
+        "procfs_fstat_eio": (64, {"outside_before", "outside_after"}, "manifest"),
+        "public_verified_snapshot": (5, {"result"}, "public"),
+    }
+    common = {
+        "path", "baseline", "after", "baseline_count", "after_count",
+        "retry_count", "fd_delta", "before_state", "after_state",
+    }
+    assert {row.get("path") for row in rows if type(row) is dict} == set(expected)
+    assert len({row["path"] for row in rows}) == len(rows)
+    for row in rows:
+        assert type(row) is dict and type(row.get("path")) is str
+        retry_count, extras, outside_kind = expected[row["path"]]
+        _exact_keys(row, common | extras)
+        for key in ("baseline_count", "after_count", "retry_count", "fd_delta"):
+            _integer(row[key])
+        assert row["retry_count"] == retry_count
+        baseline, after = _fd_descriptors(row["baseline"]), _fd_descriptors(row["after"])
+        assert row["baseline_count"] - len(baseline) == row["after_count"] - len(after) == 1
+        assert row["fd_delta"] == row["after_count"] - row["baseline_count"] == 0
+        assert len(after) == len(baseline) and baseline == after
+        assert row["before_state"] == row["after_state"]
+        _inventory(row["before_state"])
+        if outside_kind == "public":
+            assert row["result"] == "invalid" and type(row["result"]) is str
+            assert "outside_before" not in row and "outside_after" not in row
+        else:
+            outside_before, outside_after = row["outside_before"], row["outside_after"]
+            assert type(outside_before) is list and type(outside_after) is list
+            assert outside_before == outside_after
+            if outside_kind == "paths":
+                _outside_paths(outside_before)
+            else:
+                _outside_manifest(outside_before)
 
 
 def validate_bundle(evidence: Path = EVIDENCE) -> None:
@@ -280,7 +505,7 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         assert record["blob"] == _git("rev-parse", f"{reviewed['commit']}:{relative}") and record["sha256"] == hashlib.sha256(reviewed_bytes).hexdigest()
     suites = manifest["suites"]
     assert type(suites) is dict and set(suites) == set(SUITE_FILES)
-    all_nodes: set[str] = set()
+    suite_nodes: dict[str, list[str]] = {}
     for suite_name, files in SUITE_FILES.items():
         suite = _exact_keys(suites[suite_name], {"source_paths", "collect_command", "junit_command", "junit_file", "junit_sha256", "counts", "ordered_node_ids"})
         assert tuple(suite["source_paths"]) == files
@@ -294,7 +519,8 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         nodes, counts = _node_ids(evidence / suite["junit_file"])
         assert nodes == suite["ordered_node_ids"] and counts == suite["counts"] and all(type(value) is int for value in counts.values())
         assert counts["failures"] == counts["errors"] == counts["skipped"] == 0 and counts["tests"] == len(nodes)
-        all_nodes.update(nodes)
+        suite_nodes[suite_name] = nodes
+    expected_report_nodes = _expected_report_nodes(suite_nodes["focused"])
     artifacts = manifest["artifacts"]
     assert type(artifacts) is dict and set(artifacts) == REPORTS | JUNITS
     for name in REPORTS | JUNITS:
@@ -302,10 +528,16 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         assert artifact["sha256"] == _sha(evidence / name)
         assert artifact["producer_command"] in {"focused-junit", "compatibility-junit", "evidence-observer"}
         assert tuple(artifact["source_paths"]) == expected_sources
-        assert type(artifact["proving_node_ids"]) is list and artifact["proving_node_ids"] == sorted(set(artifact["proving_node_ids"])) and set(artifact["proving_node_ids"]) <= all_nodes
+        expected_nodes = (
+            sorted(suite_nodes["focused"])
+            if name == "slice3a-pytest.xml"
+            else sorted(suite_nodes["compatibility"])
+            if name == "compatibility-pytest.xml"
+            else expected_report_nodes[name]
+        )
+        assert artifact["proving_node_ids"] == expected_nodes
 
-    canonical = _report(evidence, "canonical-query-matrix.json", all_nodes)
-    _require_nodes(canonical, "test_durable_query_uses_exact_persisted_chain", "test_projection_filters_fail_explicitly")
+    canonical = _report(evidence, "canonical-query-matrix.json", expected_report_nodes["canonical-query-matrix.json"])
     requests = canonical["observations"].get("requests")
     unsupported = canonical["observations"].get("unsupported")
     assert type(requests) is list and len(requests) == 13 and all(type(item) is dict and type(item.get("filter")) is dict and type(item.get("ordered_entry_ids")) is list and item["ordered_entry_ids"] for item in requests)
@@ -315,24 +547,20 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         calls = item["class_hook_calls"]
         assert type(calls) is dict and calls == {"Journal.verified_snapshot": 0, "ServiceIdentity.lease": 0} and all(type(value) is int for value in calls.values())
 
-    sqlite = _report(evidence, "sqlite-independence.json", all_nodes)
-    _require_nodes(sqlite, "test_query_is_sqlite_independent")
+    sqlite = _report(evidence, "sqlite-independence.json", expected_report_nodes["sqlite-independence.json"])
     _sqlite_observations(sqlite["observations"])
 
-    cursor = _report(evidence, "cursor-restart-hwm.json", all_nodes)
-    _require_nodes(cursor, "test_fixed_hwm_cursor_resumes")
+    cursor = _report(evidence, "cursor-restart-hwm.json", expected_report_nodes["cursor-restart-hwm.json"])
     assert type(cursor["observations"].get("resumed_ids")) is list and cursor["observations"]["terminal_cursor"] is None
 
-    before = _report(evidence, "read-state-before.json", all_nodes)
-    after = _report(evidence, "read-state-after.json", all_nodes)
-    _require_nodes(before, "test_queries_and_replay_persist_no_server_read_state")
+    before = _report(evidence, "read-state-before.json", expected_report_nodes["read-state-before.json"])
+    after = _report(evidence, "read-state-after.json", expected_report_nodes["read-state-after.json"])
     assert before["observations"] == after["observations"] and before["proving_node_ids"] == after["proving_node_ids"]
     state = before["observations"]
     assert state["before"] == state["after"] and state["forbidden_matches"] == [] and state["operations"]
     _read_state_inventory(state["before"])
 
-    journal = _report(evidence, "journal-snapshot-matrix.json", all_nodes)
-    _require_nodes(journal, "test_verified_snapshot_returns_exact_triplet", "test_journal_operations_reject_noncanonical_sequence_scalars")
+    journal = _report(evidence, "journal-snapshot-matrix.json", expected_report_nodes["journal-snapshot-matrix.json"])
     scalar = journal["observations"].get("scalars")
     assert type(scalar) is list and len(scalar) == 24
     typed_values = ((bool, False, "bool"), (bool, True, "bool"), (float, 0.0, "float"), (float, 1.0, "float"))
@@ -345,37 +573,19 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         cases.add((item["operation"], item["target"], type(item["scalar"]), item["scalar"], item["scalar_type"]))
         assert item["before"] == item["after"] and item["result"] == "JournalError"
     assert cases == expected_cases
-    recovery = _report(evidence, "recovery-vs-verification.json", all_nodes)
-    _require_nodes(recovery, "test_verified_snapshot_is_non_repairing", "test_verified_snapshot_tampering")
+    recovery = _report(evidence, "recovery-vs-verification.json", expected_report_nodes["recovery-vs-verification.json"])
     assert recovery["observations"].get("reconcile") and len(recovery["observations"].get("tamper", [])) == 17
 
-    fd = _report(evidence, "fd-failure-path-matrix.json", all_nodes)
-    _require_nodes(fd, "anchored_leaf_validation", "unsafe_mode_failures", "procfs_fstat")
-    paths = fd["observations"].get("paths")
-    assert type(paths) is list and {item["path"] for item in paths} >= {"anchored_read", "anchored_append", "verified_snapshot", "direct_journal_append", "public_verified_snapshot", "procfs_fstat_eio"}
-    for item in paths:
-        assert all(type(item[key]) is int for key in ("baseline_count", "after_count", "retry_count", "fd_delta"))
-        assert type(item["baseline"]) is list and type(item["after"]) is list
-        for inventory in (item["baseline"], item["after"]):
-            for descriptor in inventory:
-                descriptor = _exact_keys(descriptor, {"fd", "target"})
-                _integer(descriptor["fd"])
-                assert type(descriptor["target"]) is str and descriptor["target"]
-        assert item["baseline_count"] - len(item["baseline"]) == item["after_count"] - len(item["after"]) == 1
-        assert item["fd_delta"] == item["after_count"] - item["baseline_count"] == 0
-        assert len(item["after"]) - len(item["baseline"]) == 0 and item["before_state"] == item["after_state"]
-        _inventory(item["before_state"])
+    fd = _report(evidence, "fd-failure-path-matrix.json", expected_report_nodes["fd-failure-path-matrix.json"])
+    _fd_observations(fd["observations"])
 
-    identity = _report(evidence, "identity-mode-lock-path-report.json", all_nodes)
-    _require_nodes(identity, "lifetime_lock", "exact_fd_procfs_fallback")
+    identity = _report(evidence, "identity-mode-lock-path-report.json", expected_report_nodes["identity-mode-lock-path-report.json"])
     assert identity["observations"].get("lifetime") and len(identity["observations"].get("procfs", [])) == 2
-    crash = _report(evidence, "identity-crash-matrix.json", all_nodes)
-    _require_nodes(crash, "real_process_death_matrix")
+    crash = _report(evidence, "identity-crash-matrix.json", expected_report_nodes["identity-crash-matrix.json"])
     assert type(crash["observations"].get("matrix")) is list and crash["observations"]["matrix"] and all(item["child_exit"] == 77 for item in crash["observations"]["matrix"])
-    transition = _report(evidence, "identity-transition-report.json", all_nodes)
+    transition = _report(evidence, "identity-transition-report.json", expected_report_nodes["identity-transition-report.json"])
     assert transition["observations"].get("procfs")
-    portability = _report(evidence, "restore-portability-manifest.json", all_nodes)
-    _require_nodes(portability, "relocation_preserves_identity")
+    portability = _report(evidence, "restore-portability-manifest.json", expected_report_nodes["restore-portability-manifest.json"])
     assert portability["observations"].get("states_equal") is True
 
     bundle = _load(evidence / "bundle-source-digests.json")
@@ -412,3 +622,108 @@ def test_inventory_allows_real_singleton_but_read_state_rejects_singletons_and_s
         _read_state_inventory(singleton)
     with pytest.raises(AssertionError):
         _read_state_inventory({**singleton, "root": "synthetic-read-state"})
+
+
+def test_rebound_slice3a_bundle_passes_without_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    validate_bundle(candidate)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unrelated_proving_node",
+        "append_node_substitution",
+        "report_manifest_node_mismatch",
+        "forged_outside_after",
+        "missing_outside",
+        "wrong_type_outside",
+        "retry_count_one",
+        "retry_count_bool",
+        "retry_count_float",
+        "extra_fd_path",
+        "missing_fd_path",
+        "extra_fd_row_key",
+        "boolean_fd_delta",
+        "mutated_after_state",
+        "nested_extra_file",
+        "changed_commit_binding",
+        "changed_tree_binding",
+    ],
+)
+def test_rebound_slice3a_bundle_rejects_resealed_provenance_and_fd_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    manifest = _load(candidate / "run-manifest.json")
+    unrelated = next(
+        node
+        for node in manifest["suites"]["focused"]["ordered_node_ids"]
+        if "test_query_is_sqlite_independent" in node
+    )
+
+    if case == "unrelated_proving_node":
+        report = _load(candidate / "cursor-restart-hwm.json")
+        _tamper_report_nodes(candidate, "cursor-restart-hwm.json", [*report["proving_node_ids"], unrelated])
+    elif case == "append_node_substitution":
+        report = _load(candidate / "fd-failure-path-matrix.json")
+        nodes = [unrelated if "anchored_leaf_validation" in node and "[append]" in node else node for node in report["proving_node_ids"]]
+        _tamper_report_nodes(candidate, "fd-failure-path-matrix.json", nodes)
+    elif case == "report_manifest_node_mismatch":
+        report = _load(candidate / "cursor-restart-hwm.json")
+        _tamper_report_nodes(candidate, "cursor-restart-hwm.json", [*report["proving_node_ids"], unrelated], manifest_too=False)
+    elif case == "forged_outside_after":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("outside_after", ["forged"]))
+    elif case == "missing_outside":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "verified_snapshot").pop("outside_after"))
+    elif case == "wrong_type_outside":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "procfs_fstat_eio").__setitem__("outside_before", "forged"))
+    elif case == "retry_count_one":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("retry_count", 1))
+    elif case == "retry_count_bool":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("retry_count", True))
+    elif case == "retry_count_float":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("retry_count", 64.0))
+    elif case == "extra_fd_path":
+        def add_path(report: dict[str, Any]) -> None:
+            extra = dict(_fd_path(report, "anchored_read"))
+            extra["path"] = "extra"
+            report["observations"]["paths"].append(extra)
+        _mutate_fd_report(candidate, add_path)
+    elif case == "missing_fd_path":
+        _mutate_fd_report(candidate, lambda report: report["observations"]["paths"].remove(_fd_path(report, "anchored_append")))
+    elif case == "extra_fd_row_key":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("extra", "forged"))
+    elif case == "boolean_fd_delta":
+        _mutate_fd_report(candidate, lambda report: _fd_path(report, "anchored_read").__setitem__("fd_delta", False))
+    elif case == "mutated_after_state":
+        def mutate_state(report: dict[str, Any]) -> None:
+            state = _fd_path(report, "anchored_read")["after_state"]
+            state["entries"][0]["size"] += 1
+        _mutate_fd_report(candidate, mutate_state)
+    elif case == "nested_extra_file":
+        extra = candidate / "nested" / "extra.json"
+        extra.parent.mkdir()
+        extra.write_text("{}\n", encoding="utf-8")
+    elif case == "changed_commit_binding":
+        manifest["reviewed"]["commit"] = "f" * 40
+        _write_json(candidate / "run-manifest.json", manifest)
+    elif case == "changed_tree_binding":
+        manifest["reviewed"]["tree"] = "f" * 40
+        _write_json(candidate / "run-manifest.json", manifest)
+    else:  # pragma: no cover - parameter guard
+        raise AssertionError(case)
+
+    _reseal_bundle(candidate, repository)
+    with pytest.raises((AssertionError, subprocess.CalledProcessError)):
+        validate_bundle(candidate)
+
+
+def _fd_path(report: dict[str, Any], path: str) -> dict[str, Any]:
+    return next(row for row in report["observations"]["paths"] if row["path"] == path)
