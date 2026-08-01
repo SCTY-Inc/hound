@@ -18,21 +18,27 @@ promise automatic rollback.
 
 Persistent service identity is certified only on a local Linux filesystem with
 owner-only directories and cooperative same-UID processes. Identity loads wait
-for mandatory startup recovery to complete. Publication uses exact-held-FD
-linking only: either `linkat(source_fd, "", service_fd, destination,
-AT_EMPTY_PATH)` or the procfs fallback `linkat(proc_self_fd_dir, "<fd>",
-service_fd, destination, AT_SYMLINK_FOLLOW)` against a private owner-held FD.
-The resulting destination must match exact inode, content, mode, and link-count
-postconditions, and if direct linking is unavailable, procfs is required. Hard
-links, `renameat2(RENAME_EXCHANGE)`, `renameat2(RENAME_NOREPLACE)`,
-directory `fsync`, and lifetime `flock` are required; missing primitives and
-remote/NFS filesystems fail unavailable. No named-temp fallback is allowed.
-Only `identity.json` is canonical. Temporary old/new witnesses may exist during
-recovery, and only clean/quiescent copy relocation is supported. Lasting
-replacements are preserved in evidence and rejected as canonical. Cooperative
-same UID excludes fully restored swaps, in-place forgery, and the final
-validation-to-unlink race; hostile same UID requires a distinct UID and no
-quarantine auto-unlink.
+for mandatory startup recovery to complete. New identity bytes must originate
+in a validated, fsynced `O_TMPFILE` opened without `O_EXCL`. Publication uses
+exact-held-FD linking only: either `linkat(source_fd, "", service_fd,
+destination, AT_EMPTY_PATH)` or the procfs fallback
+`linkat(proc_self_fd_dir, "<fd>", service_fd, destination, AT_SYMLINK_FOLLOW)`.
+The procfs fallback is permitted only while the private source FD is held by its
+owning process, its numeric proc entry resolves to the expected inode, and store
+paths remain no-follow; procfs magic-link following is the sole exception. The
+resulting destination must match exact inode, content, mode, and link-count
+postconditions, and if direct linking is unavailable, procfs is required.
+Hard links, `renameat2(RENAME_EXCHANGE)`, `renameat2(RENAME_NOREPLACE)`, and
+directory `fsync` are publication primitives required when publication or
+recovery exercises them; they are not preflighted for a clean read-only
+identity load. Lifetime `flock` is required. Missing required primitives fail
+unavailable; uncertified remote/NFS filesystems are outside the claim. No
+named-temp fallback is allowed. Only `identity.json` is canonical. Temporary
+old/new witnesses may exist during recovery, and only clean/quiescent copy
+relocation is supported. Lasting observable namespace replacements are
+preserved in evidence and rejected as canonical. Cooperative same UID excludes
+fully restored swaps, in-place forgery, and the final validation-to-unlink race;
+hostile same UID requires a distinct UID and no quarantine auto-unlink.
 
 ## Plan and execution binding
 
