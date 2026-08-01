@@ -7,7 +7,7 @@ import hmac
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any
 
@@ -122,13 +122,18 @@ class JournalQuerySnapshot:
                 raw_candidates = tuple(recovery)
             except TypeError as error:
                 raise QuerySnapshotError("cursor recovery candidates must be iterable") from error
-        if any(not isinstance(candidate, JournalCursorCandidate) for candidate in raw_candidates):
+        if any(type(candidate) is not JournalCursorCandidate for candidate in raw_candidates):
             raise QuerySnapshotError("cursor recovery snapshot contains an invalid candidate")
         if any(
-            not _is_sha256(candidate.entry_id) or not _is_sha256(candidate.chain_sha256)
+            type(candidate.sequence) is not int
+            or candidate.sequence < 0
+            or not _is_sha256(candidate.entry_id)
+            or type(candidate.appended_at) is not datetime
+            or candidate.appended_at.tzinfo is not timezone.utc
+            or not _is_sha256(candidate.chain_sha256)
             for candidate in raw_candidates
         ):
-            raise QuerySnapshotError("cursor recovery candidate identity is invalid")
+            raise QuerySnapshotError("cursor recovery candidate scalars are invalid")
 
         events = tuple(sorted(copied_events, key=lambda event: event["sequence"]))
         candidates = tuple(sorted(raw_candidates, key=lambda candidate: candidate.sequence))

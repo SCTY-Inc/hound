@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 
 import pytest
 
@@ -39,6 +40,29 @@ class _EqualitySpoofingString(str):
         return False
 
     __hash__ = str.__hash__
+
+
+class _EqualitySpoofingInt(int):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+class _EqualitySpoofingDatetime(datetime):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def isoformat(self, sep: str = "T", timespec: str = "auto") -> str:
+        return "2026-07-31T00:00:00+00:00"
+
+
+class _JournalCursorCandidateSubclass(JournalCursorCandidate):
+    pass
 
 
 def _event(sequence: int, when: str) -> dict[str, object]:
@@ -143,18 +167,31 @@ def test_hsp20_snapshot_rejects_gaps_duplicates_divergence_and_tampering(case: s
         JournalQuerySnapshot(events, recovery)
 
 
-def test_hsp20_snapshot_rejects_a_candidate_str_subclass_before_identity_comparison() -> None:
+def test_hsp20_snapshot_rejects_spoofed_datetime_mismatch_and_candidate_subclasses() -> None:
     event = _event(0, "2026-07-31T00:00:00Z")
     trusted_candidate = _recovery([event]).candidates[0]
-    hostile_candidate = JournalCursorCandidate(
-        0,
-        _EqualitySpoofingString(_digest("different-entry")),
-        event["appended_at"],
-        trusted_candidate.chain_sha256,
+    hostile_candidates = []
+    for field, value in (
+        ("appended_at", _EqualitySpoofingDatetime(2035, 1, 1, tzinfo=timezone.utc)),
+        ("sequence", _EqualitySpoofingInt(0)),
+        ("entry_id", _EqualitySpoofingString(_digest("different-entry"))),
+        ("chain_sha256", _EqualitySpoofingString(trusted_candidate.chain_sha256)),
+    ):
+        candidate = _recovery([event]).candidates[0]
+        object.__setattr__(candidate, field, value)
+        hostile_candidates.append(candidate)
+    hostile_candidates.append(
+        _JournalCursorCandidateSubclass(
+            trusted_candidate.sequence,
+            trusted_candidate.entry_id,
+            trusted_candidate.appended_at,
+            trusted_candidate.chain_sha256,
+        )
     )
 
-    with pytest.raises(QuerySnapshotError):
-        JournalQuerySnapshot([event], (hostile_candidate,))
+    for candidate in hostile_candidates:
+        with pytest.raises(QuerySnapshotError):
+            JournalQuerySnapshot([event], (candidate,))
 
 
 def test_hsp20_equivalent_rebuilt_snapshots_have_identical_manifests_and_semantic_cursor_recovery(tmp_path) -> None:

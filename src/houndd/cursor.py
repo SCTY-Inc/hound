@@ -75,18 +75,18 @@ def _kid(value: object) -> str:
 
 
 def _sequence(value: object, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise ValueError(f"{label} must be a non-negative integer")
     return value
 
 
 def _utc_instant(value: object) -> datetime:
-    if isinstance(value, str):
+    if type(value) is str:
         try:
             return parse_utc_instant(value, "appended_at")
         except ValueError as error:
             raise ValueError("appended_at must be an aware ISO-8601 timestamp") from error
-    if not isinstance(value, datetime):
+    if type(value) is not datetime:
         raise ValueError("appended_at must be an ISO-8601 timestamp")
     try:
         if value.tzinfo is None or value.utcoffset() is None:
@@ -165,6 +165,8 @@ class JournalCursorCandidate:
     chain_sha256: str
 
     def __post_init__(self) -> None:
+        if type(self.entry_id) is not str or type(self.chain_sha256) is not str:
+            raise ValueError("candidate entry ID and chain hash must be exact strings")
         object.__setattr__(self, "sequence", _sequence(self.sequence, "candidate sequence"))
         object.__setattr__(self, "entry_id", _hash(self.entry_id, "candidate entry ID"))
         object.__setattr__(self, "appended_at", _utc_instant(self.appended_at))

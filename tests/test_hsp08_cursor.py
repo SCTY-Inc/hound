@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -19,6 +19,25 @@ from houndd.cursor import (
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _EqualitySpoofingDatetime(datetime):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def isoformat(self, sep: str = "T", timespec: str = "auto") -> str:
+        return "2026-07-31T00:00:00+00:00"
 
 
 def _candidate(
@@ -179,9 +198,28 @@ def test_hsp08_equal_instants_with_different_offsets_commit_identically(
 
     first = codec.issue(bindings, last=offset_last, high_watermark=offset_hwm)
     second = codec.issue(bindings, last=utc_last, high_watermark=utc_hwm)
+    datetime_candidate = JournalCursorCandidate(
+        0,
+        _digest("base-datetime-entry"),
+        datetime(
+            2026,
+            7,
+            31,
+            5,
+            45,
+            tzinfo=timezone(timedelta(hours=5, minutes=45)),
+        ),
+        _digest("base-datetime-chain"),
+    )
 
     assert first == second
     assert offset_last.appended_at == datetime(2026, 7, 31, tzinfo=timezone.utc)
+    assert type(datetime_candidate.sequence) is int
+    assert type(datetime_candidate.entry_id) is str
+    assert type(datetime_candidate.appended_at) is datetime
+    assert datetime_candidate.appended_at == datetime(2026, 7, 31, tzinfo=timezone.utc)
+    assert datetime_candidate.appended_at.tzinfo is timezone.utc
+    assert type(datetime_candidate.chain_sha256) is str
 
 
 def test_hsp08_recovery_uses_full_chronological_tuple_not_sequence_order(
@@ -492,3 +530,23 @@ def test_hsp08_nonce_source_must_return_exactly_16_bytes(
 def test_hsp08_candidate_contract_is_strict(kwargs) -> None:
     with pytest.raises(ValueError):
         JournalCursorCandidate(**kwargs)
+
+
+def test_hsp08_candidate_rejects_scalar_subclasses() -> None:
+    valid = {
+        "sequence": 0,
+        "appended_at": "2026-07-31T00:00:00Z",
+        "entry_id": _digest("entry"),
+        "chain_sha256": _digest("chain"),
+    }
+    hostile_values = (
+        ("sequence", _IntSubclass(0)),
+        ("appended_at", _StringSubclass("2026-07-31T00:00:00Z")),
+        ("entry_id", _StringSubclass(_digest("entry"))),
+        ("chain_sha256", _StringSubclass(_digest("chain"))),
+        ("appended_at", _EqualitySpoofingDatetime(2035, 1, 1, tzinfo=timezone.utc)),
+    )
+
+    for field, value in hostile_values:
+        with pytest.raises(ValueError):
+            JournalCursorCandidate(**(valid | {field: value}))
