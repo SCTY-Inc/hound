@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -24,6 +25,15 @@ class JournalError(StoreError):
 
 
 FaultHook = Callable[[str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedJournalSnapshot:
+    """Exact persisted journal rows captured at one lock linearization point."""
+
+    event_rows: tuple[bytes, ...]
+    chain_rows: tuple[bytes, ...]
+    head_bytes: bytes | None
 
 
 def _private_directory(path: Path, *, create: bool = True) -> None:
@@ -116,6 +126,21 @@ class Journal:
             raise JournalError(f"cannot read journal file {self.chain_path}") from error
         return self._read_lines_from_raw(self.chain_path, raw)
 
+    def _persisted_bytes_unlocked(self) -> tuple[bytes, bytes, bytes | None]:
+        """Read events, chain, and head exactly once in canonical order."""
+
+        try:
+            events_raw = self.anchor.read_bytes("journal", "events.jsonl")
+            chains_raw = self.anchor.read_bytes("journal", "chain.jsonl")
+            head_raw = (
+                self.anchor.read_bytes("journal", "head.json")
+                if self.anchor.exists("journal", "head.json")
+                else None
+            )
+        except (OSError, StoreError) as error:
+            raise JournalError("cannot read persisted journal snapshot") from error
+        return events_raw, chains_raw, head_raw
+
     @staticmethod
     def _read_lines_from_raw(path: Path, raw: bytes) -> list[dict[str, Any]]:
         if raw and not raw.endswith(b"\n"):
@@ -130,7 +155,11 @@ class Journal:
                 raise JournalError(f"journal file {path} has invalid JSON") from error
             if not isinstance(value, dict):
                 raise JournalError(f"journal file {path} contains a non-object")
-            if canonical_bytes(value) != line:
+            try:
+                canonical = canonical_bytes(value)
+            except ValueError as error:
+                raise JournalError(f"journal file {path} contains non-canonical JSON") from error
+            if canonical != line:
                 raise JournalError(f"journal file {path} contains non-canonical JSON")
             result.append(value)
         return result
@@ -145,45 +174,150 @@ class Journal:
         }
         return {**body, "chain_sha256": canonical_hash(body)}
 
+    @staticmethod
+    def _head_from_raw(raw: bytes) -> dict[str, Any]:
+        try:
+            import json
+
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise JournalError("journal head is unreadable") from error
+        try:
+            canonical = canonical_bytes(value) if isinstance(value, dict) else None
+        except ValueError as error:
+            raise JournalError("journal head is not canonical JSON") from error
+        if canonical != raw:
+            raise JournalError("journal head is not canonical JSON")
+        if set(value) != {"sequence", "chain_sha256", "entry_id"}:
+            raise JournalError("journal head has invalid fields")
+        return value
+
+    @classmethod
+    def _validate_persisted_values(
+        cls,
+        events: list[dict[str, Any]],
+        chains: list[dict[str, Any]],
+        head_raw: bytes | None,
+    ) -> None:
+        if len(chains) != len(events):
+            if len(chains) < len(events):
+                raise JournalError("journal chain is incomplete")
+            raise JournalError("journal chain has entries without events")
+
+        previous = "0" * 64
+        seen_entry_ids: set[str] = set()
+        seen_event_hashes: set[str] = set()
+        seen_chain_hashes: set[str] = set()
+        for expected_sequence, (event, chain) in enumerate(zip(events, chains, strict=True)):
+            entry_id = event["entry_id"]
+            event_hash = hashlib.sha256(canonical_bytes(event)).hexdigest()
+            if event["sequence"] != expected_sequence or entry_id in seen_entry_ids or event_hash in seen_event_hashes:
+                raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
+            expected_chain = cls._chain_value(event, previous)
+            if chain != expected_chain or expected_chain["chain_sha256"] in seen_chain_hashes:
+                raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
+            seen_entry_ids.add(entry_id)
+            seen_event_hashes.add(event_hash)
+            seen_chain_hashes.add(expected_chain["chain_sha256"])
+            previous = expected_chain["chain_sha256"]
+
+        if events:
+            expected_head = {
+                "sequence": events[-1]["sequence"],
+                "chain_sha256": previous,
+                "entry_id": events[-1]["entry_id"],
+            }
+            if head_raw is None:
+                raise JournalError("journal head is missing")
+            if cls._head_from_raw(head_raw) != expected_head:
+                raise JournalError("journal head does not match journal chain")
+            return
+
+        if head_raw is not None:
+            empty_head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
+            if cls._head_from_raw(head_raw) != empty_head:
+                raise JournalError("empty journal head is invalid")
+
+    def verified_snapshot(self) -> PersistedJournalSnapshot:
+        """Read and verify persisted journal truth without repairing or writing."""
+
+        with self._lock():
+            events_raw, chains_raw, head_raw = self._persisted_bytes_unlocked()
+            event_values = self._read_lines_from_raw(self.events_path, events_raw)
+            chain_values = self._read_lines_from_raw(self.chain_path, chains_raw)
+            try:
+                events = [validate_journal_envelope(value) for value in event_values]
+            except ValueError as error:
+                raise JournalError(f"journal envelope is invalid: {error}") from error
+            self._validate_persisted_values(events, chain_values, head_raw)
+            return PersistedJournalSnapshot(
+                tuple(events_raw.splitlines(keepends=True)),
+                tuple(chains_raw.splitlines(keepends=True)),
+                head_raw,
+            )
+
     def _validate_chain_unlocked(self, *, repair_missing: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         events = self._event_values_unlocked()
-        chains = self._chain_values_unlocked()
-        if len(chains) > len(events):
+        persisted_chains = self._chain_values_unlocked()
+        if len(persisted_chains) > len(events):
             raise JournalError("journal chain has entries without events")
-        if len(chains) < len(events) and not repair_missing:
+        if len(persisted_chains) < len(events) and not repair_missing:
             raise JournalError("journal chain is incomplete")
         previous = "0" * 64
+        seen_entry_ids: set[str] = set()
+        seen_event_hashes: set[str] = set()
+        seen_chain_hashes: set[str] = set()
+        expected_chains: list[dict[str, Any]] = []
         for index, event in enumerate(events):
+            event_hash = hashlib.sha256(canonical_bytes(event)).hexdigest()
+            if event["sequence"] != index or event["entry_id"] in seen_entry_ids or event_hash in seen_event_hashes:
+                raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
             expected = self._chain_value(event, previous)
-            if index < len(chains):
-                if chains[index] != expected:
+            if index < len(persisted_chains):
+                if persisted_chains[index] != expected:
                     raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
-            else:
-                self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(expected) + b"\n")
-                chains.append(expected)
+            if expected["chain_sha256"] in seen_chain_hashes:
+                raise JournalError("journal chain hashes are not unique")
+            expected_chains.append(expected)
+            seen_entry_ids.add(event["entry_id"])
+            seen_event_hashes.add(event_hash)
+            seen_chain_hashes.add(expected["chain_sha256"])
             previous = expected["chain_sha256"]
         if events:
             head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
         else:
             head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
+        head_needs_repair = False
         if self.anchor.exists("journal", "head.json"):
             try:
-                import json
+                raw_head = self.anchor.read_bytes("journal", "head.json")
+                if repair_missing:
+                    import json
 
-                persisted = json.loads(self.anchor.read_bytes("journal", "head.json").decode("utf-8"))
-            except (OSError, UnicodeError, ValueError) as error:
+                    persisted = json.loads(raw_head.decode("utf-8"))
+                    if not isinstance(persisted, dict) or set(persisted) != {"sequence", "chain_sha256", "entry_id"}:
+                        raise JournalError("journal head has invalid fields")
+                else:
+                    persisted = self._head_from_raw(raw_head)
+            except (OSError, StoreError, UnicodeError, ValueError) as error:
                 raise JournalError("journal head is unreadable") from error
-            if persisted != head:
-                if not repair_missing:
-                    raise JournalError("journal head does not match journal chain")
-                _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
+            if persisted != head and not repair_missing:
+                raise JournalError("journal head does not match journal chain")
+            head_needs_repair = repair_missing and raw_head != canonical_bytes(head)
         elif events:
             if not repair_missing:
                 raise JournalError("journal head is missing")
+            head_needs_repair = True
+        elif repair_missing:
+            head_needs_repair = True
+
+        # No persistent repair begins until every existing event, chain row,
+        # and head has proved either valid or an accepted stale/missing suffix.
+        for expected in expected_chains[len(persisted_chains) :]:
+            self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(expected) + b"\n")
+        if head_needs_repair:
             _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
-        else:
-            _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
-        return events, chains
+        return events, expected_chains
 
     def reconcile(self) -> dict[str, Any]:
         """Repair only crash-left chain/head suffixes; reject content tampering."""
@@ -251,4 +385,4 @@ class Journal:
         return events[-1]["sequence"] if events else -1
 
 
-__all__ = ["FaultHook", "Journal", "JournalError"]
+__all__ = ["FaultHook", "Journal", "JournalError", "PersistedJournalSnapshot"]

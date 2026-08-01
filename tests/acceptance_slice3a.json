@@ -1,0 +1,96 @@
+{
+  "schema_version": "houndd.slice3a.acceptance.v1",
+  "slice": "3A",
+  "status": "partial_hsp_coverage",
+  "partial_hsps": [
+    "HSP-08",
+    "HSP-20",
+    "HSP-21"
+  ],
+  "regression_only_hsps": [
+    "HSP-02",
+    "HSP-04",
+    "HSP-05",
+    "HSP-07",
+    "HSP-14",
+    "HSP-19"
+  ],
+  "no_new_claim_hsps": [
+    "HSP-03",
+    "HSP-09"
+  ],
+  "artifacts": {
+    "src/houndd/journal.py": "HSP-20",
+    "src/houndd/service_identity.py": "HSP-20",
+    "src/houndd/snapshot.py": "HSP-08",
+    "tests/test_hsp20_durable_state.py": "HSP-20",
+    "tests/test_hsp08_durable_query.py": "HSP-08",
+    "tests/acceptance_slice3a.json": "HSP-21"
+  },
+  "coverage": {
+    "HSP-08": {
+      "status": "partial",
+      "fixture": "persisted canonical journal with fixed-HWM cursor restart, projection-filter negatives, disposable SQLite, and relocated identity",
+      "tests": [
+        "tests/test_hsp08_durable_query.py"
+      ],
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp08_durable_query.py",
+      "expected_assertions": [
+        "canonical filters use verified persisted journal bytes in chronological order",
+        "lane, topic, and entity fail with filter_not_available before evaluation",
+        "deleted or corrupt SQLite is neither opened nor rebuilt",
+        "cursor restart preserves its original high-watermark and persists no read state"
+      ],
+      "retained_artifacts": [
+        "src/houndd/snapshot.py",
+        "tests/test_hsp08_durable_query.py"
+      ],
+      "deferred": [
+        "durable lane, topic, and entity provenance",
+        "daemon, Unix-socket API, CLI, streaming, and consumer integration"
+      ]
+    },
+    "HSP-20": {
+      "status": "partial",
+      "fixture": "persisted journal triplet plus one private atomic service identity under crash, lock, permission, symlink, restart, and relocation matrices",
+      "tests": [
+        "tests/test_hsp20_durable_state.py"
+      ],
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp20_durable_state.py",
+      "expected_assertions": [
+        "snapshot holds one journal lock and never mixes append state",
+        "request verification never repairs chain or head while explicit reconcile repairs accepted suffix loss",
+        "identity transitions leave absent, old, or new complete canonical state at every injected crash point",
+        "generation and complete cursor keyring survive restart and relocation without absolute-path identity"
+      ],
+      "retained_artifacts": [
+        "src/houndd/journal.py",
+        "src/houndd/service_identity.py",
+        "tests/test_hsp20_durable_state.py"
+      ],
+      "deferred": [
+        "transport readiness and daemon recovery loop",
+        "durable access policy and provenance",
+        "privileged deployment and physical power-loss certification"
+      ]
+    },
+    "HSP-21": {
+      "status": "partial",
+      "fixture": "Slice 3A artifact-to-claim and executable-evidence manifest",
+      "tests": [
+        "tests/acceptance_slice3a.json"
+      ],
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp08_durable_query.py tests/test_hsp20_durable_state.py",
+      "expected_assertions": [
+        "every Slice 3A implementation and test artifact maps to exactly one partial HSP claim",
+        "HSP-03 and HSP-09 are explicitly unclaimed"
+      ],
+      "retained_artifacts": [
+        "tests/acceptance_slice3a.json"
+      ],
+      "deferred": [
+        "whole 22-row completion manifest and global acceptance checker"
+      ]
+    }
+  }
+}
