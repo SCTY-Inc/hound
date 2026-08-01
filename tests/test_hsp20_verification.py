@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.slice3a_evidence_capture import capture as _capture_evidence, descriptor_inventory as _fd_inventory, inventory as _capture_inventory
+
 from houndd import (
     HounddStore,
     Journal,
@@ -580,6 +582,8 @@ def test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating(
             _tree_snapshot(outside),
             outside_sentinel.read_bytes(),
         )
+        fd_baseline = _fd_inventory()
+        state_baseline = _capture_inventory(root)
 
         for _ in range(64):
             with pytest.raises(UnsafeStoreError, match="has group/world permissions") as caught:
@@ -606,6 +610,7 @@ def test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating(
         assert _fd_count() == success_baseline
         assert _tree_snapshot(outside) == before[4]
         assert outside_sentinel.read_bytes() == before[5]
+        _capture_evidence("fd_failure", {"path": f"anchored_{operation}", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": _fd_count(), "retry_count": 64, "fd_delta": _fd_count() - baseline, "before_state": state_baseline, "after_state": _capture_inventory(root), "outside_before": before[4], "outside_after": _tree_snapshot(outside)})
     finally:
         anchor.close()
 
@@ -857,10 +862,13 @@ def test_hsp20_verify_store_closes_verifier_anchors_on_success_and_failure(tmp_p
 
     store.journal.directory.chmod(0o755)
     failure_baseline = _fd_count()
+    fd_baseline = _fd_inventory()
+    state_baseline = _capture_inventory(store.root)
     for _ in range(5):
         report = verify_store(store.root)
         assert report["valid"] is False
         assert _fd_count() == failure_baseline
+    _capture_evidence("fd_failure", {"path": "public_verified_snapshot", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": failure_baseline, "after_count": _fd_count(), "retry_count": 5, "fd_delta": _fd_count() - failure_baseline, "before_state": state_baseline, "after_state": _capture_inventory(store.root), "result": "invalid"})
 
 
 @pytest.mark.parametrize(

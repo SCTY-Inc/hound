@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.slice3a_evidence_capture import capture as _capture_evidence, descriptor_inventory as _fd_inventory, inventory as _capture_inventory
+
 from houndd.contracts import canonical_bytes, canonical_hash, make_journal_envelope
 from houndd.journal import Journal, JournalError, PersistedJournalSnapshot
 from houndd.query_engine import QuerySnapshotError
@@ -142,6 +144,7 @@ def test_verified_snapshot_returns_exact_triplet_and_empty_read_creates_no_head(
     assert persisted == PersistedJournalSnapshot((), (), empty_head)
     assert build_journal_query_snapshot(persisted).events == ()
     assert _manifest(sentinel_root) == sentinel_before
+    _capture_evidence("journal_snapshot", {"triplet": {"event_rows": [row.hex() for row in snapshot.event_rows], "chain_rows": [row.hex() for row in snapshot.chain_rows], "head_bytes": snapshot.head_bytes.hex() if snapshot.head_bytes else None}, "before": before, "after": _manifest(root), "empty_before": empty_before, "empty_after": _manifest(empty_root)})
 
 
 def test_verified_snapshot_reads_triplet_once_under_one_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,6 +188,7 @@ def test_verified_snapshot_reads_triplet_once_under_one_lock(tmp_path: Path, mon
     ]
     assert len(snapshot.event_rows) == len(snapshot.chain_rows) == 3
     assert _manifest(root) == before
+    _capture_evidence("journal_lock_order", {"lock_entries": lock_entries, "reads": [list(parts) for parts in reads], "before": before, "after": _manifest(root), "snapshot_rows": len(snapshot.event_rows)})
 
 
 def test_verified_snapshot_linearizes_against_real_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,6 +251,7 @@ def test_verified_snapshot_is_non_repairing_and_explicit_reconcile_repairs_only_
     assert journal.chain_path.read_bytes() == pristine_chain
     assert journal.head_path.read_bytes() == pristine_head
     assert len(journal.verified_snapshot().event_rows) == 2
+    _capture_evidence("journal_reconcile", {"damaged": damaged, "repaired_chain_sha256": hashlib.sha256(journal.chain_path.read_bytes()).hexdigest(), "repaired_head_sha256": hashlib.sha256(journal.head_path.read_bytes()).hexdigest(), "snapshot_rows": 2})
 
 
 def test_explicit_reconcile_does_not_begin_suffix_repair_before_rejecting_corrupt_head(tmp_path: Path) -> None:
@@ -350,6 +355,7 @@ def test_verified_snapshot_tampering_fails_without_mutation(tmp_path: Path, case
         journal.verified_snapshot()
 
     assert _manifest(root) == before
+    _capture_evidence("journal_tamper", {"case": case, "before": before, "after": _manifest(root), "result": "JournalError"})
 
 
 def test_verified_snapshot_unsafe_mode_failures_are_fd_flat_and_nonmutating(tmp_path: Path) -> None:
@@ -370,6 +376,8 @@ def test_verified_snapshot_unsafe_mode_failures_are_fd_flat_and_nonmutating(tmp_
         baseline = len(tuple(proc_fd.iterdir()))
         before = _manifest(root)
         outside_before = _manifest(outside)
+        fd_baseline = _fd_inventory()
+        state_baseline = _capture_inventory(root)
 
         for _ in range(64):
             with pytest.raises(JournalError, match="cannot read persisted journal snapshot") as caught:
@@ -379,6 +387,7 @@ def test_verified_snapshot_unsafe_mode_failures_are_fd_flat_and_nonmutating(tmp_
         assert len(tuple(proc_fd.iterdir())) == baseline
         assert _manifest(root) == before
         assert _manifest(outside) == outside_before
+        _capture_evidence("fd_failure", {"path": "verified_snapshot", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": len(tuple(proc_fd.iterdir())), "retry_count": 64, "fd_delta": len(tuple(proc_fd.iterdir())) - baseline, "before_state": state_baseline, "after_state": _capture_inventory(root), "outside_before": outside_before, "outside_after": _manifest(outside)})
 
         journal.events_path.chmod(0o600)
         success_baseline = len(tuple(proc_fd.iterdir()))
@@ -414,6 +423,8 @@ def test_journal_append_validation_failures_are_fd_flat_and_nonmutating(
             baseline = len(tuple(proc_fd.iterdir()))
             before = _manifest(root)
             outside_before = _manifest(outside)
+            fd_baseline = _fd_inventory()
+            state_baseline = _capture_inventory(root)
 
             for _ in range(64):
                 with pytest.raises(UnsafeStoreError, match="injected journal event validation failure") as caught:
@@ -423,6 +434,7 @@ def test_journal_append_validation_failures_are_fd_flat_and_nonmutating(
             assert len(tuple(proc_fd.iterdir())) == baseline
             assert _manifest(root) == before
             assert _manifest(outside) == outside_before
+            _capture_evidence("fd_failure", {"path": "direct_journal_append", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": len(tuple(proc_fd.iterdir())), "retry_count": 64, "fd_delta": len(tuple(proc_fd.iterdir())) - baseline, "before_state": state_baseline, "after_state": _capture_inventory(root), "outside_before": outside_before, "outside_after": _manifest(outside)})
 
         success_baseline = len(tuple(proc_fd.iterdir()))
         journal.append(_event(1))
@@ -466,6 +478,7 @@ def test_journal_operations_reject_noncanonical_sequence_scalars_without_changin
             journal.append(_event(sequence + 1))
 
     assert _manifest(root) == before
+    _capture_evidence("journal_scalar", {"scalar": scalar, "scalar_type": type(scalar).__name__, "sequence": sequence, "target": target, "operation": operation, "before": before, "after": _manifest(root), "result": "JournalError"})
 
 
 @pytest.mark.parametrize("scalar,sequence", _NONCANONICAL_SEQUENCE_SCALARS)
@@ -683,6 +696,7 @@ sys.stdin.read()
         assert process.wait(timeout=5) < 0
         reopened = ServiceIdentity(root)
         reopened.close()
+        _capture_evidence("identity_lifetime", {"child_phase": "locked", "locked_result": "ServiceIdentityLocked", "child_exit": process.returncode, "reopen_result": "opened", "state": _capture_inventory(root)})
     finally:
         if process.poll() is None:
             process.kill()
@@ -949,6 +963,7 @@ def test_service_identity_exact_fd_procfs_fallback_uses_only_held_relative_dirfd
     assert "identity.json" in fallback_destinations
     assert sum(name.endswith(".new") for name in fallback_destinations) == 1
     assert not list((tmp_path / "store" / "service").glob(".identity.txn.*"))
+    _capture_evidence("identity_procfs", {"empty_path_errno": empty_path_errno, "calls": [list(call) for call in calls], "fallback_destinations": sorted(fallback_destinations), "state": _capture_inventory(tmp_path / "store")})
 
 
 def test_service_identity_masked_procfs_fails_without_named_temp_or_publication(
@@ -1459,6 +1474,7 @@ elif operation == "roll":
     reopened.close()
     assert path.read_bytes() == reopened_bytes
     assert not list((root / "service").glob(".identity.txn.*"))
+    _capture_evidence("identity_process_death", {"operation": operation, "fault_point": fault_point, "child_exit": completed.returncode, "before_rename": before_rename, "identity_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "state": _capture_inventory(root)})
 
 
 @pytest.mark.parametrize("operation", ["create", "rotate", "retire", "roll"])
@@ -2328,6 +2344,8 @@ def test_procfs_fstat_failures_after_empty_path_fallback_are_fd_flat_and_nonmuta
             baseline = len(tuple(proc_fd.iterdir()))
             before = _manifest(service)
             outside_before = _manifest(outside)
+            fd_baseline = _fd_inventory()
+            state_baseline = _capture_inventory(service)
 
             for _ in range(64):
                 with pytest.raises(ServiceIdentityError, match="exact-FD identity linking is unavailable") as caught:
@@ -2338,6 +2356,7 @@ def test_procfs_fstat_failures_after_empty_path_fallback_are_fd_flat_and_nonmuta
             assert len(tuple(proc_fd.iterdir())) == baseline
             assert _manifest(service) == before
             assert _manifest(outside) == outside_before
+            _capture_evidence("fd_failure", {"path": "procfs_fstat_eio", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": len(tuple(proc_fd.iterdir())), "retry_count": 64, "fd_delta": len(tuple(proc_fd.iterdir())) - baseline, "before_state": state_baseline, "after_state": _capture_inventory(service), "outside_before": outside_before, "outside_after": _manifest(outside)})
 
         success_baseline = len(tuple(proc_fd.iterdir()))
         attempt_link()
@@ -2365,3 +2384,4 @@ def test_service_identity_relocation_preserves_identity_without_absolute_paths(t
     assert relocated.state == expected_state
     assert (relocated_root / "service" / "identity.json").read_bytes() == identity_bytes
     relocated.close()
+    _capture_evidence("identity_relocation", {"identity_sha256": hashlib.sha256(identity_bytes).hexdigest(), "states_equal": True, "relocated_state": _capture_inventory(relocated_root)})

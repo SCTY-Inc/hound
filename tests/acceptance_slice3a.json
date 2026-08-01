@@ -29,11 +29,14 @@
     "tests/test_hsp05_transactions.py": "HSP-05",
     "tests/test_hsp08_durable_query.py": "HSP-08",
     "tests/test_hsp20_durable_state.py": "HSP-20",
+    "tests/test_hsp20_verification.py": "HSP-20",
+    "tests/slice3a_evidence_capture.py": "HSP-21",
     "tests/test_slice3a_evidence.py": "HSP-21",
     "tests/evidence/slice3a/bundle-source-digests.json": "HSP-21",
     "tests/evidence/slice3a/canonical-query-matrix.json": "HSP-21",
     "tests/evidence/slice3a/compatibility-pytest.xml": "HSP-21",
     "tests/evidence/slice3a/cursor-restart-hwm.json": "HSP-21",
+    "tests/evidence/slice3a/fd-failure-path-matrix.json": "HSP-21",
     "tests/evidence/slice3a/identity-crash-matrix.json": "HSP-21",
     "tests/evidence/slice3a/identity-mode-lock-path-report.json": "HSP-21",
     "tests/evidence/slice3a/identity-transition-report.json": "HSP-21",
@@ -42,6 +45,7 @@
     "tests/evidence/slice3a/read-state-before.json": "HSP-21",
     "tests/evidence/slice3a/recovery-vs-verification.json": "HSP-21",
     "tests/evidence/slice3a/restore-portability-manifest.json": "HSP-21",
+    "tests/evidence/slice3a/run-manifest.json": "HSP-21",
     "tests/evidence/slice3a/slice3a-pytest.xml": "HSP-21",
     "tests/evidence/slice3a/sqlite-independence.json": "HSP-21",
     "tests/acceptance_slice3a.json": "HSP-21"
@@ -84,6 +88,7 @@
       "fixture": "Exact-LF persisted journal triplet plus one private generation/keyring identity using exact-FD publication and immutable marker-bound recovery under process death, fork, lock, path-race, restart, and relocation matrices.",
       "tests": [
         "tests/test_hsp20_durable_state.py"
+        ,"tests/test_hsp20_verification.py"
       ],
       "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp20_durable_state.py",
       "expected_assertions": [
@@ -108,6 +113,7 @@
         "tests/evidence/slice3a/identity-transition-report.json",
         "tests/evidence/slice3a/identity-mode-lock-path-report.json",
         "tests/evidence/slice3a/restore-portability-manifest.json"
+        ,"tests/evidence/slice3a/fd-failure-path-matrix.json"
       ],
       "deferred": [
         "the separately reviewed VISION and security-boundary amendment required before claim acceptance",
@@ -133,6 +139,7 @@
       ],
       "retained_artifacts": [
         "tests/test_slice3a_evidence.py",
+        "tests/slice3a_evidence_capture.py",
         "tests/evidence/slice3a",
         "tests/acceptance_slice3a.json"
       ],

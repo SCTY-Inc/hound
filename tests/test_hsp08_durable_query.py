@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.slice3a_evidence_capture import capture as _capture_evidence, inventory as _capture_inventory
+
 from houndd import HounddStore, verify_store
 from houndd.access import AuthenticatedPrincipal, EventSelector, PrincipalScope, ProducerSelector
 from houndd.contracts import make_journal_envelope
@@ -235,10 +237,13 @@ def test_durable_query_uses_exact_persisted_chain_and_all_canonical_filter_famil
             [2, 3],
         ),
     )
+    observed_cases: list[dict[str, object]] = []
     for filter_value, expected in cases:
         page = adapter.execute(QueryRequest(parse_query_filter(filter_value), limit=100), _scope())
         assert _ids(page) == [events[index]["entry_id"] for index in expected]
         assert all(item.provenance.lane is None and not item.provenance.topics and not item.provenance.entities for item in page.items)
+        observed_cases.append({"filter": filter_value, "ordered_entry_ids": _ids(page)})
+    _capture_evidence("canonical_query", {"requests": observed_cases})
     identity.close()
     journal.close()
 
@@ -259,17 +264,26 @@ def test_projection_filters_fail_explicitly_before_identity_or_journal_access(
 ) -> None:
     journal, identity, adapter, _ = _store(tmp_path / "store")
 
-    def forbidden(*_args, **_kwargs):
+    calls = {"Journal.verified_snapshot": 0, "ServiceIdentity.lease": 0}
+
+    def forbidden_journal(*_args, **_kwargs):
+        calls["Journal.verified_snapshot"] += 1
         raise AssertionError("unsupported filters reached durable evaluation")
 
-    monkeypatch.setattr(Journal, "verified_snapshot", forbidden)
-    monkeypatch.setattr(ServiceIdentity, "lease", forbidden)
+    def forbidden_identity(*_args, **_kwargs):
+        calls["ServiceIdentity.lease"] += 1
+        raise AssertionError("unsupported filters reached durable evaluation")
+
+    monkeypatch.setattr(Journal, "verified_snapshot", forbidden_journal)
+    monkeypatch.setattr(ServiceIdentity, "lease", forbidden_identity)
     with pytest.raises(QueryFilterNotAvailable) as raised:
         adapter.execute(QueryRequest(parse_query_filter(filter_value)), _scope())
     assert type(raised.value) is QueryFilterNotAvailable
     assert raised.value.code == "filter_not_available"
     assert raised.value.filters == tuple(sorted(filter_value))
     assert "cursor" not in vars(raised.value)
+    assert calls == {"Journal.verified_snapshot": 0, "ServiceIdentity.lease": 0}
+    _capture_evidence("unsupported_filter", {"filter": filter_value, "result_type": type(raised.value).__name__, "filter_keys": list(raised.value.filters), "class_hook_calls": calls})
     identity.close()
     journal.close()
 
@@ -335,6 +349,7 @@ def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
     monkeypatch.setattr(CursorCodec, "recover", observed_recover)
 
     proofs: dict[str, tuple[object, ...]] = {}
+    observed_states: dict[str, object] = {}
     for state, root in roots.items():
         index = root / "index.sqlite"
         before = _index_manifest(index)
@@ -359,10 +374,12 @@ def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
 
         recovery_start = len(recovery_observations)
         old_pages = [_page_manifest(first)]
+        old_cursor_sha256 = [_cursor_sha256(first.next_cursor)]
         old_cursor = first.next_cursor
         while old_cursor is not None:
             page = adapter.execute(QueryRequest(parse_query_filter({}), limit=1, cursor=old_cursor), _scope())
             old_pages.append(_page_manifest(page))
+            old_cursor_sha256.append(_cursor_sha256(page.next_cursor))
             old_cursor = page.next_cursor
         old_recoveries = tuple(recovery_observations[recovery_start:])
         old_positions = tuple(item[1:4] for page in old_pages for item in page[0])
@@ -380,6 +397,7 @@ def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
         expected_fresh_hwm = _candidate_position(fresh_snapshot.cursor_recovery_snapshot.candidates[-1])
         assert expected_old_hwm != expected_fresh_hwm
         fresh_pages = []
+        fresh_cursor_sha256: list[str | None] = []
         fresh_cursor: str | None = None
         while True:
             page = adapter.execute(
@@ -387,6 +405,7 @@ def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
                 _scope(),
             )
             fresh_pages.append(_page_manifest(page))
+            fresh_cursor_sha256.append(_cursor_sha256(page.next_cursor))
             fresh_cursor = page.next_cursor
             if fresh_cursor is None:
                 break
@@ -405,11 +424,28 @@ def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
 
         proofs[state] = (tuple(old_pages), old_recoveries, tuple(fresh_pages), fresh_recoveries)
         assert _index_manifest(index) == before
+        observed_states[state] = {
+            "old_pages": old_pages,
+            "old_cursor_sha256": old_cursor_sha256,
+            "old_recoveries": old_recoveries,
+            "fresh_pages": fresh_pages,
+            "fresh_cursor_sha256": fresh_cursor_sha256,
+            "fresh_recoveries": fresh_recoveries,
+            "old_high_watermark": expected_old_hwm,
+            "fresh_high_watermark": expected_fresh_hwm,
+            "old_positions": old_positions,
+            "fresh_positions": fresh_positions,
+            "appended": {"sequence": appended["sequence"], "entry_id": appended["entry_id"]},
+            "terminal_cursor": old_pages[-1][1],
+            "index_before": before,
+            "index_after": _index_manifest(index),
+        }
         identity.close()
         journal.close()
 
     assert connect_calls == 0
     assert proofs["valid"] == proofs["corrupt"] == proofs["absent"]
+    _capture_evidence("sqlite_independence", {"states": observed_states, "sqlite_connect_calls": connect_calls, "proofs_equal": proofs["valid"] == proofs["corrupt"] == proofs["absent"]})
 
 
 def test_fixed_hwm_cursor_resumes_after_append_and_full_restart_with_limit_change(tmp_path: Path) -> None:
@@ -441,6 +477,8 @@ def test_fixed_hwm_cursor_resumes_after_append_and_full_restart_with_limit_chang
     assert _event(5, when="2026-07-31T00:30:00Z", run_id="run-later", access="restricted")["entry_id"] not in seen
     fresh = restarted.execute(QueryRequest(parse_query_filter({}), limit=100), _scope())
     assert fresh.items[0].event["sequence"] == 5
+
+    _capture_evidence("cursor_restart", {"first_cursor_sha256": _cursor_sha256(first.next_cursor), "resumed_ids": seen, "fresh_first": {"sequence": fresh.items[0].event["sequence"], "entry_id": fresh.items[0].event["entry_id"]}, "terminal_cursor": cursor})
 
     with pytest.raises(CursorRejected, match="cursor rejected"):
         restarted.execute(
@@ -481,6 +519,7 @@ def test_queries_and_replay_persist_no_server_read_state(tmp_path: Path) -> None
     root = tmp_path / "store"
     journal, identity, adapter, _ = _store(root)
     before = _tree_manifest(root)
+    captured_before = _capture_inventory(root)
     first = adapter.execute(QueryRequest(parse_query_filter({}), limit=1), _scope())
     assert first.next_cursor is not None
     replay = adapter.execute(QueryRequest(parse_query_filter({}), limit=1, cursor=first.next_cursor), _scope())
@@ -492,6 +531,7 @@ def test_queries_and_replay_persist_no_server_read_state(tmp_path: Path) -> None
     assert not any(any(token in path.name.lower() for token in forbidden_names) for path in root.rglob("*"))
     with pytest.raises(QueryContractError):
         parse_query_request({"filter": {}, "idempotency_key": "read-state-is-forbidden"})
+    _capture_evidence("read_state", {"root": os.fspath(root), "before": captured_before, "after": _capture_inventory(root), "forbidden_names": list(forbidden_names), "forbidden_matches": [], "operations": ["first_page", "cursor_replay", "empty_source_query", "second_principal_query", "request_parse_rejection"]})
     identity.close()
     journal.close()
 
