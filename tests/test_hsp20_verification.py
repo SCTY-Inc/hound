@@ -600,6 +600,8 @@ def test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating(
             outside_sentinel.read_bytes(),
         ) == before
 
+        _capture_evidence("fd_failure", {"path": f"anchored_{operation}", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": _fd_count(), "retry_count": 64, "fd_delta": _fd_count() - baseline, "before_state": state_baseline, "after_state": _capture_inventory(root), "outside_before": before[4], "outside_after": _tree_snapshot(outside)})
+
         leaf.chmod(0o600)
         success_baseline = _fd_count()
         if operation == "read":
@@ -610,7 +612,6 @@ def test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating(
         assert _fd_count() == success_baseline
         assert _tree_snapshot(outside) == before[4]
         assert outside_sentinel.read_bytes() == before[5]
-        _capture_evidence("fd_failure", {"path": f"anchored_{operation}", "baseline": fd_baseline, "after": _fd_inventory(), "baseline_count": baseline, "after_count": _fd_count(), "retry_count": 64, "fd_delta": _fd_count() - baseline, "before_state": state_baseline, "after_state": _capture_inventory(root), "outside_before": before[4], "outside_after": _tree_snapshot(outside)})
     finally:
         anchor.close()
 
