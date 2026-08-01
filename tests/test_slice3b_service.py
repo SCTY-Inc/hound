@@ -145,19 +145,21 @@ def test_slice3b_subprocess_peer_query_strict_frame_and_permissions(running_serv
 
 
 @pytest.mark.parametrize(
-    "raw",
+    "raw,expected_status",
     [
-        b"\0\0\0\0",
-        (1_048_577).to_bytes(4, "big"),
-        b"\0\0\0\x03{}",
-        _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal?x=1", "body": _request()}),
-        _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}) + b"x",
+        (b"\0\0\0\0", None),
+        ((1_048_577).to_bytes(4, "big"), None),
+        (b"\0\0\0\x03{}", None),
+        (_frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal?x=1", "body": _request()}), 400),
+        (_frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}) + b"x", 400),
     ],
 )
-def test_slice3b_rejects_bad_frame_or_raw_path_without_leaking(running_service, raw: bytes) -> None:
+def test_slice3b_rejects_bad_frame_or_raw_path_with_exact_recoverable_id_semantics(running_service, raw: bytes, expected_status: int | None) -> None:
     _state, sock, _process = running_service
     response = _exchange(sock, raw)
-    assert response is None or response["status"] == 400
+    assert (None if response is None else response["status"]) == expected_status
+    if response is not None:
+        assert response["body"]["request_id"] == "request-1"
 
 
 def test_slice3b_policy_ceiling_and_replacement_fail_closed(running_service) -> None:

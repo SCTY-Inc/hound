@@ -10,8 +10,14 @@
     "src/houndd/cli.py": "HSP-03",
     "src/houndd/service.py": "HSP-09",
     "src/hound_research/cli.py": "HSP-03",
+    "src/hound_research/journal_client.py": "HSP-03",
     "tests/test_slice3b_service.py": "HSP-21",
+    "tests/test_slice3b_hostile.py": "HSP-21",
+    "tests/test_slice3b_evidence.py": "HSP-21",
+    "tests/test_slice3a_historical_evidence.py": "HSP-21",
     "tests/generate_slice3b_evidence.py": "HSP-21",
+    "tests/verify_slice3b_evidence.py": "HSP-21",
+    "tests/verify_slice3a_historical.py": "HSP-21",
     "tests/acceptance_slice3b.json": "HSP-21",
     "tests/evidence/slice3b/run-manifest.json": "HSP-21",
     "tests/evidence/slice3b/slice3b-pytest.xml": "HSP-21"
@@ -19,33 +25,33 @@
   "coverage": {
     "HSP-03": {
       "status": "partial",
-      "tests": ["tests/test_slice3b_service.py"],
-      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_slice3b_service.py",
+      "tests": ["tests/test_slice3b_service.py", "tests/test_slice3b_hostile.py"],
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_slice3b_service.py tests/test_slice3b_hostile.py",
       "assertions": ["foreground houndd serve and thin hound-research journal query use only one AF_UNIX SOCK_STREAM request/response", "framing is canonical, bounded, EOF-gated, and route-bound", "CLI exits are exactly 0, 2, 3, or 5"],
       "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json", "tests/evidence/slice3b/slice3b-pytest.xml"]
     },
     "HSP-08": {
       "status": "partial",
-      "tests": ["tests/test_slice3b_service.py"],
+      "tests": ["tests/test_slice3b_service.py", "tests/test_slice3b_hostile.py"],
       "assertions": ["the durable query adapter remains the sole cursor/HWM evaluator", "unavailable derived filters are logical 400 before adapter state access"],
       "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
     },
     "HSP-09": {
       "status": "partial",
-      "tests": ["tests/test_slice3b_service.py"],
-      "assertions": ["accepted-socket SO_PEERCRED forms linux-uid principal", "frozen owner-only canonical policy selects one matching rule and applies a disclosure ceiling", "policy replacement and denied scopes fail closed without protected IDs"],
+      "tests": ["tests/test_slice3b_service.py", "tests/test_slice3b_hostile.py"],
+      "assertions": ["accepted-socket SO_PEERCRED forms linux-uid principal", "frozen owner-only canonical policy is anchored to a held directory/file descriptor, selects one policy ID without unions, and applies a disclosure ceiling", "policy replacement and denied scopes fail closed without protected IDs"],
       "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
     },
     "HSP-20": {
       "status": "partial",
-      "tests": ["tests/test_slice3b_service.py"],
+      "tests": ["tests/test_slice3b_service.py", "tests/test_slice3b_hostile.py"],
       "assertions": ["recover and verify complete before identity creation and listener bind", "request-time query uses the verified durable query core without rebuilding SQLite"],
       "retained_artifacts": ["tests/evidence/slice3b/run-manifest.json"]
     },
     "HSP-21": {
       "status": "partial",
-      "tests": ["tests/generate_slice3b_evidence.py"],
-      "assertions": ["retained evidence binds the exact source commit/tree, command, test count, and JUnit result"],
+      "tests": ["tests/test_slice3b_evidence.py", "tests/test_slice3a_historical_evidence.py", "tests/generate_slice3b_evidence.py", "tests/verify_slice3b_evidence.py", "tests/verify_slice3a_historical.py"],
+      "assertions": ["retained evidence binds raw Git source bytes and blob IDs, exact source commit/tree, BB thread/run IDs, argv, typed live observations, and complete JUnit node IDs", "the retained Slice 3A evidence and original historical checker are pinned by commit, tree, checker blob, and retention subtree; later source evolution cannot weaken that checker"],
       "retained_artifacts": ["tests/acceptance_slice3b.json", "tests/evidence/slice3b/run-manifest.json", "tests/evidence/slice3b/slice3b-pytest.xml"]
     }
   }

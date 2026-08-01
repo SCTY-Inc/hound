@@ -9,6 +9,9 @@ from pathlib import Path
 import socket
 import stat
 import struct
+import ctypes
+import errno
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +22,7 @@ from .query_contracts import QueryContractError, parse_query_request
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
 from .service_identity import ServiceIdentity, ServiceIdentityError
 from . import HounddStore
+from ._safety import AnchoredRoot
 
 
 WIRE_VERSION = "houndd.uds.v1"
@@ -35,6 +39,23 @@ _ACCESS_CEILINGS = {
     "workspace": frozenset({"public", "workspace"}),
     "restricted": frozenset({"public", "workspace", "restricted"}),
 }
+_RENAME_NOREPLACE = 1
+
+
+def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    """Atomically publish a privately-bound socket name without replacement."""
+
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:  # pragma: no cover - certified Linux exposes it
+        raise ServiceError("atomic socket publication is unavailable") from error
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), _RENAME_NOREPLACE) != 0:
+        number = ctypes.get_errno()
+        if number == errno.EEXIST:
+            raise ServiceError("socket path is already occupied")
+        raise ServiceError("atomic socket publication failed") from OSError(number, os.strerror(number))
 
 
 class ServiceError(RuntimeError):
@@ -42,7 +63,17 @@ class ServiceError(RuntimeError):
 
 
 class FrameError(ServiceError):
-    """The peer did not send exactly one bounded canonical frame."""
+    """The peer did not send exactly one bounded canonical frame.
+
+    A framing failure is normally deliberately silent.  ``request_id`` is set
+    only when a complete UTF-8 JSON frame contains exactly one safely bounded
+    body request ID; this permits the one recoverable logical 400 required by
+    the wire contract without manufacturing an identifier from damaged bytes.
+    """
+
+    def __init__(self, message: str, *, request_id: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
 
 
 class RequestError(ServiceError):
@@ -57,6 +88,8 @@ class PolicyError(ServiceError):
 class FrozenPolicy:
     bundle: PolicyBundle
     fingerprint: tuple[int, int, int, int, int, int, str]
+    service_root: AnchoredRoot
+    policy_fd: int
 
 
 def _canonical_load(raw: bytes, label: str, error_type: type[ServiceError] = PolicyError) -> dict[str, Any]:
@@ -86,12 +119,9 @@ def _private_directory(path: Path, label: str) -> None:
         raise ServiceError(f"{label} must be current-user 0700 directory")
 
 
-def _policy_fingerprint(path: Path) -> tuple[bytes, tuple[int, int, int, int, int, int, str]]:
+def _policy_fingerprint(service_root: AnchoredRoot, descriptor: int) -> tuple[bytes, tuple[int, int, int, int, int, int, str]]:
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as error:
-        raise PolicyError("policy file is unavailable") from error
-    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1:
             raise PolicyError("policy file must be current-user 0600 regular file")
@@ -105,13 +135,18 @@ def _policy_fingerprint(path: Path) -> tuple[bytes, tuple[int, int, int, int, in
             chunks.append(chunk)
         raw = b"".join(chunks)
         after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
+    except OSError as error:
+        raise PolicyError("policy file cannot be read") from error
     try:
-        visible = path.lstat()
+        # The service directory and policy leaf must still be the objects
+        # opened at startup.  All lookup is relative to the held descriptor.
+        with service_root.operation():
+            visible = os.stat("policy.json", dir_fd=service_root.fd, follow_symlinks=False)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (before.st_dev, before.st_ino) != (visible.st_dev, visible.st_ino):
+                raise PolicyError("policy file changed while read")
     except OSError as error:
         raise PolicyError("policy file disappeared") from error
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (before.st_dev, before.st_ino) != (visible.st_dev, visible.st_ino):
+    if not stat.S_ISREG(visible.st_mode):
         raise PolicyError("policy file changed while read")
     return raw, (after.st_dev, after.st_ino, after.st_uid, after.st_mode, after.st_size, after.st_mtime_ns, hashlib.sha256(raw).hexdigest())
 
@@ -152,19 +187,33 @@ def load_frozen_policy(state_root: Path) -> FrozenPolicy:
     _private_directory(state_root, "state directory")
     service = state_root / "service"
     _private_directory(service, "service directory")
-    raw, fingerprint = _policy_fingerprint(service / "policy.json")
-    value = _canonical_load(raw, "policy file")
-    if set(value) != {"schema_version", "rules"} or value["schema_version"] != "houndd.policy.v1" or type(value["rules"]) is not list or not value["rules"]:
-        raise PolicyError("policy file has unsupported schema or fields")
-    rules = tuple(_rule(item) for item in value["rules"])
-    bundle = PolicyBundle(rules)
-    if len(bundle.rules) != len(rules):
-        raise PolicyError("policy file must not duplicate rules")
-    return FrozenPolicy(bundle, fingerprint)
+    service_root: AnchoredRoot | None = None
+    descriptor: int | None = None
+    try:
+        service_root = AnchoredRoot(service, error_type=PolicyError)
+        descriptor = service_root.open_file("policy.json", flags=os.O_RDONLY)
+        raw, fingerprint = _policy_fingerprint(service_root, descriptor)
+        value = _canonical_load(raw, "policy file")
+        if set(value) != {"schema_version", "rules"} or value["schema_version"] != "houndd.policy.v1" or type(value["rules"]) is not list or not value["rules"]:
+            raise PolicyError("policy file has unsupported schema or fields")
+        rules = tuple(_rule(item) for item in value["rules"])
+        bundle = PolicyBundle(rules)
+        if len(bundle.rules) != len(rules):
+            raise PolicyError("policy file must not duplicate rules")
+        return FrozenPolicy(bundle, fingerprint, service_root, descriptor)
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        if service_root is not None:
+            service_root.close()
+        raise
 
 
 def _assert_frozen(policy: FrozenPolicy, state_root: Path) -> None:
-    _raw, fingerprint = _policy_fingerprint(state_root / "service" / "policy.json")
+    # ``state_root`` is retained in this signature to make the service's
+    # policy boundary explicit; it is never used for a second pathname lookup.
+    del state_root
+    _raw, fingerprint = _policy_fingerprint(policy.service_root, policy.policy_fd)
     if fingerprint != policy.fingerprint:
         raise PolicyError("policy changed after service startup")
 
@@ -179,19 +228,44 @@ def _read_exact(connection: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+def _recover_frame_request_id(raw: bytes) -> str | None:
+    """Extract precisely one body request ID without accepting the frame."""
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=lambda pairs: pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite number")))
+    except (UnicodeError, ValueError):
+        return None
+    if type(value) is not list:
+        return None
+    bodies = [item for key, item in value if type(key) is str and key == "body"]
+    if len(bodies) != 1 or type(bodies[0]) is not list:
+        return None
+    ids = [item for key, item in bodies[0] if type(key) is str and key == "request_id"]
+    if len(ids) != 1:
+        return None
+    try:
+        return _text(ids[0], "request_id")
+    except RequestError:
+        return None
+
+
 def read_frame(connection: socket.socket) -> dict[str, Any]:
     header = _read_exact(connection, 4)
     size = int.from_bytes(header, "big")
     if not 0 < size <= MAX_WIRE_FRAME_BYTES:
         raise FrameError("frame size is invalid")
     raw = _read_exact(connection, size)
+    request_id = _recover_frame_request_id(raw)
     if connection.recv(1):
-        raise FrameError("connection contains trailing or second frame bytes")
-    value = _canonical_load(raw, "wire frame", FrameError)
+        raise FrameError("connection contains trailing or second frame bytes", request_id=request_id)
+    try:
+        value = _canonical_load(raw, "wire frame", FrameError)
+    except FrameError as error:
+        raise FrameError(str(error), request_id=request_id) from error
     if set(value) != _FRAME_FIELDS or value.get("wire_version") != WIRE_VERSION or value.get("method") != "GET" or type(value.get("path")) is not str or type(value.get("body")) is not dict:
-        raise FrameError("wire frame fields are invalid")
+        raise FrameError("wire frame fields are invalid", request_id=request_id)
     if len(canonical_bytes(value["body"])) > MAX_FRAME_BYTES:
-        raise FrameError("read envelope body exceeds 1048576 bytes")
+        raise FrameError("read envelope body exceeds 1048576 bytes", request_id=request_id)
     return value
 
 
@@ -287,6 +361,8 @@ class HounddService:
         self.store: HounddStore | None = None
         self.identity: ServiceIdentity | None = None
         self.policy: FrozenPolicy | None = None
+        self._socket_identity: tuple[int, int] | None = None
+        self._runtime_root: AnchoredRoot | None = None
         try:
             self.store = HounddStore(self.state_root)
             self.store.recover()
@@ -301,33 +377,51 @@ class HounddService:
 
     def _bind(self) -> None:
         parent = self.socket_path.parent
-        if not parent.exists():
-            parent.mkdir(mode=0o700, parents=True)
+        runtime_root = AnchoredRoot(parent, error_type=ServiceError, create=True)
+        self._runtime_root = runtime_root
         _private_directory(parent, "runtime directory")
-        try:
-            info = self.socket_path.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
-                raise ServiceError("socket path is occupied by an unsafe entry")
-            self.socket_path.unlink()
+        name = self.socket_path.name
+        temporary = f".{name}.houndd.{self._owner_pid}.{secrets.token_hex(16)}"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(os.fspath(self.socket_path))
-            os.chmod(self.socket_path, 0o600)
-            if stat.S_IMODE(self.socket_path.lstat().st_mode) != 0o600:
+            # This spelling remains tied to the held runtime directory FD;
+            # publication below is an atomic no-replace rename through it.
+            listener.bind(f"/proc/self/fd/{runtime_root.fd}/{temporary}")
+            # The private temporary name is addressed through the held parent
+            # descriptor, so its mode can be set before publication without a
+            # caller-controlled pathname race.
+            os.chmod(f"/proc/self/fd/{runtime_root.fd}/{temporary}", 0o600)
+            with runtime_root.operation():
+                _rename_noreplace(temporary, name, directory_fd=runtime_root.fd)
+                info = os.stat(name, dir_fd=runtime_root.fd, follow_symlinks=False)
+            if stat.S_IMODE(info.st_mode) != 0o600:
                 raise ServiceError("socket permissions are unsafe")
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                raise ServiceError("socket ownership is unsafe")
             listener.listen(32)
+            self._socket_identity = (info.st_dev, info.st_ino)
+            self._listener = listener
+            # A self-connect must arrive at this listener before it becomes
+            # public.  It detects any namespace replacement after publication
+            # without ever contacting a non-local transport.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1)
+                probe.connect(os.fspath(self.socket_path))
+                accepted, _ = listener.accept()
+                accepted.close()
+            self._assert_socket_binding()
         except Exception:
+            try:
+                os.unlink(temporary, dir_fd=runtime_root.fd)
+            except OSError:
+                pass
             listener.close()
             raise
-        self._listener = listener
 
     def _scope(self, principal: AuthenticatedPrincipal, request: ReadRequest):
         assert self.policy is not None
-        matches = tuple(rule for rule in self.policy.bundle.rules if rule.subject == principal.subject and rule.claim_selector.matches(request.claim))
-        if len(matches) != 1 or matches[0].policy_id != request.policy_id:
+        matches = tuple(rule for rule in self.policy.bundle.rules if rule.subject == principal.subject and rule.claim_selector.matches(request.claim) and rule.policy_id == request.policy_id)
+        if len(matches) != 1:
             return None
         rule = matches[0]
         scope = resolve_scope(PolicyBundle((rule,)), principal, request.claim)
@@ -341,6 +435,23 @@ class HounddService:
             return None
         from .access import EventSelector, PrincipalScope
         return PrincipalScope(principal, frozenset(tiers), tuple(EventSelector(selector.policy_id, selector.producer_selector, selector.readable_tiers & tiers) for selector in selectors))
+
+    def _assert_socket_binding(self) -> None:
+        listener = self._listener
+        identity = self._socket_identity
+        runtime_root = self._runtime_root
+        if listener is None or identity is None or runtime_root is None:
+            raise ServiceError("service socket is unavailable")
+        try:
+            with runtime_root.operation():
+                visible = os.stat(self.socket_path.name, dir_fd=runtime_root.fd, follow_symlinks=False)
+        except OSError as error:
+            raise ServiceError("service socket binding is unavailable") from error
+        if (
+            not stat.S_ISSOCK(visible.st_mode)
+            or (visible.st_dev, visible.st_ino) != identity
+        ):
+            raise ServiceError("service socket binding changed")
 
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         request = parse_read_request(frame["body"])
@@ -396,8 +507,12 @@ class HounddService:
         if self._listener is None:
             raise ServiceError("service is closed")
         while not self._closed:
+            self._assert_socket_binding()
+            listener = self._listener
+            if listener is None:
+                break
             try:
-                connection, _address = self._listener.accept()
+                connection, _address = listener.accept()
             except OSError:
                 if self._closed:
                     break
@@ -408,8 +523,10 @@ class HounddService:
                     principal = self._principal(connection)
                     frame = read_frame(connection)
                     response = self._dispatch(principal, frame)
-                except FrameError:
-                    continue
+                except FrameError as error:
+                    if error.request_id is None:
+                        continue
+                    response = _response(error.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
                 except (RequestError, ValueError) as error:
                     request_id = _request_id(locals().get("frame", {}).get("body") if isinstance(locals().get("frame"), dict) else None)
                     if request_id is None:
@@ -431,11 +548,22 @@ class HounddService:
             listener.close()
         if self._owner_pid != os.getpid():
             return
-        try:
-            if self.socket_path.exists() and stat.S_ISSOCK(self.socket_path.lstat().st_mode):
-                self.socket_path.unlink()
-        except OSError:
-            pass
+        runtime_root, self._runtime_root = self._runtime_root, None
+        if runtime_root is not None:
+            try:
+                with runtime_root.operation():
+                    info = os.stat(self.socket_path.name, dir_fd=runtime_root.fd, follow_symlinks=False)
+                    if self._socket_identity == (info.st_dev, info.st_ino) and stat.S_ISSOCK(info.st_mode):
+                        os.unlink(self.socket_path.name, dir_fd=runtime_root.fd)
+            except OSError:
+                pass
+            finally:
+                runtime_root.close()
+        self._socket_identity = None
+        policy, self.policy = self.policy, None
+        if policy is not None:
+            os.close(policy.policy_fd)
+            policy.service_root.close()
         identity, self.identity = self.identity, None
         if identity is not None:
             identity.close()

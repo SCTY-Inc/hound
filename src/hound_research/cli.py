@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
-import socket
 import sys
 from typing import Any, Sequence
 
@@ -16,11 +14,43 @@ from hound_cli.orchestrator import HoundError
 from hound_cli.runtime import RuntimeErrorHound
 from houndd.contracts import canonical_bytes
 from houndd.query_contracts import parse_query_request
-from houndd.service import MAX_FRAME_BYTES, RESPONSE_SCHEMA, WIRE_VERSION
+from houndd.service import WIRE_VERSION
+from .journal_client import JournalClientError, exchange
 
-from .evidence import EvidenceError, store_capture, verify_capture
-from .source import capture_sources, discover_sources, inspect_sources
-from .web import WebError, run_web, verify_web_run
+
+def verify_web_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .web import verify_web_run as implementation
+    return implementation(*args, **kwargs)
+
+
+def discover_sources(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .source import discover_sources as implementation
+    return implementation(*args, **kwargs)
+
+
+def capture_sources(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .source import capture_sources as implementation
+    return implementation(*args, **kwargs)
+
+
+def inspect_sources(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .source import inspect_sources as implementation
+    return implementation(*args, **kwargs)
+
+
+def run_web(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .web import run_web as implementation
+    return implementation(*args, **kwargs)
+
+
+def store_capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .evidence import store_capture as implementation
+    return implementation(*args, **kwargs)
+
+
+def verify_capture(*args: Any, **kwargs: Any) -> bool:
+    from .evidence import verify_capture as implementation
+    return implementation(*args, **kwargs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,41 +174,6 @@ def _handle_capture_verify(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _read_socket_exact(connection: socket.socket, size: int) -> bytes:
-    data = bytearray()
-    while len(data) < size:
-        chunk = connection.recv(size - len(data))
-        if not chunk:
-            raise HoundError("houndd response was truncated", exit_code=5)
-        data.extend(chunk)
-    return bytes(data)
-
-
-def _strict_response(raw: bytes) -> dict[str, Any]:
-    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate key")
-            result[key] = value
-        return result
-
-    try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite number")))
-    except (UnicodeError, ValueError) as error:
-        raise HoundError("houndd response is invalid", exit_code=5) from error
-    if type(value) is not dict or canonical_bytes(value) != raw:
-        raise HoundError("houndd response is not canonical", exit_code=5)
-    if set(value) != {"wire_version", "status", "body"} or value["wire_version"] != WIRE_VERSION or value["status"] not in {200, 400, 404, 503}:
-        raise HoundError("houndd response has an invalid wire contract", exit_code=5)
-    body = value["body"]
-    required = {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"}
-    optional = {"result", "cursor", "error"}
-    if type(body) is not dict or set(body) - required - optional or required - set(body) or body["schema_version"] != RESPONSE_SCHEMA:
-        raise HoundError("houndd response has an invalid body contract", exit_code=5)
-    return value
-
-
 def _handle_journal_query(args: argparse.Namespace) -> dict[str, Any]:
     try:
         filter_value = json.loads(args.filter_json)
@@ -204,23 +199,10 @@ def _handle_journal_query(args: argparse.Namespace) -> dict[str, Any]:
             "operation": {"name": "journal.query", "payload": payload},
         },
     }
-    raw = canonical_bytes(request)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
-            connection.connect(os.fspath(socket_path))
-            connection.sendall(len(raw).to_bytes(4, "big") + raw)
-            connection.shutdown(socket.SHUT_WR)
-            length = int.from_bytes(_read_socket_exact(connection, 4), "big")
-            if not 0 < length <= MAX_FRAME_BYTES:
-                raise HoundError("houndd response frame is invalid", exit_code=5)
-            response = _strict_response(_read_socket_exact(connection, length))
-            if connection.recv(1):
-                raise HoundError("houndd returned multiple response frames", exit_code=5)
-    except HoundError:
-        raise
-    except OSError as error:
-        raise HoundError("houndd is unavailable", exit_code=5) from error
+        response = exchange(socket_path, request)
+    except JournalClientError as error:
+        raise HoundError(str(error), exit_code=5) from error
     status = response["status"]
     if status == 200:
         return response["body"]
@@ -237,7 +219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HoundError as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return exc.exit_code
-    except (ContractError, RuntimeErrorHound, EvidenceError, WebError) as exc:
+    except (ContractError, RuntimeErrorHound) as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)
         return 2 if isinstance(exc, ContractError) else 1
     except KeyboardInterrupt:
