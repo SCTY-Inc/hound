@@ -16,6 +16,24 @@ Write scopes are checked postconditions, not an operating-system sandbox. Hound
 detects and records an out-of-scope mutation as a failed run; it does not
 promise automatic rollback.
 
+Persistent service identity is certified only on a local Linux filesystem with
+owner-only directories and cooperative same-UID processes. Identity loads wait
+for mandatory startup recovery to complete. Publication uses exact-held-FD
+linking only: either `linkat(source_fd, "", service_fd, destination,
+AT_EMPTY_PATH)` or the procfs fallback `linkat(proc_self_fd_dir, "<fd>",
+service_fd, destination, AT_SYMLINK_FOLLOW)` against a private owner-held FD.
+The resulting destination must match exact inode, content, mode, and link-count
+postconditions, and if direct linking is unavailable, procfs is required. Hard
+links, `renameat2(RENAME_EXCHANGE)`, `renameat2(RENAME_NOREPLACE)`,
+directory `fsync`, and lifetime `flock` are required; missing primitives and
+remote/NFS filesystems fail unavailable. No named-temp fallback is allowed.
+Only `identity.json` is canonical. Temporary old/new witnesses may exist during
+recovery, and only clean/quiescent copy relocation is supported. Lasting
+replacements are preserved in evidence and rejected as canonical. Cooperative
+same UID excludes fully restored swaps, in-place forgery, and the final
+validation-to-unlink race; hostile same UID requires a distinct UID and no
+quarantine auto-unlink.
+
 ## Plan and execution binding
 
 A write plan binds the Hound version and source hash, canonical manifest,
