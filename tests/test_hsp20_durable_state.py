@@ -21,6 +21,7 @@ import pytest
 
 from houndd.contracts import canonical_bytes, canonical_hash, make_journal_envelope
 from houndd.journal import Journal, JournalError, PersistedJournalSnapshot
+from houndd.query_engine import QuerySnapshotError
 from houndd.service_identity import (
     ServiceIdentity,
     ServiceIdentityConflict,
@@ -29,6 +30,14 @@ from houndd.service_identity import (
 )
 import houndd.service_identity as identity_module
 from houndd.snapshot import build_journal_query_snapshot
+
+
+_NONCANONICAL_SEQUENCE_SCALARS = (
+    pytest.param(False, 0, id="false"),
+    pytest.param(True, 1, id="true"),
+    pytest.param(0.0, 0, id="zero-float"),
+    pytest.param(1.0, 1, id="one-float"),
+)
 
 
 def _digest(value: str) -> str:
@@ -337,6 +346,110 @@ def test_verified_snapshot_tampering_fails_without_mutation(tmp_path: Path, case
 
     with pytest.raises(JournalError):
         journal.verified_snapshot()
+
+    assert _manifest(root) == before
+
+
+@pytest.mark.parametrize("scalar,sequence", _NONCANONICAL_SEQUENCE_SCALARS)
+@pytest.mark.parametrize("target", ["chain", "current_head"])
+@pytest.mark.parametrize("operation", ["verified_snapshot", "reconcile", "append"])
+def test_journal_operations_reject_noncanonical_sequence_scalars_without_changing_bytes(
+    tmp_path: Path,
+    scalar: object,
+    sequence: int,
+    target: str,
+    operation: str,
+) -> None:
+    root = tmp_path / "store"
+    journal = Journal(root)
+    for index in range(sequence + 1):
+        journal.append(_event(index))
+    if target == "chain":
+        rows = journal.chain_path.read_bytes().splitlines(keepends=True)
+        value = json.loads(rows[sequence])
+        value["sequence"] = scalar
+        rows[sequence] = canonical_bytes(value) + b"\n"
+        journal.chain_path.write_bytes(b"".join(rows))
+    else:
+        value = json.loads(journal.head_path.read_bytes())
+        value["sequence"] = scalar
+        journal.head_path.write_bytes(canonical_bytes(value))
+    before = _manifest(root)
+
+    with pytest.raises(JournalError):
+        if operation == "verified_snapshot":
+            journal.verified_snapshot()
+        elif operation == "reconcile":
+            journal.reconcile()
+        else:
+            journal.append(_event(sequence + 1))
+
+    assert _manifest(root) == before
+
+
+@pytest.mark.parametrize("scalar,sequence", _NONCANONICAL_SEQUENCE_SCALARS)
+@pytest.mark.parametrize("operation", ["reconcile", "append"])
+def test_recovery_rejects_noncanonical_older_prefix_heads_without_changing_bytes(
+    tmp_path: Path,
+    scalar: object,
+    sequence: int,
+    operation: str,
+) -> None:
+    root = tmp_path / "store"
+    journal = Journal(root)
+    for index in range(sequence + 2):
+        journal.append(_event(index))
+    event = json.loads(journal.events_path.read_bytes().splitlines()[sequence])
+    chain = json.loads(journal.chain_path.read_bytes().splitlines()[sequence])
+    journal.head_path.write_bytes(
+        canonical_bytes(
+            {
+                "sequence": scalar,
+                "entry_id": event["entry_id"],
+                "chain_sha256": chain["chain_sha256"],
+            }
+        )
+    )
+    before = _manifest(root)
+
+    with pytest.raises(JournalError):
+        if operation == "reconcile":
+            journal.reconcile()
+        else:
+            journal.append(_event(sequence + 2))
+
+    assert _manifest(root) == before
+
+
+@pytest.mark.parametrize("scalar,sequence", _NONCANONICAL_SEQUENCE_SCALARS)
+@pytest.mark.parametrize("target", ["chain", "head"])
+def test_query_snapshot_builder_rejects_noncanonical_sequence_scalars_without_changing_bytes(
+    tmp_path: Path,
+    scalar: object,
+    sequence: int,
+    target: str,
+) -> None:
+    root = tmp_path / "store"
+    journal = Journal(root)
+    for index in range(sequence + 1):
+        journal.append(_event(index))
+    persisted = journal.verified_snapshot()
+    chain_rows = list(persisted.chain_rows)
+    head_bytes = persisted.head_bytes
+    if target == "chain":
+        value = json.loads(chain_rows[sequence])
+        value["sequence"] = scalar
+        chain_rows[sequence] = canonical_bytes(value) + b"\n"
+    else:
+        assert head_bytes is not None
+        value = json.loads(head_bytes)
+        value["sequence"] = scalar
+        head_bytes = canonical_bytes(value)
+    malformed = PersistedJournalSnapshot(persisted.event_rows, tuple(chain_rows), head_bytes)
+    before = _manifest(root)
+
+    with pytest.raises(QuerySnapshotError):
+        build_journal_query_snapshot(malformed)
 
     assert _manifest(root) == before
 

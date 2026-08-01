@@ -19,7 +19,12 @@ from .access import (
 )
 from .contracts import canonical_bytes, canonical_hash, validate_journal_envelope
 from .cursor import CursorBindings, CursorCodec, CursorKeyring, CursorRejected, JournalCursorCandidate
-from .journal import Journal, PersistedJournalSnapshot
+from .journal import (
+    Journal,
+    PersistedJournalSnapshot,
+    _validate_persisted_chain_value,
+    _validate_persisted_head_value,
+)
 from .provenance import ProvenanceProjection
 from .query_contracts import (
     ClassificationFilter,
@@ -231,16 +236,15 @@ def _head_value(raw: object) -> dict[str, object]:
     except (UnicodeError, ValueError) as error:
         raise QuerySnapshotError("persisted journal head is invalid JSON") from error
     try:
-        is_canonical = (
-            isinstance(value, dict)
-            and set(value) == {"sequence", "entry_id", "chain_sha256"}
-            and canonical_bytes(value) == raw
-        )
+        is_canonical = type(value) is dict and canonical_bytes(value) == raw
     except ValueError as error:
         raise QuerySnapshotError("persisted journal head is not canonical") from error
     if not is_canonical:
         raise QuerySnapshotError("persisted journal head is not canonical")
-    return value
+    try:
+        return _validate_persisted_head_value(value)
+    except ValueError as error:
+        raise QuerySnapshotError(str(error)) from error
 
 
 def build_journal_query_snapshot(
@@ -254,7 +258,10 @@ def build_journal_query_snapshot(
         raise QuerySnapshotError("persisted journal rows must be immutable tuples")
     try:
         events = [validate_journal_envelope(_row_value(raw, "event")) for raw in persisted.event_rows]
-        chains = [_row_value(raw, "chain") for raw in persisted.chain_rows]
+        chains = [
+            _validate_persisted_chain_value(_row_value(raw, "chain"))
+            for raw in persisted.chain_rows
+        ]
     except QuerySnapshotError:
         raise
     except (KeyError, TypeError, ValueError) as error:
@@ -281,7 +288,7 @@ def build_journal_query_snapshot(
                 event["sequence"] != expected_sequence
                 or event["entry_id"] in seen_entry_ids
                 or event_hash in seen_event_hashes
-                or chain != expected_chain
+                or canonical_bytes(chain) != canonical_bytes(expected_chain)
                 or expected_chain["chain_sha256"] in seen_chain_hashes
             ):
                 raise QuerySnapshotError("persisted journal sequence, identity, or chain is invalid")
@@ -307,11 +314,15 @@ def build_journal_query_snapshot(
             "entry_id": events[-1]["entry_id"],
             "chain_sha256": previous,
         }
-        if persisted.head_bytes is None or _head_value(persisted.head_bytes) != expected_head:
+        if persisted.head_bytes is None:
+            raise QuerySnapshotError("persisted journal head does not match its chain")
+        _head_value(persisted.head_bytes)
+        if persisted.head_bytes != canonical_bytes(expected_head):
             raise QuerySnapshotError("persisted journal head does not match its chain")
     elif persisted.head_bytes is not None:
         empty_head = {"sequence": -1, "entry_id": "", "chain_sha256": "0" * 64}
-        if _head_value(persisted.head_bytes) != empty_head:
+        _head_value(persisted.head_bytes)
+        if persisted.head_bytes != canonical_bytes(empty_head):
             raise QuerySnapshotError("persisted empty journal head is invalid")
 
     try:

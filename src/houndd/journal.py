@@ -26,6 +26,13 @@ class JournalError(StoreError):
 
 FaultHook = Callable[[str], None]
 
+_CHAIN_FIELDS = frozenset(
+    {"sequence", "entry_id", "event_sha256", "previous_chain_sha256", "chain_sha256"}
+)
+_HEAD_FIELDS = frozenset({"sequence", "entry_id", "chain_sha256"})
+_EMPTY_CHAIN_SHA256 = "0" * 64
+_SHA256_CHARACTERS = frozenset("0123456789abcdef")
+
 
 @dataclass(frozen=True, slots=True)
 class PersistedJournalSnapshot:
@@ -34,6 +41,55 @@ class PersistedJournalSnapshot:
     event_rows: tuple[bytes, ...]
     chain_rows: tuple[bytes, ...]
     head_bytes: bytes | None
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in _SHA256_CHARACTERS for character in value)
+    )
+
+
+def _validate_persisted_chain_value(value: object) -> dict[str, Any]:
+    if (
+        type(value) is not dict
+        or len(value) != len(_CHAIN_FIELDS)
+        or any(type(key) is not str for key in value)
+        or frozenset(value) != _CHAIN_FIELDS
+    ):
+        raise ValueError("journal chain row has invalid fields")
+    if type(value["sequence"]) is not int or value["sequence"] < 0:
+        raise ValueError("journal chain sequence must be a non-negative exact integer")
+    if any(
+        not _is_sha256(value[field])
+        for field in ("entry_id", "event_sha256", "previous_chain_sha256", "chain_sha256")
+    ):
+        raise ValueError("journal chain identity and hashes must be exact lowercase SHA-256 strings")
+    return value
+
+
+def _validate_persisted_head_value(value: object) -> dict[str, Any]:
+    if (
+        type(value) is not dict
+        or len(value) != len(_HEAD_FIELDS)
+        or any(type(key) is not str for key in value)
+        or frozenset(value) != _HEAD_FIELDS
+    ):
+        raise ValueError("journal head has invalid fields")
+    sequence = value["sequence"]
+    entry_id = value["entry_id"]
+    chain_sha256 = value["chain_sha256"]
+    if type(sequence) is not int or sequence < -1:
+        raise ValueError("journal head sequence must be an exact integer no smaller than -1")
+    if type(entry_id) is not str or not _is_sha256(chain_sha256):
+        raise ValueError("journal head identity and chain hash must be exact canonical strings")
+    if sequence == -1:
+        if entry_id != "" or chain_sha256 != _EMPTY_CHAIN_SHA256:
+            raise ValueError("empty journal head has invalid identity or chain hash")
+    elif not _is_sha256(entry_id):
+        raise ValueError("journal head entry ID must be an exact lowercase SHA-256 string")
+    return value
 
 
 def _private_directory(path: Path, *, create: bool = True) -> None:
@@ -124,7 +180,11 @@ class Journal:
             raw = self.anchor.read_bytes("journal", "chain.jsonl")
         except OSError as error:
             raise JournalError(f"cannot read journal file {self.chain_path}") from error
-        return self._read_lines_from_raw(self.chain_path, raw)
+        values = self._read_lines_from_raw(self.chain_path, raw)
+        try:
+            return [_validate_persisted_chain_value(value) for value in values]
+        except ValueError as error:
+            raise JournalError(str(error)) from error
 
     def _persisted_bytes_unlocked(self) -> tuple[bytes, bytes, bytes | None]:
         """Read events, chain, and head exactly once in canonical order."""
@@ -191,9 +251,10 @@ class Journal:
             raise JournalError("journal head is not canonical JSON") from error
         if canonical != raw:
             raise JournalError("journal head is not canonical JSON")
-        if set(value) != {"sequence", "chain_sha256", "entry_id"}:
-            raise JournalError("journal head has invalid fields")
-        return value
+        try:
+            return _validate_persisted_head_value(value)
+        except ValueError as error:
+            raise JournalError(str(error)) from error
 
     @classmethod
     def _validate_persisted_values(
@@ -202,12 +263,16 @@ class Journal:
         chains: list[dict[str, Any]],
         head_raw: bytes | None,
     ) -> None:
+        try:
+            chains = [_validate_persisted_chain_value(chain) for chain in chains]
+        except ValueError as error:
+            raise JournalError(str(error)) from error
         if len(chains) != len(events):
             if len(chains) < len(events):
                 raise JournalError("journal chain is incomplete")
             raise JournalError("journal chain has entries without events")
 
-        previous = "0" * 64
+        previous = _EMPTY_CHAIN_SHA256
         seen_entry_ids: set[str] = set()
         seen_event_hashes: set[str] = set()
         seen_chain_hashes: set[str] = set()
@@ -217,7 +282,10 @@ class Journal:
             if event["sequence"] != expected_sequence or entry_id in seen_entry_ids or event_hash in seen_event_hashes:
                 raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
             expected_chain = cls._chain_value(event, previous)
-            if chain != expected_chain or expected_chain["chain_sha256"] in seen_chain_hashes:
+            if (
+                canonical_bytes(chain) != canonical_bytes(expected_chain)
+                or expected_chain["chain_sha256"] in seen_chain_hashes
+            ):
                 raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
             seen_entry_ids.add(entry_id)
             seen_event_hashes.add(event_hash)
@@ -232,13 +300,15 @@ class Journal:
             }
             if head_raw is None:
                 raise JournalError("journal head is missing")
-            if cls._head_from_raw(head_raw) != expected_head:
+            cls._head_from_raw(head_raw)
+            if head_raw != canonical_bytes(expected_head):
                 raise JournalError("journal head does not match journal chain")
             return
 
         if head_raw is not None:
-            empty_head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
-            if cls._head_from_raw(head_raw) != empty_head:
+            empty_head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
+            cls._head_from_raw(head_raw)
+            if head_raw != canonical_bytes(empty_head):
                 raise JournalError("empty journal head is invalid")
 
     def verified_snapshot(self) -> PersistedJournalSnapshot:
@@ -266,7 +336,7 @@ class Journal:
             raise JournalError("journal chain has entries without events")
         if len(persisted_chains) < len(events) and not repair_missing:
             raise JournalError("journal chain is incomplete")
-        previous = "0" * 64
+        previous = _EMPTY_CHAIN_SHA256
         seen_entry_ids: set[str] = set()
         seen_event_hashes: set[str] = set()
         seen_chain_hashes: set[str] = set()
@@ -277,7 +347,7 @@ class Journal:
                 raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
             expected = self._chain_value(event, previous)
             if index < len(persisted_chains):
-                if persisted_chains[index] != expected:
+                if canonical_bytes(persisted_chains[index]) != canonical_bytes(expected):
                     raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
             if expected["chain_sha256"] in seen_chain_hashes:
                 raise JournalError("journal chain hashes are not unique")
@@ -289,27 +359,30 @@ class Journal:
         if events:
             head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
         else:
-            head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
-        empty_head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
-        recoverable_heads = [empty_head]
-        recoverable_heads.extend(
-            {
-                "sequence": events[index]["sequence"],
-                "chain_sha256": expected_chains[index]["chain_sha256"],
-                "entry_id": events[index]["entry_id"],
-            }
+            head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
+        head_bytes = canonical_bytes(head)
+        empty_head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
+        recoverable_head_bytes = [canonical_bytes(empty_head)]
+        recoverable_head_bytes.extend(
+            canonical_bytes(
+                {
+                    "sequence": events[index]["sequence"],
+                    "chain_sha256": expected_chains[index]["chain_sha256"],
+                    "entry_id": events[index]["entry_id"],
+                }
+            )
             for index in range(len(persisted_chains))
         )
         head_needs_repair = False
         if self.anchor.exists("journal", "head.json"):
             try:
                 raw_head = self.anchor.read_bytes("journal", "head.json")
-                persisted = self._head_from_raw(raw_head)
+                self._head_from_raw(raw_head)
             except (OSError, StoreError) as error:
                 raise JournalError("journal head is unreadable") from error
-            if persisted == head and len(persisted_chains) == len(events):
+            if raw_head == head_bytes and len(persisted_chains) == len(events):
                 pass
-            elif repair_missing and persisted in recoverable_heads:
+            elif repair_missing and raw_head in recoverable_head_bytes:
                 head_needs_repair = True
             else:
                 raise JournalError("journal head does not match journal chain")
@@ -367,7 +440,7 @@ class Journal:
                 os.fsync(parent_fd)
             finally:
                 os.close(parent_fd)
-            previous = chains[-1]["chain_sha256"] if chains else "0" * 64
+            previous = chains[-1]["chain_sha256"] if chains else _EMPTY_CHAIN_SHA256
             chain = self._chain_value(envelope, previous)
             self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(chain) + b"\n")
             head = {"sequence": envelope["sequence"], "chain_sha256": chain["chain_sha256"], "entry_id": envelope["entry_id"]}
