@@ -10,12 +10,10 @@
     "HSP-21"
   ],
   "regression_only_hsps": [
-    "HSP-02",
     "HSP-04",
     "HSP-05",
     "HSP-07",
-    "HSP-14",
-    "HSP-19"
+    "HSP-14"
   ],
   "no_new_claim_hsps": [
     "HSP-03",
@@ -60,9 +58,9 @@
         "canonical filters use one verified persisted journal snapshot in chronological order",
         "Journal, ServiceIdentity, QueryRequest, PrincipalScope, and every nested model are exact reconstructed inputs before durable hooks",
         "malformed cursors reject before provenance work and authenticated wrong-context or old-context recovery is linear",
-        "lane, topic, and entity fail with filter_not_available before evaluation",
-        "deleted or corrupt SQLite is neither opened nor rebuilt",
-        "cursor restart preserves its original high-watermark and persists no read state"
+        "lane, topic, entity, and combined unsupported filters raise exact filter_not_available before either durable class hook",
+        "valid, corrupt, and absent SQLite indexes leave complete pages, cursor SHA-256 values, recovered positions, fixed high-watermarks, resumed positions, and terminal cursors unchanged without opening or rebuilding SQLite",
+        "an appended entry is excluded from an old fixed-high-watermark continuation and included in a fresh chronological query"
       ],
       "retained_artifacts": [
         "src/houndd/cursor.py",

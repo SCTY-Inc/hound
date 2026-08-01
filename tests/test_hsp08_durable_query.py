@@ -152,6 +152,62 @@ def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
     return tuple(result)
 
 
+def _index_manifest(index: Path) -> tuple[object, ...] | None:
+    try:
+        info = index.lstat()
+    except FileNotFoundError:
+        return None
+    return (
+        "symlink" if stat.S_ISLNK(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "file",
+        os.readlink(index) if stat.S_ISLNK(info.st_mode) else None,
+        info.st_dev,
+        info.st_ino,
+        stat.S_IMODE(info.st_mode),
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_rdev,
+        info.st_size,
+        info.st_blksize,
+        info.st_blocks,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        hashlib.sha256(index.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else None,
+    )
+
+
+def _cursor_sha256(cursor: str | None) -> str | None:
+    return None if cursor is None else hashlib.sha256(cursor.encode("utf-8")).hexdigest()
+
+
+def _candidate_position(candidate) -> tuple[object, ...]:
+    appended_at = candidate.appended_at
+    return (
+        candidate.sequence,
+        candidate.entry_id,
+        appended_at.isoformat() if hasattr(appended_at, "isoformat") else appended_at,
+        candidate.chain_sha256,
+    )
+
+
+def _page_manifest(page) -> tuple[tuple[tuple[object, ...], ...], str | None]:
+    return (
+        tuple(
+            (
+                json.dumps(item.event, default=dict, sort_keys=True, separators=(",", ":")),
+                item.event["sequence"],
+                item.event["entry_id"],
+                item.event["appended_at"],
+                item.provenance.lane,
+                tuple(item.provenance.topics),
+                tuple(item.provenance.entities),
+            )
+            for item in page.items
+        ),
+        _cursor_sha256(page.next_cursor),
+    )
+
+
 def test_durable_query_uses_exact_persisted_chain_and_all_canonical_filter_families(tmp_path: Path) -> None:
     journal, identity, adapter, events = _store(tmp_path / "store")
     snapshot = build_journal_query_snapshot(journal.verified_snapshot())
@@ -206,10 +262,11 @@ def test_projection_filters_fail_explicitly_before_identity_or_journal_access(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("unsupported filters reached durable evaluation")
 
-    monkeypatch.setattr(journal, "verified_snapshot", forbidden)
-    monkeypatch.setattr(identity, "lease", forbidden)
+    monkeypatch.setattr(Journal, "verified_snapshot", forbidden)
+    monkeypatch.setattr(ServiceIdentity, "lease", forbidden)
     with pytest.raises(QueryFilterNotAvailable) as raised:
         adapter.execute(QueryRequest(parse_query_filter(filter_value)), _scope())
+    assert type(raised.value) is QueryFilterNotAvailable
     assert raised.value.code == "filter_not_available"
     assert raised.value.filters == tuple(sorted(filter_value))
     assert "cursor" not in vars(raised.value)
@@ -230,36 +287,129 @@ def test_none_scope_is_auth_first_and_dereferences_nothing(tmp_path: Path, monke
     journal.close()
 
 
-def test_query_is_sqlite_independent_and_never_rebuilds_or_opens_it(
+def test_query_is_sqlite_independent_across_valid_corrupt_and_absent_indexes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = tmp_path / "store"
-    journal, identity, adapter, _ = _store(root)
-    request = QueryRequest(parse_query_filter({}), limit=2)
-    baseline = _ids(adapter.execute(request, _scope()))
-    index = root / "index.sqlite"
-    index.write_bytes(b"not sqlite and not canonical truth")
-    index.chmod(0o600)
-    before = (index.lstat(), index.read_bytes())
+    seed_root = tmp_path / "seed"
+    seed_journal, seed_identity, _, events = _store(seed_root)
+    seed_identity.close()
+    seed_journal.close()
 
-    monkeypatch.setattr(sqlite3, "connect", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SQLite opened")))
-    assert _ids(adapter.execute(request, _scope())) == baseline
-    after = (index.lstat(), index.read_bytes())
-    assert after[1] == before[1]
-    assert (after[0].st_dev, after[0].st_ino, after[0].st_mode, after[0].st_size, after[0].st_mtime_ns, after[0].st_ctime_ns) == (
-        before[0].st_dev,
-        before[0].st_ino,
-        before[0].st_mode,
-        before[0].st_size,
-        before[0].st_mtime_ns,
-        before[0].st_ctime_ns,
-    )
-    index.unlink()
-    assert _ids(adapter.execute(request, _scope())) == baseline
-    assert not index.exists()
-    identity.close()
-    journal.close()
+    roots: dict[str, Path] = {}
+    for state in ("valid", "corrupt", "absent"):
+        root = tmp_path / state
+        shutil.copytree(seed_root, root)
+        index = root / "index.sqlite"
+        if state == "valid":
+            connection = sqlite3.connect(index)
+            try:
+                connection.execute("CREATE TABLE durable_query_probe (value TEXT NOT NULL)")
+                connection.execute("INSERT INTO durable_query_probe VALUES ('canonical journal remains truth')")
+                connection.commit()
+            finally:
+                connection.close()
+        elif state == "corrupt":
+            index.write_bytes(b"not sqlite and not canonical truth")
+        else:
+            assert not index.exists()
+        roots[state] = root
+
+    connect_calls = 0
+    recovery_observations: list[tuple[str, tuple[object, ...], tuple[object, ...]]] = []
+    real_recover = CursorCodec.recover
+
+    def forbidden_connect(*_args, **_kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        raise AssertionError("SQLite opened")
+
+    def observed_recover(codec, token, bindings, snapshot, *, scan_observer=None):
+        recovery = real_recover(codec, token, bindings, snapshot, scan_observer=scan_observer)
+        recovery_observations.append(
+            (_cursor_sha256(token) or "", _candidate_position(recovery.last), _candidate_position(recovery.high_watermark))
+        )
+        return recovery
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
+    monkeypatch.setattr(CursorCodec, "recover", observed_recover)
+
+    proofs: dict[str, tuple[object, ...]] = {}
+    for state, root in roots.items():
+        index = root / "index.sqlite"
+        before = _index_manifest(index)
+        journal = Journal(root, create=False)
+        identity = ServiceIdentity(root)
+        adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+        original_snapshot = build_journal_query_snapshot(journal.verified_snapshot())
+        expected_old_hwm = _candidate_position(original_snapshot.cursor_recovery_snapshot.candidates[-1])
+
+        first = adapter.execute(QueryRequest(parse_query_filter({}), limit=2), _scope())
+        assert [item.event["sequence"] for item in first.items] == [1, 2]
+        assert first.next_cursor is not None
+        expected_old_last = _candidate_position(
+            next(
+                candidate
+                for candidate in original_snapshot.cursor_recovery_snapshot.candidates
+                if candidate.entry_id == first.items[-1].event["entry_id"]
+            )
+        )
+        appended = _event(5, when="2026-07-31T00:30:00Z", run_id="run-later", access="restricted")
+        journal.append(appended)
+
+        recovery_start = len(recovery_observations)
+        old_pages = [_page_manifest(first)]
+        old_cursor = first.next_cursor
+        while old_cursor is not None:
+            page = adapter.execute(QueryRequest(parse_query_filter({}), limit=1, cursor=old_cursor), _scope())
+            old_pages.append(_page_manifest(page))
+            old_cursor = page.next_cursor
+        old_recoveries = tuple(recovery_observations[recovery_start:])
+        old_positions = tuple(item[1:4] for page in old_pages for item in page[0])
+        assert old_pages[-1][1] is None
+        assert old_positions == tuple(
+            (events[sequence]["sequence"], events[sequence]["entry_id"], events[sequence]["appended_at"])
+            for sequence in (1, 2, 3, 0, 4)
+        )
+        assert appended["entry_id"] not in [position[1] for position in old_positions]
+        assert len(old_recoveries) == 6
+        assert old_recoveries[0][1] == expected_old_last
+        assert all(recovery[2] == expected_old_hwm for recovery in old_recoveries)
+
+        fresh_snapshot = build_journal_query_snapshot(journal.verified_snapshot())
+        expected_fresh_hwm = _candidate_position(fresh_snapshot.cursor_recovery_snapshot.candidates[-1])
+        assert expected_old_hwm != expected_fresh_hwm
+        fresh_pages = []
+        fresh_cursor: str | None = None
+        while True:
+            page = adapter.execute(
+                QueryRequest(parse_query_filter({}), limit=2, cursor=fresh_cursor),
+                _scope(),
+            )
+            fresh_pages.append(_page_manifest(page))
+            fresh_cursor = page.next_cursor
+            if fresh_cursor is None:
+                break
+        fresh_recoveries = tuple(recovery_observations[recovery_start + len(old_recoveries) :])
+        fresh_positions = tuple(item[1:4] for page in fresh_pages for item in page[0])
+        assert fresh_pages[-1][1] is None
+        expected_fresh_positions = ((appended["sequence"], appended["entry_id"], appended["appended_at"]),) + tuple(
+            (events[sequence]["sequence"], events[sequence]["entry_id"], events[sequence]["appended_at"])
+            for sequence in (1, 2, 3, 0, 4)
+        )
+        assert fresh_positions == expected_fresh_positions
+        assert fresh_positions[0] == (appended["sequence"], appended["entry_id"], appended["appended_at"])
+        assert len(fresh_recoveries) == 4
+        assert fresh_recoveries[0][1][0:2] == (events[1]["sequence"], events[1]["entry_id"])
+        assert all(recovery[2] == expected_fresh_hwm for recovery in fresh_recoveries)
+
+        proofs[state] = (tuple(old_pages), old_recoveries, tuple(fresh_pages), fresh_recoveries)
+        assert _index_manifest(index) == before
+        identity.close()
+        journal.close()
+
+    assert connect_calls == 0
+    assert proofs["valid"] == proofs["corrupt"] == proofs["absent"]
 
 
 def test_fixed_hwm_cursor_resumes_after_append_and_full_restart_with_limit_change(tmp_path: Path) -> None:
