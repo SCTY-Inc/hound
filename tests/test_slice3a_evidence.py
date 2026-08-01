@@ -100,7 +100,10 @@ _REBOUND_SOURCE = "HOUND_SLICE3A_REBOUND_SOURCE"
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _copy_and_rebind_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -176,6 +179,13 @@ def _mutate_fd_report(candidate: Path, mutation: Callable[[dict[str, Any]], None
     _write_json(candidate / "fd-failure-path-matrix.json", report)
 
 
+def _mutate_junit(candidate: Path, mutation: Callable[[ElementTree.Element], None]) -> None:
+    path = candidate / "slice3a-pytest.xml"
+    root = ElementTree.parse(path).getroot()
+    mutation(root)
+    ElementTree.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
 def source_paths(commit: str) -> tuple[str, ...]:
     tracked = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", commit], cwd=ROOT, text=True).splitlines()
     required = {"pyproject.toml", "uv.lock", "tests/acceptance_slice3a.json", "tests/generate_slice3a_evidence.py", "tests/test_slice3a_evidence.py", "tests/slice3a_evidence_capture.py", *SUITE_FILES["focused"], *SUITE_FILES["compatibility"]}
@@ -184,9 +194,36 @@ def source_paths(commit: str) -> tuple[str, ...]:
     return tuple(sorted(required))
 
 
-def _load(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_bytes())
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _load(path: Path, *, canonical: bool = True) -> dict[str, Any]:
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AssertionError(path) from exc
     assert type(value) is dict, path
+    if canonical:
+        expected = (
+            json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        assert raw == expected, path
     return value
 
 
@@ -200,18 +237,48 @@ def _git(*args: str) -> str:
 
 def _node_ids(path: Path) -> tuple[list[str], dict[str, int]]:
     root = ElementTree.parse(path).getroot()
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    counts = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+    count_keys = ("tests", "failures", "errors", "skipped")
+    if root.tag == "testsuite":
+        suites = [root]
+        aggregate = None
+    else:
+        assert root.tag == "testsuites"
+        suites = list(root)
+        assert suites and all(suite.tag == "testsuite" for suite in suites)
+        aggregate = root
+    assert len(list(root.iter("testsuite"))) == len(suites)
+
+    counts = {key: 0 for key in count_keys}
     nodes: list[str] = []
     for suite in suites:
-        for key in counts:
-            value = int(suite.attrib.get(key, "0"))
-            assert type(value) is int
-            counts[key] += value
-    for case in root.iter("testcase"):
-        classname, name = case.attrib.get("classname"), case.attrib.get("name")
-        assert classname and name
-        nodes.append(f"{classname.replace('.', '/')}.py::{name}")
+        cases = [child for child in suite if child.tag == "testcase"]
+        assert len(list(suite.iter("testcase"))) == len(cases)
+        derived = {key: 0 for key in count_keys}
+        derived["tests"] = len(cases)
+        for case in cases:
+            classname, name = case.attrib.get("classname"), case.attrib.get("name")
+            assert type(classname) is str and classname and type(name) is str and name
+            nodes.append(f"{classname.replace('.', '/')}.py::{name}")
+            outcome_count = 0
+            for key in ("failures", "errors", "skipped"):
+                tag = key.removesuffix("s")
+                direct = [child for child in case if child.tag == tag]
+                assert len(direct) <= 1
+                assert len(list(case.iter(tag))) == len(direct)
+                derived[key] += len(direct)
+                outcome_count += len(direct)
+            assert outcome_count <= 1
+        for key in count_keys:
+            declared = suite.attrib.get(key)
+            assert type(declared) is str and re.fullmatch(r"0|[1-9][0-9]*", declared)
+            assert int(declared) == derived[key]
+            counts[key] += derived[key]
+    if aggregate is not None:
+        for key in count_keys:
+            if key in aggregate.attrib:
+                declared = aggregate.attrib[key]
+                assert type(declared) is str and re.fullmatch(r"0|[1-9][0-9]*", declared)
+                assert int(declared) == counts[key]
     assert counts["tests"] == len(nodes) and len(nodes) == len(set(nodes)) and nodes
     return nodes, counts
 
@@ -385,7 +452,7 @@ def _report(evidence: Path, name: str, expected_nodes: list[str]) -> dict[str, A
 
 
 def _fd_descriptors(value: object) -> list[dict[str, Any]]:
-    assert type(value) is list
+    assert type(value) is list and value
     descriptors: list[dict[str, Any]] = []
     for descriptor in value:
         descriptor = _exact_keys(descriptor, {"fd", "target"})
@@ -423,6 +490,21 @@ def _outside_manifest(value: object) -> list[list[Any]]:
     return value
 
 
+_OUTSIDE_SENTINEL_SHA256 = "73606bdee62655425a943d2a1c1343cc1fdad5aee3c48873416a34d5cd060f69"
+
+
+def _exact_outside_manifest(value: object) -> list[list[Any]]:
+    result = _outside_manifest(value)
+    assert len(result) == 2
+    directory, sentinel = result
+    assert directory[0] == "." and directory[1] == "directory"
+    assert directory[2] is None and directory[11] is None
+    assert sentinel[0] == "sentinel" and sentinel[1] == "file"
+    assert sentinel[2] is None and sentinel[8] == 25
+    assert sentinel[11] == _OUTSIDE_SENTINEL_SHA256
+    return result
+
+
 def _fd_observations(value: object) -> None:
     observations = _exact_keys(value, {"paths"})
     rows = observations["paths"]
@@ -454,6 +536,7 @@ def _fd_observations(value: object) -> None:
         assert len(after) == len(baseline) and baseline == after
         assert row["before_state"] == row["after_state"]
         _inventory(row["before_state"])
+        _inventory(row["after_state"])
         if outside_kind == "public":
             assert row["result"] == "invalid" and type(row["result"]) is str
             assert "outside_before" not in row and "outside_after" not in row
@@ -462,9 +545,11 @@ def _fd_observations(value: object) -> None:
             assert type(outside_before) is list and type(outside_after) is list
             assert outside_before == outside_after
             if outside_kind == "paths":
-                _outside_paths(outside_before)
+                assert _outside_paths(outside_before) == ["sentinel"]
+                assert _outside_paths(outside_after) == ["sentinel"]
             else:
-                _outside_manifest(outside_before)
+                _exact_outside_manifest(outside_before)
+                _exact_outside_manifest(outside_after)
 
 
 def validate_bundle(evidence: Path = EVIDENCE) -> None:
@@ -473,7 +558,7 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     entries = list(evidence.iterdir())
     assert all(path.is_file() and not path.is_symlink() for path in entries)
     assert {path.name for path in entries} == LEAVES
-    acceptance = _load(ROOT / "tests" / "acceptance_slice3a.json")
+    acceptance = _load(ROOT / "tests" / "acceptance_slice3a.json", canonical=False)
     assert acceptance.get("partial_hsps") == ["HSP-08", "HSP-20", "HSP-21"] and acceptance.get("no_new_claim_hsps") == ["HSP-03", "HSP-09"]
     artifact_map = acceptance.get("artifacts")
     evidence_map = {path: claim for path, claim in artifact_map.items() if path.startswith("tests/evidence/slice3a/")} if type(artifact_map) is dict else {}
@@ -513,6 +598,7 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         junit = _exact_keys(suite["junit_command"], {"id", "argv", "exit"})
         assert collect["id"] == f"{suite_name}-collect" and junit["id"] == f"{suite_name}-junit" and collect["exit"] == junit["exit"] == 0
         assert type(collect["argv"]) is list and type(junit["argv"]) is list
+        assert collect["argv"][0] == junit["argv"][0] == sys.executable
         assert collect["argv"][1:5] == ["-m", "pytest", "--collect-only", "-q"] and collect["argv"][5:] == list(files)
         assert junit["argv"][1:4] == ["-m", "pytest", "-p"] and junit["argv"][4:6] == ["no:cacheprovider", f"--junitxml={evidence / suite['junit_file']}"] and junit["argv"][6:] == list(files)
         assert suite["junit_file"] in JUNITS and _sha(evidence / suite["junit_file"]) == suite["junit_sha256"] and suite["junit_sha256"] not in STALE_JUNIT_SHA256
@@ -526,7 +612,14 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     for name in REPORTS | JUNITS:
         artifact = _exact_keys(artifacts[name], {"sha256", "producer_command", "source_paths", "proving_node_ids"})
         assert artifact["sha256"] == _sha(evidence / name)
-        assert artifact["producer_command"] in {"focused-junit", "compatibility-junit", "evidence-observer"}
+        expected_producer = (
+            "focused-junit"
+            if name == "slice3a-pytest.xml"
+            else "compatibility-junit"
+            if name == "compatibility-pytest.xml"
+            else "evidence-observer"
+        )
+        assert artifact["producer_command"] == expected_producer
         assert tuple(artifact["source_paths"]) == expected_sources
         expected_nodes = (
             sorted(suite_nodes["focused"])
@@ -624,6 +717,17 @@ def test_inventory_allows_real_singleton_but_read_state_rejects_singletons_and_s
         _read_state_inventory({**singleton, "root": "synthetic-read-state"})
 
 
+def test_acceptance_json_is_strict_but_need_not_use_candidate_canonical_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "acceptance.json"
+    path.write_bytes(b'{ "value": 1 }')
+    assert _load(path, canonical=False) == {"value": 1}
+
+    for raw in (b'{"value":1,"value":1}\n', b'{"value":NaN}\n', b'\xff'):
+        path.write_bytes(raw)
+        with pytest.raises(AssertionError):
+            _load(path, canonical=False)
+
+
 def test_rebound_slice3a_bundle_passes_without_tampering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -652,6 +756,27 @@ def test_rebound_slice3a_bundle_passes_without_tampering(
         "nested_extra_file",
         "changed_commit_binding",
         "changed_tree_binding",
+        "junit_failure_child_with_zero_attrs",
+        "junit_error_child_with_zero_attrs",
+        "junit_skipped_child_with_zero_attrs",
+        "junit_failure_attr_without_child",
+        "junit_nested_suite",
+        "junit_noncanonical_count",
+        "junit_aggregate_mismatch",
+        "json_duplicate_identical_value",
+        "json_noncanonical_whitespace",
+        "json_missing_final_lf",
+        "json_nonfinite",
+        "json_invalid_utf8",
+        "collect_wrong_interpreter",
+        "junit_wrong_interpreter",
+        "producer_swap_both_directions",
+        "empty_fd_inventories_count_one",
+        "coherent_anchored_read_outside_forgery",
+        "coherent_anchored_append_outside_forgery",
+        "coherent_verified_snapshot_outside_forgery",
+        "coherent_direct_append_outside_forgery",
+        "coherent_procfs_outside_forgery",
     ],
 )
 def test_rebound_slice3a_bundle_rejects_resealed_provenance_and_fd_tampering(
@@ -717,6 +842,109 @@ def test_rebound_slice3a_bundle_rejects_resealed_provenance_and_fd_tampering(
     elif case == "changed_tree_binding":
         manifest["reviewed"]["tree"] = "f" * 40
         _write_json(candidate / "run-manifest.json", manifest)
+    elif case in {
+        "junit_failure_child_with_zero_attrs",
+        "junit_error_child_with_zero_attrs",
+        "junit_skipped_child_with_zero_attrs",
+    }:
+        outcome = case.removeprefix("junit_").removesuffix("_child_with_zero_attrs")
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(next(root.iter("testcase")), outcome),
+        )
+    elif case == "junit_failure_attr_without_child":
+        _mutate_junit(
+            candidate,
+            lambda root: next(root.iter("testsuite")).set("failures", "1"),
+        )
+    elif case == "junit_nested_suite":
+        _mutate_junit(
+            candidate,
+            lambda root: ElementTree.SubElement(next(root.iter("testsuite")), "testsuite", {
+                "name": "nested", "tests": "0", "failures": "0", "errors": "0", "skipped": "0",
+            }),
+        )
+    elif case == "junit_noncanonical_count":
+        _mutate_junit(
+            candidate,
+            lambda root: next(root.iter("testsuite")).set("failures", "00"),
+        )
+    elif case == "junit_aggregate_mismatch":
+        _mutate_junit(candidate, lambda root: root.set("tests", "1"))
+    elif case == "json_duplicate_identical_value":
+        path = candidate / "canonical-query-matrix.json"
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(
+            b'{\n  "observations":',
+            f'{{\n  "schema_version": "{SCHEMA}",\n  "observations":'.encode("ascii"),
+            1,
+        ))
+    elif case == "json_noncanonical_whitespace":
+        path = candidate / "canonical-query-matrix.json"
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'{\n', b'{ \n', 1))
+    elif case == "json_missing_final_lf":
+        path = candidate / "canonical-query-matrix.json"
+        raw = path.read_bytes()
+        assert raw.endswith(b"\n")
+        path.write_bytes(raw[:-1])
+    elif case == "json_nonfinite":
+        path = candidate / "canonical-query-matrix.json"
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'"observations": {', b'"observations": {\n    "nonfinite": NaN,', 1))
+    elif case == "json_invalid_utf8":
+        path = candidate / "canonical-query-matrix.json"
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'{\n', b'{\n  "invalid": "\xff",\n', 1))
+    elif case == "collect_wrong_interpreter":
+        manifest["suites"]["focused"]["collect_command"]["argv"][0] = "/bin/false"
+        _write_json(candidate / "run-manifest.json", manifest)
+    elif case == "junit_wrong_interpreter":
+        manifest["suites"]["focused"]["junit_command"]["argv"][0] = "/bin/false"
+        _write_json(candidate / "run-manifest.json", manifest)
+    elif case == "producer_swap_both_directions":
+        manifest["artifacts"]["slice3a-pytest.xml"]["producer_command"] = "compatibility-junit"
+        manifest["artifacts"]["compatibility-pytest.xml"]["producer_command"] = "focused-junit"
+        _write_json(candidate / "run-manifest.json", manifest)
+    elif case == "empty_fd_inventories_count_one":
+        def empty_fd_inventories(report: dict[str, Any]) -> None:
+            row = _fd_path(report, "anchored_read")
+            row["baseline"] = row["after"] = []
+            row["baseline_count"] = row["after_count"] = 1
+        _mutate_fd_report(candidate, empty_fd_inventories)
+    elif case in {
+        "coherent_anchored_read_outside_forgery",
+        "coherent_anchored_append_outside_forgery",
+    }:
+        path_name = "anchored_read" if "read" in case else "anchored_append"
+        def forge_outside_paths(report: dict[str, Any]) -> None:
+            row = _fd_path(report, path_name)
+            row["outside_before"] = row["outside_after"] = ["forged"]
+        _mutate_fd_report(candidate, forge_outside_paths)
+    elif case in {
+        "coherent_verified_snapshot_outside_forgery",
+        "coherent_direct_append_outside_forgery",
+        "coherent_procfs_outside_forgery",
+    }:
+        if case == "coherent_verified_snapshot_outside_forgery":
+            path_name, field = "verified_snapshot", "path"
+        elif case == "coherent_direct_append_outside_forgery":
+            path_name, field = "direct_journal_append", "size"
+        else:
+            path_name, field = "procfs_fstat_eio", "digest"
+
+        def forge_outside_manifest(report: dict[str, Any]) -> None:
+            row = _fd_path(report, path_name)
+            for side in ("outside_before", "outside_after"):
+                manifest_rows = row[side]
+                sentinel = next(item for item in manifest_rows if item[0] == "sentinel")
+                if field == "path":
+                    sentinel[0] = "forged"
+                elif field == "size":
+                    sentinel[8] = 26
+                else:
+                    sentinel[11] = "0" * 64
+        _mutate_fd_report(candidate, forge_outside_manifest)
     else:  # pragma: no cover - parameter guard
         raise AssertionError(case)
 
