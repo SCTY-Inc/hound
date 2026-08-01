@@ -333,7 +333,9 @@ def _pages(value: object) -> list[Any]:
             assert lane is None or type(lane) is str and lane
             assert type(topics) is list and all(type(topic) is str for topic in topics)
             assert type(entities) is list and all(type(entity) is str for entity in entities)
-            assert event.get("sequence") == sequence and type(event.get("sequence")) is int
+            event_sequence = event.get("sequence")
+            _integer(event_sequence)
+            assert event_sequence == sequence
             assert event.get("entry_id") == entry_id and event.get("appended_at") == appended_at
     return value
 
@@ -353,7 +355,8 @@ def _index_manifest(value: object) -> list[Any] | None:
 def _sqlite_observations(value: object) -> None:
     observations = _exact_keys(value, {"proofs_equal", "sqlite_connect_calls", "states"})
     assert observations["proofs_equal"] is True
-    assert observations["sqlite_connect_calls"] == 0 and type(observations["sqlite_connect_calls"]) is int
+    _integer(observations["sqlite_connect_calls"])
+    assert observations["sqlite_connect_calls"] == 0
     states = observations["states"]
     assert type(states) is dict and set(states) == {"valid", "corrupt", "absent"}
     proof: list[object] = []
@@ -447,6 +450,66 @@ def _report(evidence: Path, name: str, expected_nodes: list[str]) -> dict[str, A
     proving = report["proving_node_ids"]
     assert type(proving) is list and proving == expected_nodes
     return report
+
+
+def _identity_crash_observations(value: object, expected_nodes: list[str]) -> None:
+    observations = _exact_keys(value, {"matrix"})
+    matrix = observations["matrix"]
+    assert type(matrix) is list and matrix
+    node_prefix = _REPORT_NODE_BASES["identity-crash-matrix.json"][0]
+    expected_cases: set[tuple[str, str]] = set()
+    for node in expected_nodes:
+        matched = re.fullmatch(
+            rf"{re.escape(node_prefix)}\[([a-z]+)-([a-z0-9_]+)\]",
+            node,
+        )
+        assert matched is not None
+        expected_cases.add((matched.group(1), matched.group(2)))
+    assert len(expected_cases) == len(expected_nodes)
+
+    before_publication = {
+        "before_identity_temp_write",
+        "mid_identity_temp_write",
+        "after_identity_temp_write",
+        "after_identity_temp_fsync",
+        "after_identity_marker_fsync",
+        "after_identity_new_witness_link",
+        "after_identity_old_witness_link",
+        "after_identity_swap_witness_link",
+        "after_identity_prepared_directory_fsync",
+        "before_identity_publication",
+    }
+    actual_cases: list[tuple[str, str]] = []
+    for row in matrix:
+        row = _exact_keys(
+            row,
+            {
+                "before_rename",
+                "child_exit",
+                "fault_point",
+                "identity_sha256",
+                "operation",
+                "state",
+            },
+        )
+        assert type(row["operation"]) is str and row["operation"]
+        assert type(row["fault_point"]) is str and row["fault_point"]
+        assert type(row["before_rename"]) is bool
+        _integer(row["child_exit"])
+        assert row["child_exit"] == 77
+        identity_sha256 = _sha256(row["identity_sha256"])
+        state = _inventory(row["state"])
+        identity_entries = [
+            entry
+            for entry in state["entries"]
+            if entry["path"] == "service/identity.json" and entry["kind"] == "regular"
+        ]
+        assert len(identity_entries) == 1
+        assert identity_entries[0]["sha256"] == identity_sha256
+        assert row["before_rename"] is (row["fault_point"] in before_publication)
+        actual_cases.append((row["operation"], row["fault_point"]))
+    assert len(actual_cases) == len(expected_cases)
+    assert set(actual_cases) == expected_cases
 
 
 def _fd_descriptors(value: object) -> list[dict[str, Any]]:
@@ -641,7 +704,10 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     for item in unsupported:
         assert type(item) is dict and item["result_type"] == "QueryFilterNotAvailable" and item["filter_keys"] == sorted(item["filter"])
         calls = item["class_hook_calls"]
-        assert type(calls) is dict and calls == {"Journal.verified_snapshot": 0, "ServiceIdentity.lease": 0} and all(type(value) is int for value in calls.values())
+        calls = _exact_keys(calls, {"Journal.verified_snapshot", "ServiceIdentity.lease"})
+        for value in calls.values():
+            _integer(value)
+        assert calls == {"Journal.verified_snapshot": 0, "ServiceIdentity.lease": 0}
 
     sqlite = _report(evidence, "sqlite-independence.json", expected_report_nodes["sqlite-independence.json"])
     _sqlite_observations(sqlite["observations"])
@@ -670,17 +736,27 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
         assert item["before"] == item["after"] and item["result"] == "JournalError"
     assert cases == expected_cases
     recovery = _report(evidence, "recovery-vs-verification.json", expected_report_nodes["recovery-vs-verification.json"])
-    assert recovery["observations"].get("reconcile") and len(recovery["observations"].get("tamper", [])) == 17
+    recovery_observations = _exact_keys(recovery["observations"], {"reconcile", "tamper"})
+    assert type(recovery_observations["reconcile"]) is dict and recovery_observations["reconcile"]
+    assert type(recovery_observations["tamper"]) is list
+    assert len(recovery_observations["tamper"]) == 17
 
     fd = _report(evidence, "fd-failure-path-matrix.json", expected_report_nodes["fd-failure-path-matrix.json"])
     _fd_observations(fd["observations"])
 
     identity = _report(evidence, "identity-mode-lock-path-report.json", expected_report_nodes["identity-mode-lock-path-report.json"])
-    assert identity["observations"].get("lifetime") and len(identity["observations"].get("procfs", [])) == 2
+    identity_observations = _exact_keys(identity["observations"], {"lifetime", "procfs"})
+    assert type(identity_observations["lifetime"]) is dict and identity_observations["lifetime"]
+    assert type(identity_observations["procfs"]) is list
+    assert len(identity_observations["procfs"]) == 2
     crash = _report(evidence, "identity-crash-matrix.json", expected_report_nodes["identity-crash-matrix.json"])
-    assert type(crash["observations"].get("matrix")) is list and crash["observations"]["matrix"] and all(item["child_exit"] == 77 for item in crash["observations"]["matrix"])
+    _identity_crash_observations(
+        crash["observations"],
+        expected_report_nodes["identity-crash-matrix.json"],
+    )
     transition = _report(evidence, "identity-transition-report.json", expected_report_nodes["identity-transition-report.json"])
-    assert transition["observations"].get("procfs")
+    transition_observations = _exact_keys(transition["observations"], {"procfs"})
+    assert type(transition_observations["procfs"]) is list and transition_observations["procfs"]
     portability = _report(evidence, "restore-portability-manifest.json", expected_report_nodes["restore-portability-manifest.json"])
     assert portability["observations"].get("states_equal") is True
 
@@ -763,6 +839,37 @@ def test_reseal_refreshes_suite_and_artifact_junit_hashes(
         digest = _sha(candidate / junit_file)
         assert manifest["suites"][suite_name]["junit_sha256"] == digest
         assert manifest["artifacts"][junit_file]["sha256"] == digest
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("child_exit", 77.0),
+        ("child_exit", True),
+        ("child_exit", False),
+        ("before_rename", 1),
+        ("operation", 1),
+        ("fault_point", False),
+        ("identity_sha256", 1),
+        ("state", False),
+        ("extra", "forged"),
+    ],
+)
+def test_rebound_slice3a_bundle_rejects_resealed_noncanonical_identity_crash_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    forged: object,
+) -> None:
+    candidate = _copy_and_rebind_bundle(tmp_path, monkeypatch)
+    repository = candidate.parents[2]
+    report = _load(candidate / "identity-crash-matrix.json")
+    report["observations"]["matrix"][0][field] = forged
+    _write_json(candidate / "identity-crash-matrix.json", report)
+    _reseal_bundle(candidate, repository)
+
+    with pytest.raises((AssertionError, subprocess.CalledProcessError)):
+        validate_bundle(candidate)
 
 
 @pytest.mark.parametrize("suite_name", sorted(SUITE_FILES))
