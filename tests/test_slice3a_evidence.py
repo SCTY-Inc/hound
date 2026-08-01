@@ -92,6 +92,108 @@ def _integer(value: object) -> int:
     return value
 
 
+def _sha256(value: object, *, nullable: bool = False) -> str | None:
+    assert nullable and value is None or type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value)
+    return value
+
+
+def _canonical_uuid(value: object) -> str:
+    assert type(value) is str
+    assert str(uuid.UUID(value)) == value
+    return value
+
+
+def _position(value: object, *, digest: bool = False) -> list[Any]:
+    expected = 4 if digest else 3
+    assert type(value) is list and len(value) == expected
+    _integer(value[0])
+    _sha256(value[1])
+    assert type(value[2]) is str and value[2]
+    if digest:
+        _sha256(value[3])
+    return value
+
+
+def _pages(value: object) -> list[Any]:
+    assert type(value) is list and value
+    for page in value:
+        assert type(page) is list and len(page) == 2
+        rows, cursor = page
+        assert type(rows) is list and rows
+        _sha256(cursor, nullable=True)
+        for row in rows:
+            assert type(row) is list and len(row) == 7
+            canonical_event_json, sequence, entry_id, appended_at, lane, topics, entities = row
+            assert type(canonical_event_json) is str
+            event = json.loads(canonical_event_json)
+            assert type(event) is dict
+            assert json.dumps(event, sort_keys=True, separators=(",", ":")) == canonical_event_json
+            _integer(sequence)
+            _sha256(entry_id)
+            assert type(appended_at) is str and appended_at
+            assert lane is None or type(lane) is str and lane
+            assert type(topics) is list and all(type(topic) is str for topic in topics)
+            assert type(entities) is list and all(type(entity) is str for entity in entities)
+            assert event.get("sequence") == sequence and type(event.get("sequence")) is int
+            assert event.get("entry_id") == entry_id and event.get("appended_at") == appended_at
+    return value
+
+
+def _index_manifest(value: object) -> list[Any] | None:
+    if value is None:
+        return None
+    assert type(value) is list and len(value) == 15
+    assert type(value[0]) is str and value[0] in {"file", "directory", "symlink", "other"}
+    assert value[1] is None or type(value[1]) is str
+    for field in value[2:14]:
+        _integer(field)
+    _sha256(value[14])
+    return value
+
+
+def _sqlite_observations(value: object) -> None:
+    observations = _exact_keys(value, {"proofs_equal", "sqlite_connect_calls", "states"})
+    assert observations["proofs_equal"] is True
+    assert observations["sqlite_connect_calls"] == 0 and type(observations["sqlite_connect_calls"]) is int
+    states = observations["states"]
+    assert type(states) is dict and set(states) == {"valid", "corrupt", "absent"}
+    proof: list[object] = []
+    for state in states.values():
+        _exact_keys(state, {"appended", "fresh_cursor_sha256", "fresh_high_watermark", "fresh_pages", "fresh_positions", "fresh_recoveries", "index_after", "index_before", "old_cursor_sha256", "old_high_watermark", "old_pages", "old_positions", "old_recoveries", "terminal_cursor"})
+        old_pages, fresh_pages = _pages(state["old_pages"]), _pages(state["fresh_pages"])
+        for prefix, pages in (("old", old_pages), ("fresh", fresh_pages)):
+            cursor_hashes = state[f"{prefix}_cursor_sha256"]
+            assert type(cursor_hashes) is list and len(cursor_hashes) == len(pages)
+            assert all(_sha256(digest, nullable=True) == page[1] for digest, page in zip(cursor_hashes, pages, strict=True))
+            positions = state[f"{prefix}_positions"]
+            assert type(positions) is list and positions
+            for position in positions:
+                _position(position)
+            recoveries = state[f"{prefix}_recoveries"]
+            assert type(recoveries) is list and recoveries
+            for recovery_item in recoveries:
+                assert type(recovery_item) is list and len(recovery_item) == 3
+                _sha256(recovery_item[0])
+                assert recovery_item[0] in cursor_hashes
+                _position(recovery_item[1], digest=True)
+                _position(recovery_item[2], digest=True)
+            _position(state[f"{prefix}_high_watermark"], digest=True)
+            assert positions == [[row[1], row[2], row[3]] for page in pages for row in page[0]]
+        assert state["terminal_cursor"] is None
+        appended = _exact_keys(state["appended"], {"entry_id", "sequence"})
+        _sha256(appended["entry_id"])
+        _integer(appended["sequence"])
+        old_rows = [row for page in old_pages for row in page[0]]
+        fresh_rows = [row for page in fresh_pages for row in page[0]]
+        assert appended["entry_id"] not in [row[2] for row in old_rows]
+        assert [appended["sequence"], appended["entry_id"]] in [[row[1], row[2]] for row in fresh_rows]
+        _index_manifest(state["index_before"])
+        _index_manifest(state["index_after"])
+        assert state["index_before"] == state["index_after"]
+        proof.append([state[key] for key in ("appended", "old_pages", "old_cursor_sha256", "old_positions", "old_recoveries", "old_high_watermark", "fresh_pages", "fresh_cursor_sha256", "fresh_positions", "fresh_recoveries", "fresh_high_watermark", "terminal_cursor")])
+    assert proof[0] == proof[1] == proof[2]
+
+
 def _inventory(value: object) -> dict[str, Any]:
     result = _exact_keys(value, {"root", "entries"})
     assert type(result["root"]) is str and result["root"] and not result["root"].startswith("synthetic")
@@ -100,11 +202,13 @@ def _inventory(value: object) -> dict[str, Any]:
     paths: list[str] = []
     required = {"path", "kind", "dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blocks", "blksize", "mtime_ns", "ctime_ns"}
     for entry in entries:
-        assert type(entry) is dict and set(entry) in (required, required | {"sha256"}, required | {"symlink_target"})
+        assert type(entry) is dict
         assert "atime" not in entry and "atime_ns" not in entry
         assert type(entry["path"]) is str and entry["path"]
         paths.append(entry["path"])
-        assert entry["kind"] in {"directory", "regular", "symlink", "other"}
+        assert type(entry["kind"]) is str and entry["kind"] in {"directory", "regular", "symlink", "other"}
+        extras = {"sha256"} if entry["kind"] == "regular" else {"symlink_target"} if entry["kind"] == "symlink" else set()
+        assert set(entry) == required | extras
         for key in required - {"path", "kind"}:
             _integer(entry[key])
         if entry["kind"] == "regular":
@@ -150,8 +254,8 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     manifest = _load(evidence / "run-manifest.json")
     _exact_keys(manifest, {"schema_version", "run_id", "bb_thread_id", "reviewed", "cwd", "allowlisted_environment", "sources", "suites", "artifacts"})
     assert manifest["schema_version"] == SCHEMA
-    uuid.UUID(manifest["run_id"])
-    assert type(manifest["bb_thread_id"]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,}", manifest["bb_thread_id"])
+    _canonical_uuid(manifest["run_id"])
+    assert type(manifest["bb_thread_id"]) is str and re.fullmatch(r"thr_[a-z0-9]+", manifest["bb_thread_id"])
     assert manifest["cwd"] == str(ROOT) and manifest["allowlisted_environment"] == {"PYTHONDONTWRITEBYTECODE": "1"}
     reviewed = _exact_keys(manifest["reviewed"], {"commit", "tree"})
     assert type(reviewed["commit"]) is str and re.fullmatch(r"[0-9a-f]{40}", reviewed["commit"])
@@ -205,15 +309,7 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
 
     sqlite = _report(evidence, "sqlite-independence.json", all_nodes)
     _require_nodes(sqlite, "test_query_is_sqlite_independent")
-    states = sqlite["observations"].get("states")
-    assert type(states) is dict and set(states) == {"valid", "corrupt", "absent"} and sqlite["observations"].get("sqlite_connect_calls") == 0 and type(sqlite["observations"].get("sqlite_connect_calls")) is int
-    proof: list[object] = []
-    for state in states.values():
-        assert type(state) is dict and state["old_pages"] and state["fresh_pages"] and state["old_recoveries"] and state["fresh_recoveries"]
-        assert state["terminal_cursor"] is None and state["appended"]["entry_id"] not in [row[1] for page in state["old_pages"] for row in page[0]] and state["appended"]["entry_id"] in [row[1] for page in state["fresh_pages"] for row in page[0]]
-        assert state["index_before"] == state["index_after"]
-        proof.append([state[key] for key in ("old_pages", "old_recoveries", "fresh_pages", "fresh_recoveries", "old_high_watermark", "fresh_high_watermark")])
-    assert proof[0] == proof[1] == proof[2] and sqlite["observations"].get("proofs_equal") is True
+    _sqlite_observations(sqlite["observations"])
 
     cursor = _report(evidence, "cursor-restart-hwm.json", all_nodes)
     _require_nodes(cursor, "test_fixed_hwm_cursor_resumes")
@@ -230,9 +326,17 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     journal = _report(evidence, "journal-snapshot-matrix.json", all_nodes)
     _require_nodes(journal, "test_verified_snapshot_returns_exact_triplet", "test_journal_operations_reject_noncanonical_sequence_scalars")
     scalar = journal["observations"].get("scalars")
-    assert type(scalar) is list and {item["scalar_type"] for item in scalar} == {"bool", "float"} and {item["scalar"] for item in scalar} == {False, True, 0.0, 1.0}
+    assert type(scalar) is list and len(scalar) == 24
+    typed_values = ((bool, False, "bool"), (bool, True, "bool"), (float, 0.0, "float"), (float, 1.0, "float"))
+    expected_cases = {(operation, target, value_type, value, scalar_type) for operation in ("append", "reconcile", "verified_snapshot") for target in ("chain", "current_head") for value_type, value, scalar_type in typed_values}
+    cases: set[tuple[object, ...]] = set()
     for item in scalar:
+        item = _exact_keys(item, {"after", "before", "operation", "result", "scalar", "scalar_type", "sequence", "target"})
+        assert type(item["operation"]) is str and type(item["target"]) is str and type(item["scalar_type"]) is str
+        _integer(item["sequence"])
+        cases.add((item["operation"], item["target"], type(item["scalar"]), item["scalar"], item["scalar_type"]))
         assert item["before"] == item["after"] and item["result"] == "JournalError"
+    assert cases == expected_cases
     recovery = _report(evidence, "recovery-vs-verification.json", all_nodes)
     _require_nodes(recovery, "test_verified_snapshot_is_non_repairing", "test_verified_snapshot_tampering")
     assert recovery["observations"].get("reconcile") and len(recovery["observations"].get("tamper", [])) == 17
@@ -243,9 +347,16 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     assert type(paths) is list and {item["path"] for item in paths} >= {"anchored_read", "anchored_append", "verified_snapshot", "direct_journal_append", "public_verified_snapshot", "procfs_fstat_eio"}
     for item in paths:
         assert all(type(item[key]) is int for key in ("baseline_count", "after_count", "retry_count", "fd_delta"))
-        assert item["fd_delta"] == item["after_count"] - item["baseline_count"] == 0 and item["before_state"] == item["after_state"]
-        _inventory(item["before_state"])
         assert type(item["baseline"]) is list and type(item["after"]) is list
+        for inventory in (item["baseline"], item["after"]):
+            for descriptor in inventory:
+                descriptor = _exact_keys(descriptor, {"fd", "target"})
+                _integer(descriptor["fd"])
+                assert type(descriptor["target"]) is str and descriptor["target"]
+        assert item["baseline_count"] - len(item["baseline"]) == item["after_count"] - len(item["after"]) == 1
+        assert item["fd_delta"] == item["after_count"] - item["baseline_count"] == 0
+        assert len(item["after"]) - len(item["baseline"]) == 0 and item["before_state"] == item["after_state"]
+        _inventory(item["before_state"])
 
     identity = _report(evidence, "identity-mode-lock-path-report.json", all_nodes)
     _require_nodes(identity, "lifetime_lock", "exact_fd_procfs_fallback")

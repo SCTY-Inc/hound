@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -124,8 +125,9 @@ def generate(output: Path, reviewed_commit: str, reviewed_tree: str, run_id: str
     retained = ROOT / "tests" / "evidence" / "slice3a"
     if output == retained or retained in output.parents or output.exists() and any(output.iterdir()):
         raise RuntimeError("output must be a fresh staging directory, never retained evidence")
-    uuid.UUID(run_id)
-    if not bb_thread_id or not __import__("re").fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,}", bb_thread_id):
+    if type(run_id) is not str or str(uuid.UUID(run_id)) != run_id:
+        raise RuntimeError("run id must be canonical UUID text")
+    if type(bb_thread_id) is not str or not re.fullmatch(r"thr_[a-z0-9]+", bb_thread_id):
         raise RuntimeError("invalid BB thread id")
     if _git("rev-parse", f"{reviewed_commit}^{{tree}}") != reviewed_tree:
         raise RuntimeError("reviewed commit/tree mismatch")
