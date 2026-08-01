@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -431,7 +432,12 @@ class JournalQueryEngine:
         if high_watermark is None:
             return EMPTY_QUERY_PAGE
 
-        matches: list[tuple[QueryItem, JournalCursorCandidate]] = []
+        # Journal verification/recovery and canonical/provenance filtering are
+        # intentionally O(N): the append-only journal is Slice 3B truth.
+        # Retain only one page plus its continuation witness; QueryItem's
+        # defensive clone is reserved for returned items.
+        retained: list[tuple[tuple[datetime, int, str], Mapping[str, object], JournalCursorCandidate, EventProvenance]] = []
+        capacity = request.limit + 1
         for event, candidate in zip(snapshot.events, snapshot.cursor_recovery_snapshot.candidates, strict=True):
             # The precise sequence is security material: header-only auth,
             # then HWM/resume, then canonical body filters, then provenance.
@@ -446,15 +452,19 @@ class JournalQueryEngine:
             item_provenance = provenance.project(scope, event)
             if not _matches_provenance(request, item_provenance):
                 continue
-            matches.append((QueryItem(event, item_provenance), candidate))
-        matches.sort(key=lambda pair: pair[1].chronological_order)
-        selected = matches[: request.limit]
+            value = (candidate.chronological_order, event, candidate, item_provenance)
+            if len(retained) < capacity or value[0] < retained[-1][0]:
+                position = bisect_left([item[0] for item in retained], value[0])
+                retained.insert(position, value)
+                if len(retained) > capacity:
+                    retained.pop()
+        selected = retained[: request.limit]
         if not selected:
             return EMPTY_QUERY_PAGE
         next_cursor = None
-        if len(matches) > len(selected):
-            next_cursor = cursor_codec.issue(bindings, last=selected[-1][1], high_watermark=high_watermark)
-        return QueryPage(tuple(item for item, _ in selected), next_cursor)
+        if len(retained) > len(selected):
+            next_cursor = cursor_codec.issue(bindings, last=selected[-1][2], high_watermark=high_watermark)
+        return QueryPage(tuple(QueryItem(event, provenance) for _order, event, _candidate, provenance in selected), next_cursor)
 
     query = execute
 

@@ -28,6 +28,8 @@ from ._safety import AnchoredRoot
 WIRE_VERSION = "houndd.uds.v1"
 MAX_FRAME_BYTES = 1_048_576
 MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES + 2_048
+CONNECTION_TIMEOUT_SECONDS = 0.2
+ACCEPT_TIMEOUT_SECONDS = 0.2
 REQUEST_SCHEMA = "houndd.read-request.v1"
 RESPONSE_SCHEMA = "houndd.read-response.v1"
 _REQUEST_FIELDS = frozenset({"schema_version", "request_id", "producer", "requested_access", "policy_id", "operation"})
@@ -82,6 +84,18 @@ class RequestError(ServiceError):
 
 class PolicyError(ServiceError):
     """The operator-provisioned policy is absent, unsafe, or ambiguous."""
+
+
+class ResponseTooLarge(ServiceError):
+    """An otherwise valid response exceeds the fixed wire bound."""
+
+
+class EncodedResponse(dict[str, Any]):
+    """A response with its one canonical wire encoding retained for send."""
+
+    def __init__(self, value: dict[str, Any], wire: bytes) -> None:
+        super().__init__(value)
+        self.wire = wire
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +336,14 @@ def parse_read_request(value: object) -> ReadRequest:
         raise RequestError("read envelope values are invalid") from error
 
 
-def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, cursor: str | None = None, error: tuple[str, bool, str] | None = None) -> dict[str, Any]:
+def _encode_response(value: dict[str, Any]) -> bytes:
+    raw = canonical_bytes(value)
+    if len(raw) > MAX_FRAME_BYTES:
+        raise ResponseTooLarge("encoded response exceeds 1048576 bytes")
+    return len(raw).to_bytes(4, "big") + raw
+
+
+def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, cursor: str | None = None, error: tuple[str, bool, str] | None = None) -> EncodedResponse:
     body: dict[str, Any] = {"schema_version": RESPONSE_SCHEMA, "request_id": request_id, "ok": status == 200, "outcome": outcome, "record_ids": [], "entry_ids": [], "usage": {"requests": 0, "bytes": 0, "cost": 0}}
     if result is not None:
         body["result"] = result
@@ -332,7 +353,8 @@ def _response(request_id: str, status: int, *, outcome: str, result: list[dict[s
         body["cursor"] = cursor
     if error is not None:
         body["error"] = {"code": error[0], "retryable": error[1], "message": error[2]}
-    return {"wire_version": WIRE_VERSION, "status": status, "body": body}
+    value = {"wire_version": WIRE_VERSION, "status": status, "body": body}
+    return EncodedResponse(value, _encode_response(value))
 
 
 def _plain_json(value: Any) -> Any:
@@ -399,6 +421,10 @@ class HounddService:
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
                 raise ServiceError("socket ownership is unsafe")
             listener.listen(32)
+            # A bounded accept is the close linearization point: closing a
+            # listening AF_UNIX descriptor in another thread is not a
+            # portable wakeup guarantee on its own.
+            listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
             self._socket_identity = (info.st_dev, info.st_ino)
             self._listener = listener
             # A self-connect must arrive at this listener before it becomes
@@ -482,13 +508,31 @@ class HounddService:
             query_request = parse_query_request(request.payload)
             if query_request.filter.access is not None and not set(query_request.filter.access) <= scope.readable_tiers:
                 return _response(request.request_id, 404, outcome="not_found")
-            page = DurableJournalQueryAdapter(self.store.journal, self.identity).execute(query_request, scope)
+            adapter = DurableJournalQueryAdapter(self.store.journal, self.identity)
         except (QueryContractError, QueryFilterNotAvailable, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
         except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
             return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
-        events = [_plain_json(item.event) for item in page.items]
-        return _response(request.request_id, 200, outcome="completed", result=events, cursor=page.next_cursor)
+        prepared: EncodedResponse | None = None
+
+        def fits(page: Any) -> bool:
+            nonlocal prepared
+            try:
+                events = [_plain_json(item.event) for item in page.items]
+                prepared = _response(request.request_id, 200, outcome="completed", result=events, cursor=page.next_cursor)
+            except ResponseTooLarge:
+                return False
+            return True
+
+        try:
+            page = adapter.execute_bounded(query_request, scope, fits)
+        except (QueryContractError, QueryFilterNotAvailable, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+        except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        if page is not None and prepared is not None:
+            return prepared
+        return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
 
     @staticmethod
     def _principal(connection: socket.socket) -> AuthenticatedPrincipal:
@@ -513,12 +557,14 @@ class HounddService:
                 break
             try:
                 connection, _address = listener.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 if self._closed:
                     break
                 raise
             with connection:
-                connection.settimeout(5)
+                connection.settimeout(CONNECTION_TIMEOUT_SECONDS)
                 try:
                     principal = self._principal(connection)
                     frame = read_frame(connection)
@@ -532,10 +578,19 @@ class HounddService:
                     if request_id is None:
                         continue
                     response = _response(request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
-                except ServiceError:
+                except (ServiceError, OSError):
+                    # A broken or idle peer is not a daemon failure.  The
+                    # connection is already scoped by the context manager;
+                    # discard it and continue accepting later callers.
                     continue
                 try:
-                    connection.sendall(len(canonical_bytes(response)).to_bytes(4, "big") + canonical_bytes(response))
+                    wire = response.wire if isinstance(response, EncodedResponse) else _encode_response(response)
+                    connection.sendall(wire)
+                except ResponseTooLarge:
+                    request_id = _request_id(locals().get("frame", {}).get("body") if isinstance(locals().get("frame"), dict) else None)
+                    if request_id is None:
+                        continue
+                    connection.sendall(_response(request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable")).wire)
                 except OSError:
                     pass
 
@@ -546,10 +601,8 @@ class HounddService:
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.close()
-        if self._owner_pid != os.getpid():
-            return
         runtime_root, self._runtime_root = self._runtime_root, None
-        if runtime_root is not None:
+        if runtime_root is not None and self._owner_pid == os.getpid():
             try:
                 with runtime_root.operation():
                     info = os.stat(self.socket_path.name, dir_fd=runtime_root.fd, follow_symlinks=False)
@@ -559,6 +612,8 @@ class HounddService:
                 pass
             finally:
                 runtime_root.close()
+        elif runtime_root is not None:
+            runtime_root.close()
         self._socket_identity = None
         policy, self.policy = self.policy, None
         if policy is not None:
@@ -572,4 +627,4 @@ class HounddService:
             store.close()
 
 
-__all__ = ["FrameError", "HounddService", "MAX_FRAME_BYTES", "PolicyError", "REQUEST_SCHEMA", "RESPONSE_SCHEMA", "ServiceError", "WIRE_VERSION", "load_frozen_policy", "read_frame"]
+__all__ = ["FrameError", "HounddService", "MAX_FRAME_BYTES", "PolicyError", "REQUEST_SCHEMA", "RESPONSE_SCHEMA", "ResponseTooLarge", "ServiceError", "WIRE_VERSION", "load_frozen_policy", "read_frame"]

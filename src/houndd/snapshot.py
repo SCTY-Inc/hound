@@ -433,6 +433,69 @@ class DurableJournalQueryAdapter:
                 context,
             )
 
+    def execute_bounded(
+        self,
+        request: QueryRequest,
+        scope: PrincipalScope | None,
+        fits: Callable[[QueryPage], bool],
+    ) -> QueryPage | None:
+        """Select the largest wire-fitting page from one verified snapshot.
+
+        The normal journal-wide reparse/verification remains O(N), but a
+        response-size decision performs only O(log(limit)) engine passes over
+        that one immutable snapshot.  Each candidate therefore shares the
+        same identity lease, generation, high-watermark, and cursor binding.
+        """
+
+        if scope is None:
+            return EMPTY_QUERY_PAGE
+        if not callable(fits):
+            raise QueryEngineError("page fit predicate must be callable")
+        trusted_scope = _trusted_scope(scope)
+        trusted_request = _trusted_request(request)
+        unavailable = self._unavailable_filters(trusted_request)
+        if unavailable:
+            raise QueryFilterNotAvailable(unavailable)
+        with ServiceIdentity.lease(self._service_identity) as leased_state:
+            state = _trusted_identity_state(leased_state)
+            snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
+            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
+                return EMPTY_QUERY_PAGE if fits(EMPTY_QUERY_PAGE) else None
+            provenance = ProvenanceProjection()
+            codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
+            if trusted_request.cursor is None:
+                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
+            else:
+                context = self._resume_context(trusted_request, trusted_scope, snapshot, provenance, codec, state)
+
+            def page(limit: int) -> QueryPage:
+                return self._engine.execute(
+                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor),
+                    trusted_scope,
+                    snapshot,
+                    provenance,
+                    codec,
+                    context,
+                )
+
+            largest = page(trusted_request.limit)
+            if fits(largest):
+                return largest
+            smallest = page(1)
+            if not fits(smallest):
+                return None
+            accepted = smallest
+            lower, upper = 1, trusted_request.limit - 1
+            while lower <= upper:
+                middle = (lower + upper) // 2
+                candidate = page(middle)
+                if fits(candidate):
+                    accepted = candidate
+                    lower = middle + 1
+                else:
+                    upper = middle - 1
+            return accepted
+
     query = execute
 
 

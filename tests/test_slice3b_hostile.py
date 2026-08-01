@@ -12,10 +12,12 @@ import sys
 import shutil
 import threading
 import time
+import hashlib
 
 import pytest
 
-from houndd.contracts import canonical_bytes
+from houndd import HounddStore
+from houndd.contracts import canonical_bytes, make_journal_envelope
 from houndd.access import AuthenticatedPrincipal
 from houndd.service import HounddService, ServiceError, parse_read_request, read_frame
 
@@ -39,6 +41,33 @@ def _response(*, status: int, request_id: str = "request-1", **body_values: obje
     body.update(body_values)
     value = {"wire_version": "houndd.uds.v1", "status": status, "body": body}
     return canonical_bytes(value)
+
+
+def _append_large_events(state: Path, *, count: int, native_size: int) -> list[str]:
+    entry_ids: list[str] = []
+    with HounddStore(state) as store:
+        for index in range(count):
+            record_id = f"large-{index}"
+            data = f"large-{index}".encode()
+            digest = hashlib.sha256(data).hexdigest()
+            assert store.records.blobs.put(data) == digest
+            store.records.put_bytes(record_id, data, expected_sha256=digest)
+            event = make_journal_envelope(
+                sequence=index + 1,
+                appended_at=f"2026-08-01T00:00:0{index + 1}Z",
+                producer={"owner_id": "writer", "capability": "capture", "run_id": f"large-{index}"},
+                artifact={"kind": "capture", "schema": "houndd.capture.v1", "record_id": record_id, "hash": digest, "authorized_uri": f"houndd://{record_id}"},
+                lineage={"relation": "none", "record_id": record_id, "lead_id": "none"},
+                source={"provider": "large", "native_id": "x" * native_size, "canonical_url": f"https://large.test/{index}"},
+                classification={"outcome": "completed", "evidence_status": "evidence"},
+                access="public",
+                policy_id="policy-reader",
+                dedupe={"object_key": record_id, "content_sha256": digest},
+                usage={},
+            )
+            store.journal.append(event)
+            entry_ids.append(event["entry_id"])
+    return entry_ids
 
 
 @pytest.mark.parametrize(
@@ -138,8 +167,10 @@ def test_unauthorized_dispatch_never_reaches_journal_or_cursor(tmp_path: Path, m
     runtime.mkdir(mode=0o700)
     service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
     try:
-        monkeypatch.setattr(service_module.DurableJournalQueryAdapter, "execute", lambda *_args, **_kwargs: pytest.fail("unauthorized request reached journal"))
-        frame = {"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request(policy_id="wrong")}
+        monkeypatch.setattr(service_module.DurableJournalQueryAdapter, "execute_bounded", lambda *_args, **_kwargs: pytest.fail("unauthorized request reached journal"))
+        body = _request(policy_id="wrong")
+        body["operation"]["payload"]["cursor"] = "not-a-cursor"
+        frame = {"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": body}
         response = service._dispatch(AuthenticatedPrincipal(f"linux-uid:{os.getuid()}"), frame)
         assert response["status"] == 404
         assert response["body"] == {"schema_version": "houndd.read-response.v1", "request_id": "request-1", "ok": False, "outcome": "not_found", "record_ids": [], "entry_ids": [], "usage": {"requests": 0, "bytes": 0, "cost": 0}}
@@ -215,6 +246,141 @@ def test_peer_credentials_are_certified_before_any_frame_read(tmp_path: Path, mo
         service.close()
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+def test_real_accepted_socket_peer_credential_precedes_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Observe the kernel-derived peer subject on a real accepted socket."""
+
+    state = _valid_state(tmp_path / "state")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    observed: list[str] = []
+    dispatch = service._dispatch
+
+    def record(principal, frame):
+        observed.append(principal.subject)
+        return dispatch(principal, frame)
+
+    monkeypatch.setattr(service, "_dispatch", record)
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        response = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}))
+        assert response is not None and response["status"] == 200
+        assert observed == [f"linux-uid:{os.getuid()}"]
+    finally:
+        service.close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_idle_or_reset_client_cannot_terminate_server_and_later_query_succeeds(tmp_path: Path) -> None:
+    state = _valid_state(tmp_path / "state")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as idle:
+            idle.connect(os.fspath(service.socket_path))
+            time.sleep(0.35)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as reset:
+            reset.connect(os.fspath(service.socket_path))
+            reset.sendall(b"\0\0\0\x10{")
+        deadline = time.monotonic() + 2
+        while thread.is_alive() and time.monotonic() < deadline:
+            response = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}))
+            if response is not None:
+                assert response["status"] == 200
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("later valid query did not succeed after broken clients")
+        assert thread.is_alive()
+    finally:
+        service.close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_close_wakes_an_accept_blocked_server_thread_without_unlinking_replacement(tmp_path: Path) -> None:
+    state = _valid_state(tmp_path / "state")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    time.sleep(0.05)
+    displaced = runtime / "displaced.sock"
+    service.socket_path.rename(displaced)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as replacement:
+        replacement.bind(os.fspath(service.socket_path))
+        expected = service.socket_path.lstat()
+        started = time.monotonic()
+        service.close()
+        thread.join(timeout=1)
+        assert time.monotonic() - started < 1
+        assert not thread.is_alive()
+        observed = service.socket_path.lstat()
+        assert (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="Linux fork semantics required")
+def test_child_close_releases_inherited_fds_without_unlocking_parent_or_socket(tmp_path: Path) -> None:
+    from houndd.service_identity import ServiceIdentity, ServiceIdentityLocked
+
+    state = _valid_state(tmp_path / "state")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    descriptors = [
+        service._listener.fileno(),  # type: ignore[union-attr]
+        service.policy.policy_fd,  # type: ignore[union-attr]
+        service.identity._lock_fd,  # type: ignore[union-attr]
+    ]
+    reader, writer = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - asserted by parent
+        os.close(reader)
+        try:
+            service.close()
+            closed = all(_fd_closed(descriptor) for descriptor in descriptors)
+            try:
+                ServiceIdentity(state, create=False)
+            except ServiceIdentityLocked:
+                locked = True
+            else:
+                locked = False
+            os.write(writer, f"{int(closed)}:{int(locked)}".encode())
+        finally:
+            os.close(writer)
+        os._exit(0)
+    os.close(writer)
+    try:
+        assert os.read(reader, 16) == b"1:1"
+        assert os.waitpid(child, 0)[1] == 0
+        thread = threading.Thread(target=service.serve_forever)
+        thread.start()
+        try:
+            response = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}))
+            assert response is not None and response["status"] == 200
+        finally:
+            service.close()
+            thread.join(timeout=2)
+    finally:
+        os.close(reader)
+
+
+def _fd_closed(descriptor: int | None) -> bool:
+    if descriptor is None:
+        return True
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        return True
+    return False
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="Linux fork semantics required")
@@ -340,7 +506,7 @@ def test_socket_client_import_scan_and_isolated_wheel(tmp_path: Path) -> None:
     assert not {"hound_research.source", "hound_research.web", "hound_research.evidence", "requests", "http.client"} & imports
     service_source = (Path(__file__).parents[1] / "src" / "houndd" / "service.py").read_text(encoding="utf-8")
     assert "AF_INET" not in service_source and "SOCK_DGRAM" not in service_source
-    uv = shutil.which("uv")
+    uv = os.environ.get("HOUND_SLICE3B_UV") or shutil.which("uv")
     assert uv is not None
     dist = tmp_path / "dist"
     subprocess.run([uv, "build", "--out-dir", os.fspath(dist)], cwd=Path(__file__).parents[1], check=True, capture_output=True, text=True, timeout=60)
@@ -382,3 +548,171 @@ def test_socket_only_client_accepts_exact_response_and_has_no_legacy_imports() -
     imports = {node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom) and node.module}
     assert not {"hound_research.source", "hound_research.web", "hound_research.evidence"} & imports
     assert strict_response(_response(status=200), request_id="request-1")["status"] == 200
+
+
+def test_socket_client_rejects_oversized_response_before_payload_allocation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import hound_research.journal_client as client
+
+    class HeaderOnlySocket:
+        def __init__(self, *_args) -> None:
+            self.reads: list[int] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout) -> None:
+            return None
+
+        def connect(self, _path) -> None:
+            return None
+
+        def sendall(self, _data) -> None:
+            return None
+
+        def shutdown(self, _how) -> None:
+            return None
+
+        def recv(self, size: int) -> bytes:
+            self.reads.append(size)
+            if len(self.reads) == 1:
+                return (1_048_577).to_bytes(4, "big")
+            raise AssertionError("client attempted to allocate/read oversized payload")
+
+    fake = HeaderOnlySocket()
+    monkeypatch.setattr(client.socket, "socket", lambda *_args: fake)
+    request = {"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": _request()}
+    with pytest.raises(client.JournalClientError):
+        client.exchange(tmp_path / "socket", request)
+    assert fake.reads == [4]
+
+
+@pytest.mark.parametrize("empty_kind", ["no_authorized_headers", "filter_matches_zero"])
+def test_resolved_authorized_empty_query_returns_canonical_completed_response(tmp_path: Path, empty_kind: str) -> None:
+    state = _valid_state(tmp_path / "state")
+    filter_value: dict[str, object] = {"source": {"provider": ["absent"]}}
+    if empty_kind == "no_authorized_headers":
+        policy_path = state / "service" / "policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["rules"][0]["event_producer_selectors"][0]["owner_id"] = "other-writer"
+        policy_path.write_bytes(canonical_bytes(policy))
+        policy_path.chmod(0o600)
+        filter_value = {}
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        request = _request(filter_value=filter_value)
+        response = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": request}))
+        assert response == {
+            "wire_version": "houndd.uds.v1",
+            "status": 200,
+            "body": {
+                "schema_version": "houndd.read-response.v1",
+                "request_id": "request-1",
+                "ok": True,
+                "outcome": "completed",
+                "record_ids": [],
+                "entry_ids": [],
+                "usage": {"requests": 0, "bytes": 0, "cost": 0},
+                "result": [],
+            },
+        }
+    finally:
+        service.close()
+        thread.join(timeout=2)
+
+
+def test_oversized_authorized_event_returns_one_bounded_503(tmp_path: Path) -> None:
+    state = _valid_state(tmp_path / "state")
+    _append_large_events(state, count=1, native_size=1_048_000)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        request = _request(filter_value={"source": {"provider": ["large"]}})
+        response = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": request}))
+        assert response is not None
+        assert response["status"] == 503
+        assert response["body"]["error"]["code"] == "response_too_large"
+        assert len(canonical_bytes(response)) <= 1_048_576
+    finally:
+        service.close()
+        thread.join(timeout=2)
+
+
+def test_byte_bounded_pages_preserve_cursor_order_without_loss_or_duplication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from houndd.query_engine import JournalQueryEngine
+    from houndd.snapshot import DurableJournalQueryAdapter
+
+    state = _valid_state(tmp_path / "state")
+    expected = _append_large_events(state, count=3, native_size=440_000)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    calls = 0
+    adapter_calls = 0
+    execute = JournalQueryEngine.execute
+    bounded = DurableJournalQueryAdapter.execute_bounded
+
+    def count(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return execute(*args, **kwargs)
+
+    monkeypatch.setattr(JournalQueryEngine, "execute", count)
+
+    def count_adapter(*args, **kwargs):
+        nonlocal adapter_calls
+        adapter_calls += 1
+        return bounded(*args, **kwargs)
+
+    monkeypatch.setattr(DurableJournalQueryAdapter, "execute_bounded", count_adapter)
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        request = _request(filter_value={"source": {"provider": ["large"]}})
+        request["operation"]["payload"]["limit"] = 100
+        first = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": request}))
+        assert first is not None and first["status"] == 200
+        cursor = first["body"].get("cursor")
+        assert type(cursor) is str
+        continuation = _request(filter_value={"source": {"provider": ["large"]}})
+        continuation["operation"]["payload"]["cursor"] = cursor
+        second = _exchange(service.socket_path, _frame({"wire_version": "houndd.uds.v1", "method": "GET", "path": "/v1/journal", "body": continuation}))
+        assert second is not None and second["status"] == 200
+        returned = first["body"]["entry_ids"] + second["body"]["entry_ids"]
+        assert returned == expected
+        assert len(set(returned)) == len(expected)
+        assert all(len(canonical_bytes(response)) <= 1_048_576 for response in (first, second))
+        assert adapter_calls == 2
+        assert calls <= 16  # two page requests, each bounded by 2 + log2(100) passes
+    finally:
+        service.close()
+        thread.join(timeout=2)
+
+
+def test_query_engine_materializes_only_selected_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    from houndd.query_engine import JournalQueryEngine, QueryItem
+    from houndd.query_contracts import QueryRequest, parse_query_filter
+    from tests.test_hsp08_query_engine import _matrix
+
+    _events, snapshot, projection, scope, context, codec = _matrix(include_e6=True)
+    built = 0
+    original = QueryItem.__post_init__
+
+    def count(self) -> None:
+        nonlocal built
+        built += 1
+        original(self)
+
+    monkeypatch.setattr(QueryItem, "__post_init__", count)
+    page = JournalQueryEngine().execute(QueryRequest(parse_query_filter({}), limit=1), scope, snapshot, projection, codec, context)
+    assert len(page.items) == built == 1
+    assert page.next_cursor is not None
