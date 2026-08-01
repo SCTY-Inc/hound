@@ -2,6 +2,8 @@
   "schema_version": "houndd.slice3a.acceptance.v1",
   "slice": "3A",
   "status": "partial_hsp_coverage",
+  "provisional": true,
+  "acceptance_gate": "Code and retained evidence are provisional until a separate documentation change amends the exact HSP-20 and security-boundary contract and a fresh reviewer accepts that amendment.",
   "partial_hsps": [
     "HSP-08",
     "HSP-20",
@@ -20,30 +22,59 @@
     "HSP-09"
   ],
   "artifacts": {
+    "src/houndd/cursor.py": "HSP-08",
     "src/houndd/journal.py": "HSP-20",
+    "src/houndd/provenance.py": "HSP-08",
+    "src/houndd/query_engine.py": "HSP-08",
     "src/houndd/service_identity.py": "HSP-20",
     "src/houndd/snapshot.py": "HSP-08",
-    "tests/test_hsp20_durable_state.py": "HSP-20",
+    "tests/test_hsp05_transactions.py": "HSP-05",
     "tests/test_hsp08_durable_query.py": "HSP-08",
+    "tests/test_hsp20_durable_state.py": "HSP-20",
+    "tests/test_slice3a_evidence.py": "HSP-21",
+    "tests/evidence/slice3a/bundle-source-digests.json": "HSP-21",
+    "tests/evidence/slice3a/canonical-query-matrix.json": "HSP-21",
+    "tests/evidence/slice3a/compatibility-pytest.xml": "HSP-21",
+    "tests/evidence/slice3a/cursor-restart-hwm.json": "HSP-21",
+    "tests/evidence/slice3a/identity-crash-matrix.json": "HSP-21",
+    "tests/evidence/slice3a/identity-mode-lock-path-report.json": "HSP-21",
+    "tests/evidence/slice3a/identity-transition-report.json": "HSP-21",
+    "tests/evidence/slice3a/journal-snapshot-matrix.json": "HSP-21",
+    "tests/evidence/slice3a/read-state-after.json": "HSP-21",
+    "tests/evidence/slice3a/read-state-before.json": "HSP-21",
+    "tests/evidence/slice3a/recovery-vs-verification.json": "HSP-21",
+    "tests/evidence/slice3a/restore-portability-manifest.json": "HSP-21",
+    "tests/evidence/slice3a/slice3a-pytest.xml": "HSP-21",
+    "tests/evidence/slice3a/sqlite-independence.json": "HSP-21",
     "tests/acceptance_slice3a.json": "HSP-21"
   },
   "coverage": {
     "HSP-08": {
       "status": "partial",
-      "fixture": "persisted canonical journal with fixed-HWM cursor restart, projection-filter negatives, disposable SQLite, and relocated identity",
+      "fixture": "Verified persisted journal bytes with canonical filters, exact dependency reconstruction, fixed-HWM cursor restart, append-stable linear provenance commitments, disposable SQLite, and relocated identity.",
       "tests": [
         "tests/test_hsp08_durable_query.py"
       ],
       "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp08_durable_query.py",
       "expected_assertions": [
-        "canonical filters use verified persisted journal bytes in chronological order",
+        "canonical filters use one verified persisted journal snapshot in chronological order",
+        "Journal, ServiceIdentity, QueryRequest, PrincipalScope, and every nested model are exact reconstructed inputs before durable hooks",
+        "malformed cursors reject before provenance work and authenticated wrong-context or old-context recovery is linear",
         "lane, topic, and entity fail with filter_not_available before evaluation",
         "deleted or corrupt SQLite is neither opened nor rebuilt",
         "cursor restart preserves its original high-watermark and persists no read state"
       ],
       "retained_artifacts": [
+        "src/houndd/cursor.py",
+        "src/houndd/provenance.py",
+        "src/houndd/query_engine.py",
         "src/houndd/snapshot.py",
-        "tests/test_hsp08_durable_query.py"
+        "tests/test_hsp08_durable_query.py",
+        "tests/evidence/slice3a/canonical-query-matrix.json",
+        "tests/evidence/slice3a/cursor-restart-hwm.json",
+        "tests/evidence/slice3a/sqlite-independence.json",
+        "tests/evidence/slice3a/read-state-before.json",
+        "tests/evidence/slice3a/read-state-after.json"
       ],
       "deferred": [
         "durable lane, topic, and entity provenance",
@@ -52,45 +83,75 @@
     },
     "HSP-20": {
       "status": "partial",
-      "fixture": "persisted journal triplet plus one private atomic service identity under crash, lock, permission, symlink, restart, and relocation matrices",
+      "fixture": "Exact-LF persisted journal triplet plus one private generation/keyring identity using exact-FD publication and immutable marker-bound recovery under process death, fork, lock, path-race, restart, and relocation matrices.",
       "tests": [
         "tests/test_hsp20_durable_state.py"
       ],
       "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp20_durable_state.py",
       "expected_assertions": [
         "snapshot holds one journal lock and never mixes append state",
-        "request verification never repairs chain or head while explicit reconcile repairs accepted suffix loss",
-        "identity transitions leave absent, old, or new complete canonical state at every injected crash point",
-        "generation and complete cursor keyring survive restart and relocation without absolute-path identity"
+        "request verification never repairs chain or head while explicit reconcile repairs only provable suffix loss",
+        "forged, divergent, out-of-range, CRLF, partial, or noncanonical journal truth fails with no bytes changed",
+        "the canonical persisted identity field is generation",
+        "new identity bytes originate in a fsynced validated O_TMPFILE and every witness is linked from its held FD without overwrite",
+        "AT_EMPTY_PATH falls back only through a held /proc/self/fd dirfd and a numeric relative entry with AT_SYMLINK_FOLLOW",
+        "marker-bound RENAME_EXCHANGE recovery preserves displaced bytes and never adopts prepublication witnesses",
+        "forked children reject inherited operations before the inherited mutex and cannot unlock the parent",
+        "generation and complete cursor keyring survive restart and clean relocation without absolute-path identity"
       ],
       "retained_artifacts": [
         "src/houndd/journal.py",
         "src/houndd/service_identity.py",
-        "tests/test_hsp20_durable_state.py"
+        "tests/test_hsp05_transactions.py",
+        "tests/test_hsp20_durable_state.py",
+        "tests/evidence/slice3a/journal-snapshot-matrix.json",
+        "tests/evidence/slice3a/recovery-vs-verification.json",
+        "tests/evidence/slice3a/identity-crash-matrix.json",
+        "tests/evidence/slice3a/identity-transition-report.json",
+        "tests/evidence/slice3a/identity-mode-lock-path-report.json",
+        "tests/evidence/slice3a/restore-portability-manifest.json"
       ],
       "deferred": [
+        "the separately reviewed VISION and security-boundary amendment required before claim acceptance",
         "transport readiness and daemon recovery loop",
         "durable access policy and provenance",
-        "privileged deployment and physical power-loss certification"
+        "privileged deployment and physical power-loss certification",
+        "same-UID pathname swaps restored before final validation"
       ]
     },
     "HSP-21": {
       "status": "partial",
-      "fixture": "Slice 3A artifact-to-claim and executable-evidence manifest",
+      "fixture": "Machine-checked Slice 3A artifact map, source digests, JSON reports, and retained focused/compatibility JUnit results.",
       "tests": [
-        "tests/acceptance_slice3a.json"
+        "tests/test_slice3a_evidence.py"
       ],
-      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_hsp08_durable_query.py tests/test_hsp20_durable_state.py",
+      "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_slice3a_evidence.py",
       "expected_assertions": [
-        "every Slice 3A implementation and test artifact maps to exactly one partial HSP claim",
+        "every changed Slice 3A implementation, regression, and proof artifact maps to exactly one partial or regression-only HSP claim",
+        "all required reports and both zero-failure JUnit files are retained and parseable",
+        "source digests bind the proof bundle to the reviewed code and tests",
+        "the bundle labels HSP-20 and HSP-21 acceptance provisional pending the separate contract amendment",
         "HSP-03 and HSP-09 are explicitly unclaimed"
       ],
       "retained_artifacts": [
+        "tests/test_slice3a_evidence.py",
+        "tests/evidence/slice3a",
         "tests/acceptance_slice3a.json"
       ],
       "deferred": [
-        "whole 22-row completion manifest and global acceptance checker"
+        "whole 22-row completion manifest and global acceptance checker",
+        "canonical documentation amendment and fresh claim review"
       ]
     }
+  },
+  "portable_boundary": {
+    "platform": "Linux with O_TMPFILE, linkat, procfs fallback, renameat2 RENAME_NOREPLACE, flock, and RENAME_EXCHANGE",
+    "cooperation": "same-UID processes are assumed cooperative after final held/visible validation",
+    "explicit_exclusions": [
+      "same-UID swap restored to the same inode before final validation",
+      "physical power-loss certification",
+      "foreign-UID or privileged hostile deployment",
+      "platforms without the required Linux atomic namespace primitives"
+    ]
   }
 }

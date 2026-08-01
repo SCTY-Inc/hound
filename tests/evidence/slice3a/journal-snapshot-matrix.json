@@ -1,0 +1,11 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "matrix": {
+    "J1": "one lock encloses exact events, chain, then head reads; returned bytes and full manifest are unchanged",
+    "J2": "a second journal handle cannot finish append while the verified snapshot owns the journal lock",
+    "J3": "17 partial, noncanonical, exact-row, CRLF, envelope, chain, head, hash, and mode corruptions fail without mutation",
+    "J4": "absent and canonical-empty heads both yield empty snapshots without creating read state"
+  },
+  "source": "tests/test_hsp20_durable_state.py"
+}

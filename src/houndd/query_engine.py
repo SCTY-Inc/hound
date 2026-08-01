@@ -359,14 +359,18 @@ def _verified_context_hash(
     *,
     cursor_resume: bool,
 ) -> str:
+    trusted_prefixes = provenance.access_scoped_context_hashes(scope, snapshot.events)
     if not cursor_resume:
-        trusted = provenance.access_scoped_context_hash(scope, snapshot.events)
+        trusted = (
+            trusted_prefixes[-1]
+            if trusted_prefixes
+            else provenance.access_scoped_context_hash(scope, ())
+        )
         if not hmac.compare_digest(context.access_scoped_context_hash, trusted):
             raise QueryContextError("query context hash does not match trusted query inputs")
         return trusted
 
-    for end in range(1, len(snapshot.events) + 1):
-        trusted = provenance.access_scoped_context_hash(scope, snapshot.events[:end])
+    for trusted in trusted_prefixes:
         if hmac.compare_digest(context.access_scoped_context_hash, trusted):
             return trusted
     raise CursorRejected()

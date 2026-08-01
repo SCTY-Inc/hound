@@ -1,0 +1,21 @@
+{
+  "schema_version": "houndd.slice3a.read-state-manifest.v1",
+  "result": "pass",
+  "comparison": "byte-for-byte equal to read-state-after.json",
+  "excluded_stat_field": "atime",
+  "manifest_fields": [
+    "relative_path",
+    "kind_or_symlink_target",
+    "device",
+    "inode",
+    "uid",
+    "gid",
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "regular_file_sha256"
+  ],
+  "persisted_read_state_files": 0,
+  "source": "test_queries_and_replay_persist_no_server_read_state"
+}

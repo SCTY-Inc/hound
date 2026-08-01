@@ -1,0 +1,37 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "process_exit": "os._exit(77)",
+  "operations": [
+    "create",
+    "rotate",
+    "retire",
+    "roll"
+  ],
+  "fault_points": [
+    "before_identity_temp_write",
+    "mid_identity_temp_write",
+    "after_identity_temp_write",
+    "after_identity_temp_fsync",
+    "after_identity_marker_fsync",
+    "after_identity_new_witness_link",
+    "after_identity_old_witness_link",
+    "after_identity_swap_witness_link",
+    "after_identity_prepared_directory_fsync",
+    "before_identity_publication",
+    "after_identity_rename",
+    "after_identity_directory_fsync",
+    "after_identity_quarantine_move",
+    "after_identity_quarantine_fsync",
+    "after_identity_quarantine_unlink",
+    "after_identity_marker_cleanup"
+  ],
+  "cases": 62,
+  "publication_protocol": "fsynced canonical O_TMPFILE; immutable marker; exact-FD new/old/swap witnesses; absent-link or RENAME_EXCHANGE publication; service-directory fsync; marker-bound cleanup",
+  "before_publication": "old identity or absent on create; unpublished bytes are never adopted",
+  "after_exchange_before_directory_fsync": "exact old or exact deterministic new after recovery",
+  "after_directory_fsync": "exact deterministic new",
+  "hybrid_states": 0,
+  "unmarked_named_temps": 0,
+  "source": "tests/test_hsp20_durable_state.py"
+}

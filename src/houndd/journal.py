@@ -146,7 +146,10 @@ class Journal:
         if raw and not raw.endswith(b"\n"):
             raise JournalError(f"journal file {path} has a partial final line")
         result = []
-        for line in raw.splitlines():
+        rows = raw.split(b"\n")
+        if rows[-1] != b"":  # Guarded above; retained as an exact-LF invariant.
+            raise JournalError(f"journal file {path} has a partial final line")
+        for line in rows[:-1]:
             try:
                 import json
 
@@ -251,8 +254,8 @@ class Journal:
                 raise JournalError(f"journal envelope is invalid: {error}") from error
             self._validate_persisted_values(events, chain_values, head_raw)
             return PersistedJournalSnapshot(
-                tuple(events_raw.splitlines(keepends=True)),
-                tuple(chains_raw.splitlines(keepends=True)),
+                tuple(row + b"\n" for row in events_raw.split(b"\n")[:-1]),
+                tuple(row + b"\n" for row in chains_raw.split(b"\n")[:-1]),
                 head_raw,
             )
 
@@ -287,23 +290,29 @@ class Journal:
             head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
         else:
             head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
+        empty_head = {"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""}
+        recoverable_heads = [empty_head]
+        recoverable_heads.extend(
+            {
+                "sequence": events[index]["sequence"],
+                "chain_sha256": expected_chains[index]["chain_sha256"],
+                "entry_id": events[index]["entry_id"],
+            }
+            for index in range(len(persisted_chains))
+        )
         head_needs_repair = False
         if self.anchor.exists("journal", "head.json"):
             try:
                 raw_head = self.anchor.read_bytes("journal", "head.json")
-                if repair_missing:
-                    import json
-
-                    persisted = json.loads(raw_head.decode("utf-8"))
-                    if not isinstance(persisted, dict) or set(persisted) != {"sequence", "chain_sha256", "entry_id"}:
-                        raise JournalError("journal head has invalid fields")
-                else:
-                    persisted = self._head_from_raw(raw_head)
-            except (OSError, StoreError, UnicodeError, ValueError) as error:
+                persisted = self._head_from_raw(raw_head)
+            except (OSError, StoreError) as error:
                 raise JournalError("journal head is unreadable") from error
-            if persisted != head and not repair_missing:
+            if persisted == head and len(persisted_chains) == len(events):
+                pass
+            elif repair_missing and persisted in recoverable_heads:
+                head_needs_repair = True
+            else:
                 raise JournalError("journal head does not match journal chain")
-            head_needs_repair = repair_missing and raw_head != canonical_bytes(head)
         elif events:
             if not repair_missing:
                 raise JournalError("journal head is missing")

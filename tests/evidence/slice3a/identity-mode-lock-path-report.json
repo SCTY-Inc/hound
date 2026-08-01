@@ -1,0 +1,47 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "modes": {
+    "service_directory": "0700",
+    "identity": "0600",
+    "lock": "0600",
+    "transaction_marker_and_witnesses": "0600"
+  },
+  "lifetime_lock": {
+    "subprocess_exclusion": true,
+    "sigkill_release": true,
+    "fork_child_rejected_before_mutex": true,
+    "fork_child_close_unlocks_parent": false,
+    "child_owned_reopen_before_parent_close": false,
+    "child_owned_reopen_after_parent_close": true
+  },
+  "exact_fd_publication": {
+    "source": "O_TMPFILE without O_EXCL",
+    "primary": "linkat AT_EMPTY_PATH",
+    "fallback_errnos": [
+      "EPERM",
+      "ENOENT"
+    ],
+    "fallback": "held /proc/self/fd directory FD plus numeric relative entry and AT_SYMLINK_FOLLOW",
+    "named_temp_fallback": false,
+    "closed_or_reused_source_rejected": true,
+    "masked_procfs_rejected": true,
+    "link_count_increment_verified": true
+  },
+  "lasting_and_live_replacements": [
+    "ancestor",
+    "root",
+    "service",
+    "lock",
+    "identity",
+    "marker",
+    "new witness",
+    "old witness",
+    "swap witness",
+    "cleanup quarantine"
+  ],
+  "outside_writes": 0,
+  "destructive_replacement_removals": 0,
+  "fd_growth_after_repetition": 0,
+  "source": "tests/test_hsp20_durable_state.py"
+}

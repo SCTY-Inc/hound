@@ -1,0 +1,23 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "canonical_filters": [
+    "time_range",
+    "producer",
+    "source",
+    "entry_id",
+    "record_id",
+    "object_key",
+    "content_sha256",
+    "classification",
+    "access"
+  ],
+  "ordering": "appended_at UTC, sequence, entry_id",
+  "composition": "OR within a field and AND across fields",
+  "explicitly_unavailable": [
+    "entity",
+    "lane",
+    "topic"
+  ],
+  "source": "tests/test_hsp08_durable_query.py"
+}

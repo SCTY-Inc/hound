@@ -14,6 +14,7 @@ from houndd import (
     FAULT_AFTER_PROVIDER,
     FAULT_AFTER_RECORD,
     FAULT_BEFORE_PROVIDER,
+    canonical_bytes,
     canonical_hash,
     HounddStore,
     IdempotencyConflict,
@@ -223,12 +224,12 @@ def test_hsp05_missing_or_stale_head_reconciles_without_verify_repair(tmp_path, 
         record={"schema_version": "houndd.capture.v1", "value": "x"}, blob=b"same"
     )
     head_path = store.journal.head_path
-    original_head = json.loads(head_path.read_text(encoding="utf-8"))
     if head_state == "missing":
         head_path.unlink()
     else:
-        original_head["sequence"] = 99
-        head_path.write_text(json.dumps(original_head), encoding="utf-8")
+        head_path.write_bytes(
+            canonical_bytes({"sequence": -1, "chain_sha256": "0" * 64, "entry_id": ""})
+        )
 
     assert store.verify()["valid"] is False
     if head_state == "missing":

@@ -1,0 +1,29 @@
+{
+  "files": {
+    "src/houndd/cursor.py": "773db0d919f785b489e5864f4bd7fe12d3ccdf969a4e292fff28b8766026c97a",
+    "src/houndd/journal.py": "f03ffba4b9b915dc759eb3a2845d99a87199705e92a2bdacb5f3cc88e49e43e3",
+    "src/houndd/provenance.py": "ece40eed75785031891af2eab92d58091c665c0fb81d64734adef52e215e31f6",
+    "src/houndd/query_engine.py": "ba66fe2206f4c43be0a1bdff0f879859fefae5117fcc10fbdb1650c417f2610d",
+    "src/houndd/service_identity.py": "738c4f1230747af4cdfb04c0721ab8c2ccbe04becb4448e2b56ceb12d168f5f3",
+    "src/houndd/snapshot.py": "bac84223fca826a274b354648b478e8242e1b18e2b9d7532c58b2d5eefa2436d",
+    "tests/acceptance_slice3a.json": "787ccdec762a3cf929f10a33cefd18cdd5dc362e534693e12a317be98143b59d",
+    "tests/evidence/slice3a/canonical-query-matrix.json": "b12313470d45d822138bd5ffc9454f5924ed0fcf21d28164ac0963fb60798d01",
+    "tests/evidence/slice3a/cursor-restart-hwm.json": "3c18961d4672d2eecbb9249432ea1ab2041bff4ec1536f5690ac86931ff72ecd",
+    "tests/evidence/slice3a/identity-crash-matrix.json": "5048fe20cc896d0a55d89780d81093e2d49688380547038c4d1abb11d5606b99",
+    "tests/evidence/slice3a/identity-mode-lock-path-report.json": "67dc714d43a8676d2950367262202b4ba5ba48cd74320e0f65d31a397e30bc0a",
+    "tests/evidence/slice3a/identity-transition-report.json": "24a348419f005b3be6b14785a47a267e7455a1efa5b78d67c47527c5c1f17ae3",
+    "tests/evidence/slice3a/journal-snapshot-matrix.json": "8a3b7a5cc8ef5cf7ca28e6a3a823c18b6cfdcd12deec7a1ef4b414a8ecd4d1b7",
+    "tests/evidence/slice3a/read-state-after.json": "5dadb2734b619c5934a81a60b163fa2b35e5ee58968830b968e14e4ed45c91ea",
+    "tests/evidence/slice3a/read-state-before.json": "5dadb2734b619c5934a81a60b163fa2b35e5ee58968830b968e14e4ed45c91ea",
+    "tests/evidence/slice3a/recovery-vs-verification.json": "8d0f06dd39c61ef0e5fdc22066d01c2a7c7fe13eaf44f25e7b4d0ae73c1c3564",
+    "tests/evidence/slice3a/restore-portability-manifest.json": "b66f6dbfb7284769ab2194065babcc3bb917df07846f7ff0581d7a954fa787fd",
+    "tests/evidence/slice3a/sqlite-independence.json": "fb5bfe923086a15f066199ef74bc207244ec4dec90523dc9accf143c3c2684cd",
+    "tests/fixtures/hsp14_legacy_record.json": "6b56c570014fa51640642001c06bc21a8dbe0568a5694c201b4e298cf2a1eb67",
+    "tests/test_hsp05_transactions.py": "18b76c88f379ab9e83379f59d4c121b28662a96543cdba1c076061ee94513a10",
+    "tests/test_hsp08_durable_query.py": "beee03add80385cabd2bb302b70c6e00cd2be5f8edf81bee8c6d7abe5643aa21",
+    "tests/test_hsp20_durable_state.py": "86486396da3b40650f567631e1a56758b811ddbe87c0930715a055732b38d390",
+    "tests/test_slice3a_evidence.py": "fff612bfb0ffdcf315ef4662d491b5d4f001b4369c9d1e70273e49fb02c36099"
+  },
+  "result": "pass",
+  "schema_version": "houndd.slice3a.source-digests.v1"
+}

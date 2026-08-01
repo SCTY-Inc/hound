@@ -1,0 +1,26 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "claim_status": "provisional code and evidence only; canonical HSP-20 and security-boundary documentation amendment remains a separate acceptance gate",
+  "platform_claim": "Linux with O_TMPFILE, linkat, procfs, renameat2 RENAME_NOREPLACE, flock, and RENAME_EXCHANGE",
+  "exact_fd_fallback": "AT_EMPTY_PATH is attempted first; only EPERM or ENOENT permits a held /proc/self/fd dirfd plus numeric relative entry and AT_SYMLINK_FOLLOW",
+  "copied_components": [
+    "legacy record bytes and manifest",
+    "blob",
+    "journal events, chain, and head",
+    "service identity generation and key IDs"
+  ],
+  "projection_deleted_before_verification": true,
+  "projection_rebuilt_from_journal": true,
+  "cursor_from_path_a_resumes_at_path_b": true,
+  "generation_roll_at_b_affects_a": false,
+  "canonical_absolute_paths": 0,
+  "cleanup_boundary": "RENAME_NOREPLACE quarantine and exact inode/hash validation precede cleanup; no unlink-by-FD guarantee is claimed, and retaining validated quarantine is permitted under the cooperative same-UID boundary",
+  "explicitly_outside_portable_claim": [
+    "same-UID swap restored to the same inode before final validation",
+    "physical power-loss certification",
+    "non-Linux systems without required atomic namespace primitives",
+    "foreign-UID or privileged hostile deployment"
+  ],
+  "source": "tests/test_hsp08_durable_query.py"
+}

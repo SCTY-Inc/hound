@@ -361,8 +361,12 @@ class ProvenanceProjection:
 
     resolve = project
 
-    def access_scoped_context_hash(self, scope: PrincipalScope, events: Iterable[Mapping[str, object]]) -> str:
-        """Hash only provenance that the supplied scope can authorize and observe."""
+    def access_scoped_context_hashes(
+        self,
+        scope: PrincipalScope,
+        events: Iterable[Mapping[str, object]],
+    ) -> tuple[str, ...]:
+        """Build append-stable journal-prefix commitments in one linear pass."""
 
         if not isinstance(scope, PrincipalScope):
             raise ProvenanceError("context hashing requires a PrincipalScope")
@@ -370,14 +374,21 @@ class ProvenanceProjection:
             iterable = tuple(events)
         except TypeError as error:
             raise ProvenanceError("context events must be iterable") from error
-        visible: list[dict[str, Any]] = []
+        previous = canonical_hash(
+            {
+                "schema_version": "houndd.provenance-context-chain.v2",
+                "scope": _scope_value(scope),
+            }
+        )
+        prefixes: list[str] = []
         for event in iterable:
             if not isinstance(event, Mapping):
                 raise ProvenanceError("context event is not a mapping")
             if not authorize_event_header(scope, event):
+                prefixes.append(previous)
                 continue
             provenance = self.project(scope, event)
-            visible.append(
+            visible = (
                 {
                     "entry_id": self._entry_id(event),
                     "lane": None if provenance.lane is None else {
@@ -395,11 +406,26 @@ class ProvenanceProjection:
                     ],
                 }
             )
+            previous = canonical_hash(
+                {
+                    "schema_version": "houndd.provenance-context-chain.v2",
+                    "previous": previous,
+                    "visible": visible,
+                }
+            )
+            prefixes.append(previous)
+        return tuple(prefixes)
+
+    def access_scoped_context_hash(self, scope: PrincipalScope, events: Iterable[Mapping[str, object]]) -> str:
+        """Return the final append-stable context commitment for these events."""
+
+        prefixes = self.access_scoped_context_hashes(scope, events)
+        if prefixes:
+            return prefixes[-1]
         return canonical_hash(
             {
-                "schema_version": "houndd.provenance-context.v1",
+                "schema_version": "houndd.provenance-context-chain.v2",
                 "scope": _scope_value(scope),
-                "visible": sorted(visible, key=lambda value: value["entry_id"]),
             }
         )
 

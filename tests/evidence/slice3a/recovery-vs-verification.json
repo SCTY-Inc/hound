@@ -1,0 +1,22 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "matrix": {
+    "R1": "verified_snapshot is non-repairing; explicit reconcile recreates only the exact missing chain/head suffix",
+    "R2": "tampered events, divergent middle chains, partial rows, noncanonical rows, and divergent canonical heads fail unchanged"
+  },
+  "recoverable_heads": [
+    "missing",
+    "canonical empty prefix",
+    "exact verified persisted-chain prefix"
+  ],
+  "rejected_heads": [
+    "out of range",
+    "random canonical",
+    "mismatched prefix fields",
+    "noncanonical",
+    "malformed",
+    "CRLF"
+  ],
+  "source": "tests/test_hsp20_durable_state.py"
+}

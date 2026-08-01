@@ -6,14 +6,29 @@ import hashlib
 import json
 import secrets
 from collections.abc import Callable
+from datetime import datetime
 from typing import ClassVar
+from types import MappingProxyType
 
-from .access import PrincipalScope, authorize_event_header
+from .access import (
+    AuthenticatedPrincipal,
+    EventSelector,
+    PrincipalScope,
+    ProducerSelector,
+    authorize_event_header,
+)
 from .contracts import canonical_bytes, canonical_hash, validate_journal_envelope
-from .cursor import CursorBindings, CursorCodec, CursorRejected, JournalCursorCandidate
+from .cursor import CursorBindings, CursorCodec, CursorKeyring, CursorRejected, JournalCursorCandidate
 from .journal import Journal, PersistedJournalSnapshot
 from .provenance import ProvenanceProjection
-from .query_contracts import QueryRequest
+from .query_contracts import (
+    ClassificationFilter,
+    ProducerFilter,
+    QueryFilter,
+    QueryRequest,
+    SourceFilter,
+    TimeRange,
+)
 from .query_engine import (
     EMPTY_QUERY_PAGE,
     JournalQueryEngine,
@@ -42,6 +57,151 @@ class QueryFilterNotAvailable(DurableQueryError):
             raise ValueError("unavailable query filters are invalid")
         self.filters = normalized
         super().__init__(f"filter not available: {', '.join(normalized)}")
+
+
+def _exact_text_tuple(value: object, label: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if type(value) is not tuple or any(type(item) is not str for item in value):
+        raise QueryEngineError(f"{label} must contain only exact immutable strings")
+    return tuple(value)
+
+
+def _trusted_request(value: object) -> QueryRequest:
+    if type(value) is not QueryRequest:
+        raise QueryEngineError("query request must be an exact QueryRequest")
+    query_filter = value.filter
+    if type(query_filter) is not QueryFilter:
+        raise QueryEngineError("query request filter must be an exact QueryFilter")
+    if type(value.limit) is not int or not 1 <= value.limit <= 100:
+        raise QueryEngineError("query request limit is invalid")
+    if value.cursor is not None and type(value.cursor) is not str:
+        raise QueryEngineError("query request cursor is invalid")
+
+    time_range = query_filter.time_range
+    if time_range is not None:
+        if (
+            type(time_range) is not TimeRange
+            or type(time_range.lower) is not datetime
+            or type(time_range.upper) is not datetime
+        ):
+            raise QueryEngineError("query time range must be an exact TimeRange")
+        time_range = TimeRange(time_range.lower, time_range.upper)
+
+    producer = query_filter.producer
+    if producer is not None:
+        if type(producer) is not ProducerFilter:
+            raise QueryEngineError("query producer filter must be an exact ProducerFilter")
+        producer = ProducerFilter(
+            owner_id=_exact_text_tuple(producer.owner_id, "producer.owner_id"),
+            capability=_exact_text_tuple(producer.capability, "producer.capability"),
+            run_id=_exact_text_tuple(producer.run_id, "producer.run_id"),
+        )
+
+    source = query_filter.source
+    if source is not None:
+        if type(source) is not SourceFilter:
+            raise QueryEngineError("query source filter must be an exact SourceFilter")
+        source = SourceFilter(
+            provider=_exact_text_tuple(source.provider, "source.provider"),
+            canonical_url=_exact_text_tuple(source.canonical_url, "source.canonical_url"),
+        )
+
+    classification = query_filter.classification
+    if classification is not None:
+        if type(classification) is not ClassificationFilter:
+            raise QueryEngineError("query classification filter must be an exact ClassificationFilter")
+        classification = ClassificationFilter(
+            outcome=_exact_text_tuple(classification.outcome, "classification.outcome"),
+            evidence_status=_exact_text_tuple(
+                classification.evidence_status,
+                "classification.evidence_status",
+            ),
+        )
+
+    try:
+        trusted_filter = QueryFilter(
+            time_range=time_range,
+            producer=producer,
+            lane=_exact_text_tuple(query_filter.lane, "lane"),
+            topic=_exact_text_tuple(query_filter.topic, "topic"),
+            source=source,
+            entity=_exact_text_tuple(query_filter.entity, "entity"),
+            entry_id=_exact_text_tuple(query_filter.entry_id, "entry_id"),
+            record_id=_exact_text_tuple(query_filter.record_id, "record_id"),
+            object_key=_exact_text_tuple(query_filter.object_key, "object_key"),
+            content_sha256=_exact_text_tuple(query_filter.content_sha256, "content_sha256"),
+            classification=classification,
+            access=_exact_text_tuple(query_filter.access, "access"),
+        )
+        return QueryRequest(trusted_filter, value.limit, value.cursor)
+    except (TypeError, ValueError) as error:
+        if isinstance(error, QueryEngineError):
+            raise
+        raise QueryEngineError("query request graph is invalid") from error
+
+
+def _trusted_scope(value: object) -> PrincipalScope:
+    if type(value) is not PrincipalScope:
+        raise QueryEngineError("query scope must be an exact PrincipalScope or None")
+    principal = value.principal
+    if type(principal) is not AuthenticatedPrincipal or type(principal.subject) is not str:
+        raise QueryEngineError("query principal must be exact authenticated input")
+    readable_tiers = value.readable_tiers
+    selectors = value.permitted_event_selectors
+    if type(readable_tiers) is not frozenset or any(type(tier) is not str for tier in readable_tiers):
+        raise QueryEngineError("query scope tiers must be exact immutable strings")
+    if type(selectors) is not tuple or any(type(selector) is not EventSelector for selector in selectors):
+        raise QueryEngineError("query scope selectors must be exact EventSelector values")
+
+    trusted_selectors: list[EventSelector] = []
+    for selector in selectors:
+        producer = selector.producer_selector
+        tiers = selector.readable_tiers
+        if (
+            type(selector.policy_id) is not str
+            or type(producer) is not ProducerSelector
+            or type(tiers) is not frozenset
+            or any(type(tier) is not str for tier in tiers)
+        ):
+            raise QueryEngineError("query scope selector graph is invalid")
+        producer_values = (producer.owner_id, producer.capability, producer.run_id)
+        if any(item is not None and type(item) is not str for item in producer_values):
+            raise QueryEngineError("query producer selector values must be exact strings")
+        trusted_selectors.append(
+            EventSelector(
+                selector.policy_id,
+                ProducerSelector(producer.owner_id, producer.capability, producer.run_id),
+                frozenset(tiers),
+            )
+        )
+    try:
+        return PrincipalScope(
+            AuthenticatedPrincipal(principal.subject),
+            frozenset(readable_tiers),
+            tuple(trusted_selectors),
+        )
+    except (TypeError, ValueError) as error:
+        raise QueryEngineError("query scope graph is invalid") from error
+
+
+def _trusted_identity_state(value: object) -> ServiceIdentityState:
+    if type(value) is not ServiceIdentityState or type(value.generation) is not str:
+        raise QueryEngineError("service identity lease returned an invalid state")
+    keyring = value.keyring
+    if (
+        type(keyring) is not CursorKeyring
+        or type(keyring.active_kid) is not str
+        or type(keyring.keys) is not MappingProxyType
+    ):
+        raise QueryEngineError("service identity lease returned an invalid keyring")
+    keys = dict(keyring.keys)
+    if any(type(kid) is not str or type(secret) is not bytes for kid, secret in keys.items()):
+        raise QueryEngineError("service identity lease returned invalid cursor keys")
+    try:
+        return ServiceIdentityState(value.generation, CursorKeyring(keyring.active_kid, keys))
+    except (TypeError, ValueError) as error:
+        raise QueryEngineError("service identity lease returned invalid durable input") from error
 
 
 def _row_value(raw: object, label: str) -> dict[str, object]:
@@ -172,10 +332,10 @@ class DurableJournalQueryAdapter:
         *,
         nonce_source: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
-        if not isinstance(journal, Journal):
-            raise DurableQueryError("durable query adapter requires a Journal")
-        if not isinstance(service_identity, ServiceIdentity):
-            raise DurableQueryError("durable query adapter requires a ServiceIdentity")
+        if type(journal) is not Journal:
+            raise DurableQueryError("durable query adapter requires an exact Journal")
+        if type(service_identity) is not ServiceIdentity:
+            raise DurableQueryError("durable query adapter requires an exact ServiceIdentity")
         if not callable(nonce_source):
             raise DurableQueryError("durable query cursor nonce source must be callable")
         self._journal = journal
@@ -201,8 +361,13 @@ class DurableJournalQueryAdapter:
         state: ServiceIdentityState,
     ) -> QueryContext:
         assert request.cursor is not None
-        for end in range(len(snapshot.events), 0, -1):
-            context_hash = provenance.access_scoped_context_hash(scope, snapshot.events[:end])
+        codec.authenticate(request.cursor)
+        prefix_hashes = provenance.access_scoped_context_hashes(scope, snapshot.events)
+        tested: set[str] = set()
+        for context_hash in reversed(prefix_hashes):
+            if context_hash in tested:
+                continue
+            tested.add(context_hash)
             bindings = CursorBindings(
                 state.generation,
                 request.filter_hash,
@@ -224,27 +389,33 @@ class DurableJournalQueryAdapter:
         # Preserve the existing authorization-first no-dereference boundary.
         if scope is None:
             return EMPTY_QUERY_PAGE
-        if not isinstance(scope, PrincipalScope):
-            raise QueryEngineError("query scope must be a PrincipalScope or None")
-        if not isinstance(request, QueryRequest):
-            raise QueryEngineError("query request must be a QueryRequest")
-        unavailable = self._unavailable_filters(request)
+        trusted_scope = _trusted_scope(scope)
+        trusted_request = _trusted_request(request)
+        unavailable = self._unavailable_filters(trusted_request)
         if unavailable:
             raise QueryFilterNotAvailable(unavailable)
 
-        with self._service_identity.lease() as state:
-            snapshot = build_journal_query_snapshot(self._journal.verified_snapshot())
-            if not any(authorize_event_header(scope, event) for event in snapshot.events):
+        with ServiceIdentity.lease(self._service_identity) as leased_state:
+            state = _trusted_identity_state(leased_state)
+            snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
+            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
                 return EMPTY_QUERY_PAGE
             provenance = ProvenanceProjection()
             codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
-            if request.cursor is None:
-                context = QueryContext.from_projection(state.generation, scope, snapshot, provenance)
+            if trusted_request.cursor is None:
+                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
             else:
-                context = self._resume_context(request, scope, snapshot, provenance, codec, state)
+                context = self._resume_context(
+                    trusted_request,
+                    trusted_scope,
+                    snapshot,
+                    provenance,
+                    codec,
+                    state,
+                )
             return self._engine.execute(
-                request,
-                scope,
+                trusted_request,
+                trusted_scope,
                 snapshot,
                 provenance,
                 codec,

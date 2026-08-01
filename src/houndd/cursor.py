@@ -365,6 +365,20 @@ class CursorCodec:
     def keyring(self) -> CursorKeyring:
         return self._keyring
 
+    def _authenticated_token(self, token: str) -> tuple[_DecodedToken, bytes]:
+        decoded = _decode_token(token)
+        secret = self._keyring.keys.get(decoded.kid)
+        if secret is None:
+            raise CursorRejected()
+        if not hmac.compare_digest(decoded.tag, _outer_tag(secret, decoded.authenticated_bytes)):
+            raise CursorRejected()
+        return decoded, secret
+
+    def authenticate(self, token: str) -> None:
+        """Reject malformed, unknown-key, or forged tokens before context work."""
+
+        self._authenticated_token(token)
+
     def issue(
         self,
         bindings: CursorBindings,
@@ -414,12 +428,7 @@ class CursorCodec:
         *,
         scan_observer: Callable[[JournalCursorCandidate], None] | None = None,
     ) -> CursorRecovery:
-        decoded = _decode_token(token)
-        secret = self._keyring.keys.get(decoded.kid)
-        if secret is None:
-            raise CursorRejected()
-        if not hmac.compare_digest(decoded.tag, _outer_tag(secret, decoded.authenticated_bytes)):
-            raise CursorRejected()
+        decoded, secret = self._authenticated_token(token)
         if not isinstance(bindings, CursorBindings) or not isinstance(snapshot, CursorRecoverySnapshot):
             raise CursorRejected()
         known_match = True

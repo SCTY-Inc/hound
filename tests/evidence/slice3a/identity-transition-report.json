@@ -1,0 +1,19 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "persisted_generation_field": "generation",
+  "identity_schema": "houndd.service-identity.v1",
+  "key_material_retained": false,
+  "retained_identity_fields": [
+    "generation_digest",
+    "key_id_digests",
+    "whole_file_sha256"
+  ],
+  "transitions": {
+    "restart": "same generation and key IDs",
+    "rotate": "new active key ID with overlap",
+    "retire": "old key removed; active and unknown retirement rejected unchanged",
+    "roll": "generation changes while keyring remains equal"
+  },
+  "source": "tests/test_hsp20_durable_state.py"
+}

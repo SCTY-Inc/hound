@@ -1,0 +1,9 @@
+{
+  "schema_version": "houndd.slice3a.evidence.v1",
+  "result": "pass",
+  "missing_projection_stays_missing": true,
+  "corrupt_projection_manifest_unchanged": true,
+  "sqlite_connect_reached": false,
+  "query_ids_and_cursor_positions_match": true,
+  "source": "tests/test_hsp08_durable_query.py"
+}
