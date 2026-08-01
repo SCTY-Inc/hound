@@ -543,6 +543,73 @@ def test_hsp20_rejected_root_construction_keeps_ancestor_fds_flat(tmp_path) -> N
     assert _fd_count() == baseline
 
 
+@pytest.mark.parametrize("operation", ["read", "append"])
+def test_hsp20_anchored_leaf_validation_failures_are_fd_flat_and_nonmutating(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    if not Path("/proc/self/fd").exists():
+        pytest.skip("requires procfs descriptor inventory")
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    leaf = root / f"unsafe-{operation}.bin"
+    leaf.write_bytes(b"durable truth")
+    leaf.chmod(0o644)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_bytes(b"outside remains untouched")
+    anchor = AnchoredRoot(root, error_type=UnsafeStoreError)
+
+    def fail_validation() -> None:
+        if operation == "read":
+            anchor.read_bytes(leaf.name)
+        else:
+            anchor.append_bytes(leaf.name, data=b"must not append")
+
+    try:
+        with pytest.raises(UnsafeStoreError, match="has group/world permissions") as warmup:
+            fail_validation()
+        assert type(warmup.value) is UnsafeStoreError
+        baseline = _fd_count()
+        before = (
+            leaf.read_bytes(),
+            leaf.stat().st_ino,
+            stat.S_IMODE(leaf.stat().st_mode),
+            _tree_snapshot(root),
+            _tree_snapshot(outside),
+            outside_sentinel.read_bytes(),
+        )
+
+        for _ in range(64):
+            with pytest.raises(UnsafeStoreError, match="has group/world permissions") as caught:
+                fail_validation()
+            assert type(caught.value) is UnsafeStoreError
+
+        assert _fd_count() == baseline
+        assert (
+            leaf.read_bytes(),
+            leaf.stat().st_ino,
+            stat.S_IMODE(leaf.stat().st_mode),
+            _tree_snapshot(root),
+            _tree_snapshot(outside),
+            outside_sentinel.read_bytes(),
+        ) == before
+
+        leaf.chmod(0o600)
+        success_baseline = _fd_count()
+        if operation == "read":
+            assert anchor.read_bytes(leaf.name) == b"durable truth"
+        else:
+            anchor.append_bytes(leaf.name, data=b" appended")
+            assert leaf.read_bytes() == b"durable truth appended"
+        assert _fd_count() == success_baseline
+        assert _tree_snapshot(outside) == before[4]
+        assert outside_sentinel.read_bytes() == before[5]
+    finally:
+        anchor.close()
+
+
 @pytest.mark.parametrize("ancestor_name", ["parent", "intermediate", "grandparent"])
 @pytest.mark.parametrize(
     "operation",

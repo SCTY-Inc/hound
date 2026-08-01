@@ -158,6 +158,7 @@ def _linkat(
 def _open_proc_self_fd() -> int:
     """Hold the kernel procfs descriptor directory for one fallback link."""
 
+    descriptor: int | None = None
     try:
         descriptor = os.open(
             "/proc/self/fd",
@@ -167,11 +168,15 @@ def _open_proc_self_fd() -> int:
             | getattr(os, "O_NOFOLLOW", 0),
         )
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
             raise ServiceIdentityError("exact-FD identity linking is unavailable")
-        return descriptor
+        result = descriptor
+        descriptor = None
+        return result
     except OSError as error:
         raise ServiceIdentityError("exact-FD identity linking is unavailable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _validate_link_source_flags(source_fd: int, *, require_otmpfile: bool) -> None:

@@ -29,7 +29,9 @@ from houndd.service_identity import (
     ServiceIdentityLocked,
 )
 import houndd.service_identity as identity_module
+import houndd.journal as journal_module
 from houndd.snapshot import build_journal_query_snapshot
+from houndd.store import UnsafeStoreError
 
 
 _NONCANONICAL_SEQUENCE_SCALARS = (
@@ -348,6 +350,85 @@ def test_verified_snapshot_tampering_fails_without_mutation(tmp_path: Path, case
         journal.verified_snapshot()
 
     assert _manifest(root) == before
+
+
+def test_verified_snapshot_unsafe_mode_failures_are_fd_flat_and_nonmutating(tmp_path: Path) -> None:
+    proc_fd = Path("/proc/self/fd")
+    if not proc_fd.exists():
+        pytest.skip("requires procfs descriptor inventory")
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (outside / "sentinel").write_bytes(b"outside remains untouched")
+
+    with Journal(root) as journal:
+        journal.append(_event(0))
+        journal.events_path.chmod(0o644)
+        with pytest.raises(JournalError, match="cannot read persisted journal snapshot") as warmup:
+            journal.verified_snapshot()
+        assert type(warmup.value.__cause__) is UnsafeStoreError
+        baseline = len(tuple(proc_fd.iterdir()))
+        before = _manifest(root)
+        outside_before = _manifest(outside)
+
+        for _ in range(64):
+            with pytest.raises(JournalError, match="cannot read persisted journal snapshot") as caught:
+                journal.verified_snapshot()
+            assert type(caught.value.__cause__) is UnsafeStoreError
+
+        assert len(tuple(proc_fd.iterdir())) == baseline
+        assert _manifest(root) == before
+        assert _manifest(outside) == outside_before
+
+        journal.events_path.chmod(0o600)
+        success_baseline = len(tuple(proc_fd.iterdir()))
+        snapshot = journal.verified_snapshot()
+        assert len(snapshot.event_rows) == len(snapshot.chain_rows) == 1
+        assert len(tuple(proc_fd.iterdir())) == success_baseline
+        assert _manifest(outside) == outside_before
+
+
+def test_journal_append_validation_failures_are_fd_flat_and_nonmutating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc_fd = Path("/proc/self/fd")
+    if not proc_fd.exists():
+        pytest.skip("requires procfs descriptor inventory")
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (outside / "sentinel").write_bytes(b"outside remains untouched")
+
+    with Journal(root) as journal:
+        journal.append(_event(0))
+
+        def reject_event_descriptor(*_args, **_kwargs) -> None:
+            raise UnsafeStoreError("injected journal event validation failure")
+
+        with monkeypatch.context() as failures:
+            failures.setattr(journal_module, "check_private_stat", reject_event_descriptor)
+            with pytest.raises(UnsafeStoreError, match="injected journal event validation failure") as warmup:
+                journal.append(_event(1))
+            assert type(warmup.value) is UnsafeStoreError
+            baseline = len(tuple(proc_fd.iterdir()))
+            before = _manifest(root)
+            outside_before = _manifest(outside)
+
+            for _ in range(64):
+                with pytest.raises(UnsafeStoreError, match="injected journal event validation failure") as caught:
+                    journal.append(_event(1))
+                assert type(caught.value) is UnsafeStoreError
+
+            assert len(tuple(proc_fd.iterdir())) == baseline
+            assert _manifest(root) == before
+            assert _manifest(outside) == outside_before
+
+        success_baseline = len(tuple(proc_fd.iterdir()))
+        journal.append(_event(1))
+        assert len(journal.verified_snapshot().event_rows) == 2
+        assert len(tuple(proc_fd.iterdir())) == success_baseline
+        assert _manifest(outside) == outside_before
 
 
 @pytest.mark.parametrize("scalar,sequence", _NONCANONICAL_SEQUENCE_SCALARS)
@@ -2166,6 +2247,108 @@ def test_service_identity_repeated_forced_procfs_publication_is_fd_flat(
         assert len(tuple(proc_fd.iterdir())) == baseline
     identity.close()
     assert len(tuple(proc_fd.iterdir())) == baseline - 4
+
+
+def test_procfs_fstat_failures_after_empty_path_fallback_are_fd_flat_and_nonmutating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc_fd = Path("/proc/self/fd")
+    if not proc_fd.exists() or not getattr(os, "O_TMPFILE", 0):
+        pytest.skip("requires Linux procfs and O_TMPFILE")
+    service = tmp_path / "service"
+    service.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (outside / "sentinel").write_bytes(b"outside remains untouched")
+    directory_fd = os.open(service, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    source_fd: int | None = None
+    try:
+        try:
+            source_fd = os.open(
+                ".",
+                os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            pytest.skip(f"O_TMPFILE is unavailable: {error}")
+        raw = b"validated unnamed identity bytes"
+        os.write(source_fd, raw)
+        os.fsync(source_fd)
+        fingerprint, observed, _ = identity_module._descriptor_fingerprint(source_fd)
+        assert observed == raw
+        real_open = os.open
+        real_fstat = os.fstat
+        real_linkat = identity_module._linkat
+        proc_descriptors: set[int] = set()
+
+        def track_proc_open(path, *args, **kwargs):
+            descriptor = real_open(path, *args, **kwargs)
+            if path == "/proc/self/fd":
+                proc_descriptors.add(descriptor)
+            return descriptor
+
+        def fail_proc_fstat(descriptor: int):
+            if descriptor in proc_descriptors:
+                proc_descriptors.remove(descriptor)
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return real_fstat(descriptor)
+
+        def force_procfs(
+            source_dir_fd: int,
+            source: str,
+            destination_dir_fd: int,
+            destination: str,
+            flags: int,
+        ) -> None:
+            if flags == identity_module._AT_EMPTY_PATH:
+                raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+            real_linkat(source_dir_fd, source, destination_dir_fd, destination, flags)
+
+        def attempt_link() -> None:
+            assert source_fd is not None
+            identity_module._link_identity_fd(
+                source_fd,
+                "identity.json",
+                dir_fd=directory_fd,
+                owner_pid=os.getpid(),
+                expected_fingerprint=fingerprint,
+                require_otmpfile=True,
+            )
+
+        with monkeypatch.context() as failures:
+            failures.setattr(identity_module.os, "open", track_proc_open)
+            failures.setattr(identity_module.os, "fstat", fail_proc_fstat)
+            failures.setattr(identity_module, "_linkat", force_procfs)
+            with pytest.raises(ServiceIdentityError, match="exact-FD identity linking is unavailable") as warmup:
+                attempt_link()
+            assert isinstance(warmup.value.__cause__, OSError)
+            assert warmup.value.__cause__.errno == errno.EIO
+            baseline = len(tuple(proc_fd.iterdir()))
+            before = _manifest(service)
+            outside_before = _manifest(outside)
+
+            for _ in range(64):
+                with pytest.raises(ServiceIdentityError, match="exact-FD identity linking is unavailable") as caught:
+                    attempt_link()
+                assert isinstance(caught.value.__cause__, OSError)
+                assert caught.value.__cause__.errno == errno.EIO
+
+            assert len(tuple(proc_fd.iterdir())) == baseline
+            assert _manifest(service) == before
+            assert _manifest(outside) == outside_before
+
+        success_baseline = len(tuple(proc_fd.iterdir()))
+        attempt_link()
+        assert (service / "identity.json").read_bytes() == raw
+        assert stat.S_IMODE((service / "identity.json").stat().st_mode) == 0o600
+        assert len(tuple(proc_fd.iterdir())) == success_baseline
+        assert _manifest(outside) == outside_before
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        os.close(directory_fd)
 
 
 def test_service_identity_relocation_preserves_identity_without_absolute_paths(tmp_path: Path) -> None:

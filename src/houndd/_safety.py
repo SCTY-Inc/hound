@@ -284,15 +284,20 @@ class AnchoredRoot:
 
     def read_bytes(self, *parts: str) -> bytes:
         self._check_root_identity()
-        fd = self.open_file(*parts, flags=os.O_RDONLY)
+        fd: int | None = self.open_file(*parts, flags=os.O_RDONLY)
         try:
             check_private_stat(os.fstat(fd), self.path.joinpath(*parts), directory=False, error_type=self.error_type)
-            with os.fdopen(fd, "rb") as stream:
+            stream = os.fdopen(fd, "rb")
+            fd = None
+            with stream:
                 data = stream.read()
             self._check_root_identity()
             return data
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be read") from error
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def write_bytes_atomic(self, *parts: str, data: bytes, mode: int = 0o600) -> None:
         if not parts:
@@ -323,10 +328,13 @@ class AnchoredRoot:
         parent_fd = self.dirfd(*parts[:-1]) if len(parts) > 1 else os.dup(self.fd)
         leaf = parts[-1]
         self._validate_part(leaf)
+        fd: int | None = None
         try:
             fd = os.open(leaf, os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
             check_private_stat(os.fstat(fd), self.path.joinpath(*parts), directory=False, error_type=self.error_type)
-            with os.fdopen(fd, "wb") as stream:
+            stream = os.fdopen(fd, "wb")
+            fd = None
+            with stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -335,7 +343,11 @@ class AnchoredRoot:
         except OSError as error:
             raise self.error_type(f"{self.path.joinpath(*parts)} cannot be written") from error
         finally:
-            os.close(parent_fd)
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                os.close(parent_fd)
 
     def listdir(self, *parts: str) -> list[str]:
         self._check_root_identity()

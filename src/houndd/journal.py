@@ -424,6 +424,7 @@ class Journal:
                 raise JournalError(f"expected sequence {expected_sequence}, got {envelope['sequence']}")
             event_bytes = canonical_bytes(envelope) + b"\n"
             parent_fd = self.anchor.dirfd("journal")
+            fd: int | None = None
             try:
                 fd = os.open(
                     "events.jsonl",
@@ -431,7 +432,9 @@ class Journal:
                     dir_fd=parent_fd,
                 )
                 check_private_stat(os.fstat(fd), self.events_path, directory=False, error_type=UnsafeStoreError)
-                with os.fdopen(fd, "wb") as stream:
+                stream = os.fdopen(fd, "wb")
+                fd = None
+                with stream:
                     stream.write(event_bytes)
                     stream.flush()
                     if before_fsync is not None:
@@ -439,7 +442,11 @@ class Journal:
                     os.fsync(stream.fileno())
                 os.fsync(parent_fd)
             finally:
-                os.close(parent_fd)
+                try:
+                    if fd is not None:
+                        os.close(fd)
+                finally:
+                    os.close(parent_fd)
             previous = chains[-1]["chain_sha256"] if chains else _EMPTY_CHAIN_SHA256
             chain = self._chain_value(envelope, previous)
             self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(chain) + b"\n")
