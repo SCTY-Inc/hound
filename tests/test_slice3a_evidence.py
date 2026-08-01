@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1].resolve()
 EVIDENCE = ROOT / "tests" / "evidence" / "slice3a"
@@ -198,7 +200,7 @@ def _inventory(value: object) -> dict[str, Any]:
     result = _exact_keys(value, {"root", "entries"})
     assert type(result["root"]) is str and result["root"] and not result["root"].startswith("synthetic")
     entries = result["entries"]
-    assert type(entries) is list and len(entries) > 1
+    assert type(entries) is list and entries
     paths: list[str] = []
     required = {"path", "kind", "dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blocks", "blksize", "mtime_ns", "ctime_ns"}
     for entry in entries:
@@ -216,6 +218,12 @@ def _inventory(value: object) -> dict[str, Any]:
         if entry["kind"] == "symlink":
             assert type(entry.get("symlink_target")) is str
     assert paths == sorted(paths) and len(paths) == len(set(paths)) and paths[0] == "."
+    return result
+
+
+def _read_state_inventory(value: object) -> dict[str, Any]:
+    result = _inventory(value)
+    assert len(result["entries"]) > 1
     return result
 
 
@@ -321,7 +329,7 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
     assert before["observations"] == after["observations"] and before["proving_node_ids"] == after["proving_node_ids"]
     state = before["observations"]
     assert state["before"] == state["after"] and state["forbidden_matches"] == [] and state["operations"]
-    _inventory(state["before"])
+    _read_state_inventory(state["before"])
 
     journal = _report(evidence, "journal-snapshot-matrix.json", all_nodes)
     _require_nodes(journal, "test_verified_snapshot_returns_exact_triplet", "test_journal_operations_reject_noncanonical_sequence_scalars")
@@ -386,3 +394,21 @@ def validate_bundle(evidence: Path = EVIDENCE) -> None:
 
 def test_slice3a_retained_evidence_is_a_complete_e2_seal() -> None:
     validate_bundle()
+
+
+def test_inventory_allows_real_singleton_but_read_state_rejects_singletons_and_synthetic_roots() -> None:
+    singleton = {
+        "root": "/proc/self/fd",
+        "entries": [{
+            "path": ".", "kind": "directory", "dev": 1, "ino": 2,
+            "mode": 0o40500, "nlink": 2, "uid": 0, "gid": 0,
+            "rdev": 0, "size": 0, "blocks": 0, "blksize": 4096,
+            "mtime_ns": 1, "ctime_ns": 1,
+        }],
+    }
+
+    assert _inventory(singleton) == singleton
+    with pytest.raises(AssertionError):
+        _read_state_inventory(singleton)
+    with pytest.raises(AssertionError):
+        _read_state_inventory({**singleton, "root": "synthetic-read-state"})
