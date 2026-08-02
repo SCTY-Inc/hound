@@ -15,7 +15,8 @@ class QueryContractError(ValueError):
     """A journal-query value does not satisfy the strict request contract."""
 
 
-_REQUEST_FIELDS = frozenset({"filter", "limit", "cursor"})
+_REQUEST_FIELDS = frozenset({"filter", "limit", "cursor", "view"})
+_INTAKE_LEDGER_VIEW = "intake-ledger.v1"
 _FILTER_FIELDS = frozenset(
     {
         "time_range",
@@ -54,9 +55,9 @@ _AWARE_ISO_PATTERN = re.compile(
 
 
 def _object(value: Any, label: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise QueryContractError(f"{label} must be an object")
-    if any(not isinstance(key, str) for key in value):
+    if any(type(key) is not str for key in value):
         raise QueryContractError(f"{label} keys must be strings")
     return value
 
@@ -80,7 +81,7 @@ def _strict_fields(
 
 
 def _text(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise QueryContractError(f"{label} must be a non-empty string")
     try:
         value.encode("utf-8")
@@ -90,7 +91,7 @@ def _text(value: Any, label: str) -> str:
 
 
 def _request_values(value: Any, label: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
+    if type(value) is not list or not value:
         raise QueryContractError(f"{label} must be a non-empty list of strings")
     normalized = tuple(sorted({_text(item, f"{label}[]") for item in value}))
     return normalized
@@ -313,24 +314,45 @@ class QueryRequest:
     filter: QueryFilter
     limit: int = 50
     cursor: str | None = None
+    view: str | None = None
 
     def __post_init__(self) -> None:
+        # Direct model construction remains deliberately permissive enough for
+        # callers to construct a graph and have the durable adapter reject a
+        # hostile subclass before it reaches any hook.  The public parser and
+        # adapter's _trusted_request boundary require exact runtime types.
         if not isinstance(self.filter, QueryFilter):
             raise QueryContractError("filter must be a QueryFilter")
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or not 1 <= self.limit <= 100:
             raise QueryContractError("limit must be an integer from 1 through 100")
         if self.cursor is not None:
             _text(self.cursor, "cursor")
+        if self.view is not None and (type(self.view) is not str or self.view != _INTAKE_LEDGER_VIEW):
+            raise QueryContractError("view must be exactly intake-ledger.v1")
 
     @property
     def filter_hash(self) -> str:
-        return self.filter.filter_hash
+        # Preserve the long-lived no-view cursor domain byte-for-byte.  The
+        # ledger discriminator belongs to the same canonical binding only when
+        # it is explicitly selected.
+        if self.view is None:
+            return self.filter.filter_hash
+        encoded = json.dumps(
+            {"filter": self.filter.canonical, "view": self.view},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @property
     def canonical(self) -> dict[str, Any]:
         value: dict[str, Any] = {"filter": self.filter.canonical, "limit": self.limit}
         if self.cursor is not None:
             value["cursor"] = self.cursor
+        if self.view is not None:
+            value["view"] = self.view
         return value
 
 
@@ -411,7 +433,10 @@ def parse_query_request(value: Any) -> QueryRequest:
     cursor = request.get("cursor")
     if "cursor" in request:
         cursor = _text(cursor, "query request.cursor")
-    return QueryRequest(filter=parse_query_filter(request["filter"]), limit=limit, cursor=cursor)
+    view = request.get("view")
+    if "view" in request and (type(view) is not str or view != _INTAKE_LEDGER_VIEW):
+        raise QueryContractError("query request.view must be exactly intake-ledger.v1")
+    return QueryRequest(filter=parse_query_filter(request["filter"]), limit=limit, cursor=cursor, view=view)
 
 
 __all__ = [

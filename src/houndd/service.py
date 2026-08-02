@@ -20,6 +20,7 @@ from .access import AuthenticatedPrincipal, PolicyBundle, PolicyRule, ProducerCl
 from .contracts import canonical_bytes
 from .query_contracts import QueryContractError, parse_query_request
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
+from .intake_projection import IntakeProjectionError, project_intake_ledger_page
 from .service_identity import ServiceIdentity, ServiceIdentityError
 from . import HounddStore
 from ._safety import AnchoredRoot
@@ -34,7 +35,7 @@ REQUEST_SCHEMA = "houndd.read-request.v1"
 RESPONSE_SCHEMA = "houndd.read-response.v1"
 _REQUEST_FIELDS = frozenset({"schema_version", "request_id", "producer", "requested_access", "policy_id", "operation"})
 _RESPONSE_REQUIRED = frozenset({"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"})
-_RESPONSE_OPTIONAL = frozenset({"result", "cursor", "error"})
+_RESPONSE_OPTIONAL = frozenset({"result", "cursor", "projection", "error"})
 _FRAME_FIELDS = frozenset({"wire_version", "method", "path", "body"})
 _ACCESS_CEILINGS = {
     "public": frozenset({"public"}),
@@ -343,7 +344,7 @@ def _encode_response(value: dict[str, Any]) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, cursor: str | None = None, error: tuple[str, bool, str] | None = None) -> EncodedResponse:
+def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, cursor: str | None = None, projection: dict[str, str] | None = None, error: tuple[str, bool, str] | None = None) -> EncodedResponse:
     body: dict[str, Any] = {"schema_version": RESPONSE_SCHEMA, "request_id": request_id, "ok": status == 200, "outcome": outcome, "record_ids": [], "entry_ids": [], "usage": {"requests": 0, "bytes": 0, "cost": 0}}
     if result is not None:
         body["result"] = result
@@ -351,6 +352,10 @@ def _response(request_id: str, status: int, *, outcome: str, result: list[dict[s
         body["record_ids"] = [event["artifact"]["record_id"] for event in result]
     if cursor is not None:
         body["cursor"] = cursor
+    if projection is not None:
+        if status != 200 or type(projection) is not dict or set(projection) != {"schema_version", "integrity", "high_watermark"} or projection.get("schema_version") != "houndd.intake-ledger.v1" or projection.get("integrity") != "verified" or type(projection.get("high_watermark")) is not str or not projection["high_watermark"]:
+            raise ResponseTooLarge("ledger projection is invalid")
+        body["projection"] = projection
     if error is not None:
         body["error"] = {"code": error[0], "retryable": error[1], "message": error[2]}
     value = {"wire_version": WIRE_VERSION, "status": status, "body": body}
@@ -525,7 +530,31 @@ class HounddService:
             return True
 
         try:
-            page = adapter.execute_bounded(query_request, scope, fits)
+            if query_request.view is None:
+                page = adapter.execute_bounded(query_request, scope, fits)
+            else:
+                def ledger_fits(ledger_page: Any, high_watermark: str) -> bool:
+                    nonlocal prepared
+                    try:
+                        rows = list(project_intake_ledger_page(ledger_page))
+                        prepared = _response(
+                            request.request_id,
+                            200,
+                            outcome="completed",
+                            result=rows,
+                            cursor=ledger_page.next_cursor,
+                            projection={
+                                "schema_version": "houndd.intake-ledger.v1",
+                                "integrity": "verified",
+                                "high_watermark": high_watermark,
+                            },
+                        )
+                    except (ResponseTooLarge, IntakeProjectionError):
+                        return False
+                    return True
+
+                ledger = adapter.execute_ledger_bounded(query_request, scope, ledger_fits)
+                page = None if ledger is None else ledger[0]
         except (QueryContractError, QueryFilterNotAvailable, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
         except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):

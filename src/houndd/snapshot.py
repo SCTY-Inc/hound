@@ -82,6 +82,8 @@ def _trusted_request(value: object) -> QueryRequest:
         raise QueryEngineError("query request limit is invalid")
     if value.cursor is not None and type(value.cursor) is not str:
         raise QueryEngineError("query request cursor is invalid")
+    if value.view is not None and (type(value.view) is not str or value.view != "intake-ledger.v1"):
+        raise QueryEngineError("query request view is invalid")
 
     time_range = query_filter.time_range
     if time_range is not None:
@@ -139,7 +141,7 @@ def _trusted_request(value: object) -> QueryRequest:
             classification=classification,
             access=_exact_text_tuple(query_filter.access, "access"),
         )
-        return QueryRequest(trusted_filter, value.limit, value.cursor)
+        return QueryRequest(trusted_filter, value.limit, value.cursor, value.view)
     except (TypeError, ValueError) as error:
         if isinstance(error, QueryEngineError):
             raise
@@ -470,7 +472,7 @@ class DurableJournalQueryAdapter:
 
             def page(limit: int) -> QueryPage:
                 return self._engine.execute(
-                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor),
+                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view),
                     trusted_scope,
                     snapshot,
                     provenance,
@@ -495,6 +497,86 @@ class DurableJournalQueryAdapter:
                 else:
                     upper = middle - 1
             return accepted
+
+    def execute_ledger_bounded(
+        self,
+        request: QueryRequest,
+        scope: PrincipalScope | None,
+        fits: Callable[[QueryPage, str], bool],
+    ) -> tuple[QueryPage, str] | None:
+        """Select a bounded ledger page and its opaque HWM commitment.
+
+        This is intentionally a sibling to ``execute_bounded`` rather than a
+        change to ``QueryPage``: canonical callers retain their original public
+        page contract, and the display-only commitment never becomes journal
+        query truth.  One identity lease/snapshot supplies every binary-search
+        candidate, so no fitting pass can advance the HWM.
+        """
+
+        if scope is None:
+            return None
+        if not callable(fits):
+            raise QueryEngineError("page fit predicate must be callable")
+        trusted_scope = _trusted_scope(scope)
+        trusted_request = _trusted_request(request)
+        if trusted_request.view != "intake-ledger.v1":
+            raise QueryEngineError("ledger execution requires the ledger view")
+        unavailable = self._unavailable_filters(trusted_request)
+        if unavailable:
+            raise QueryFilterNotAvailable(unavailable)
+        with ServiceIdentity.lease(self._service_identity) as leased_state:
+            state = _trusted_identity_state(leased_state)
+            snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
+            provenance = ProvenanceProjection()
+            codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
+            # Header authorization deliberately precedes *all* HWM, cursor,
+            # or projection work.  A valid scope with no visible events gets a
+            # nonrevealing empty-anchor commitment only after this short path.
+            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
+                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
+                commitment = codec.intake_high_watermark_commitment(
+                    CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash),
+                    None,
+                )
+                empty = EMPTY_QUERY_PAGE
+                return (empty, commitment) if fits(empty, commitment) else None
+            if trusted_request.cursor is None:
+                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
+                high_watermark = snapshot.head
+            else:
+                context = self._resume_context(trusted_request, trusted_scope, snapshot, provenance, codec, state)
+                bindings = CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash)
+                high_watermark = codec.recover(trusted_request.cursor, bindings, snapshot.cursor_recovery_snapshot).high_watermark
+            bindings = CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash)
+            commitment = codec.intake_high_watermark_commitment(bindings, high_watermark, cursor=trusted_request.cursor)
+
+            def page(limit: int) -> QueryPage:
+                return self._engine.execute(
+                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view),
+                    trusted_scope,
+                    snapshot,
+                    provenance,
+                    codec,
+                    context,
+                )
+
+            largest = page(trusted_request.limit)
+            if fits(largest, commitment):
+                return largest, commitment
+            smallest = page(1)
+            if not fits(smallest, commitment):
+                return None
+            accepted = smallest
+            lower, upper = 1, trusted_request.limit - 1
+            while lower <= upper:
+                middle = (lower + upper) // 2
+                candidate = page(middle)
+                if fits(candidate, commitment):
+                    accepted = candidate
+                    lower = middle + 1
+                else:
+                    upper = middle - 1
+            return accepted, commitment
 
     query = execute
 

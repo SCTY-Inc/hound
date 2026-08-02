@@ -50,7 +50,22 @@ def _error(value: object, *, retryable: bool) -> bool:
     )
 
 
-def strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
+def _ledger_row(value: object) -> bool:
+    fields = {"entry_id", "appended_at", "producer", "operation", "source", "classification", "artifact", "lineage", "access"}
+    if type(value) is not dict or set(value) != fields or not _text(value.get("entry_id")) or not _text(value.get("appended_at")) or not _text(value.get("access")):
+        return False
+    nested = (
+        ("producer", {"owner_id", "capability", "run_id"}),
+        ("operation", {"capability", "artifact_kind"}),
+        ("source", {"provider"}),
+        ("classification", {"outcome", "evidence_status"}),
+        ("artifact", {"record_id"}),
+        ("lineage", {"relation", "record_id", "lead_id"}),
+    )
+    return all(type(value[name]) is dict and set(value[name]) == keys and all(_text(item) for item in value[name].values()) for name, keys in nested)
+
+
+def strict_response(raw: bytes, *, request_id: str, view: str | None = None) -> dict[str, Any]:
     """Decode and semantically validate one complete Slice 3B response."""
 
     def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -71,7 +86,7 @@ def strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
         raise _invalid()
     body = value["body"]
     required = {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"}
-    optional = {"result", "cursor", "error"}
+    optional = {"result", "cursor", "projection", "error"}
     if type(body) is not dict or set(body) - required - optional or required - set(body):
         raise _invalid()
     if body["schema_version"] != RESPONSE_SCHEMA or body["request_id"] != request_id or type(body["ok"]) is not bool or not _text(body["outcome"]):
@@ -88,18 +103,28 @@ def strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
         if "cursor" in body and not _text(body["cursor"]):
             raise _invalid()
         result = body["result"]
-        if any(type(event) is not dict or not _text(event.get("entry_id")) or type(event.get("artifact")) is not dict or not _text(event["artifact"].get("record_id")) for event in result):
+        if view is None and "projection" in body:
+            raise _invalid()
+        if view == "intake-ledger.v1":
+            projection = body.get("projection")
+            if type(projection) is not dict or projection.get("schema_version") != "houndd.intake-ledger.v1" or projection.get("integrity") != "verified" or not _text(projection.get("high_watermark")) or set(projection) != {"schema_version", "integrity", "high_watermark"}:
+                raise _invalid()
+            if any(not _ledger_row(event) for event in result):
+                raise _invalid()
+        elif view is not None:
+            raise _invalid()
+        elif any(type(event) is not dict or not _text(event.get("entry_id")) or type(event.get("artifact")) is not dict or not _text(event["artifact"].get("record_id")) for event in result):
             raise _invalid()
         if body["entry_ids"] != [event["entry_id"] for event in result] or body["record_ids"] != [event["artifact"]["record_id"] for event in result]:
             raise _invalid()
     elif status == 400:
-        if body["ok"] is not False or body["outcome"] != "invalid" or "result" in body or "cursor" in body or not _error(body.get("error"), retryable=False):
+        if body["ok"] is not False or body["outcome"] != "invalid" or "result" in body or "cursor" in body or "projection" in body or not _error(body.get("error"), retryable=False):
             raise _invalid()
     elif status == 404:
         if body["ok"] is not False or body["outcome"] != "not_found" or body["entry_ids"] or body["record_ids"] or optional & set(body):
             raise _invalid()
     else:
-        if body["ok"] is not False or body["outcome"] != "unavailable" or "result" in body or "cursor" in body or not _error(body.get("error"), retryable=True):
+        if body["ok"] is not False or body["outcome"] != "unavailable" or "result" in body or "cursor" in body or "projection" in body or not _error(body.get("error"), retryable=True):
             raise _invalid()
     return value
 
@@ -112,6 +137,10 @@ def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) 
     request_id = request.get("body", {}).get("request_id") if type(request.get("body")) is dict else None
     if not _text(request_id):
         raise JournalClientError("journal request ID is invalid")
+    payload = request.get("body", {}).get("operation", {}).get("payload") if type(request.get("body")) is dict and type(request["body"].get("operation")) is dict else None
+    view = payload.get("view") if type(payload) is dict else None
+    if view is not None and view != "intake-ledger.v1":
+        raise JournalClientError("journal view is invalid")
     raw = canonical_bytes(request)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -122,7 +151,7 @@ def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) 
             length = int.from_bytes(_read_exact(connection, 4), "big")
             if not 0 < length <= MAX_FRAME_BYTES:
                 raise _invalid()
-            response = strict_response(_read_exact(connection, length), request_id=request_id)
+            response = strict_response(_read_exact(connection, length), request_id=request_id, view=view)
             if connection.recv(1):
                 raise _invalid()
             return response

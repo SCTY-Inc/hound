@@ -401,7 +401,7 @@ class JournalQueryEngine:
         if not any(authorize_event_header(scope, event) for event in snapshot.events):
             return EMPTY_QUERY_PAGE
 
-        if not isinstance(request, QueryRequest):
+        if type(request) is not QueryRequest:
             raise QueryEngineError("query request must be a QueryRequest")
         if not isinstance(provenance, ProvenanceProjection):
             raise QueryEngineError("query provenance must be a ProvenanceProjection")

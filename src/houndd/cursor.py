@@ -44,6 +44,7 @@ _KID_PATTERN = re.compile(r"[A-Za-z0-9._-]+", re.ASCII)
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _COMMITMENT_PREFIX = b"hound/cursor/commitment/v1"
 _OUTER_TAG_PREFIX = b"hound/cursor/outer-tag/v1"
+_LEDGER_HWM_PREFIX = b"hound/intake-ledger/high-watermark/v1"
 
 
 def _text(value: object, label: str) -> str:
@@ -378,6 +379,37 @@ class CursorCodec:
         """Reject malformed, unknown-key, or forged tokens before context work."""
 
         self._authenticated_token(token)
+
+    def intake_high_watermark_commitment(
+        self,
+        bindings: CursorBindings,
+        high_watermark: JournalCursorCandidate | None,
+        *,
+        cursor: str | None = None,
+    ) -> str:
+        """Return an opaque ledger HWM commitment without disclosing its anchor.
+
+        Continuations use the cursor's authenticated (possibly retired-active)
+        signing key.  This leaves the visible commitment stable through a key
+        rotation while that cursor remains recoverable, without carrying the
+        key ID, sequence, entry ID, or chain digest on the wire.
+        """
+
+        if type(bindings) is not CursorBindings:
+            raise ValueError("ledger commitment requires validated bindings")
+        if high_watermark is not None and type(high_watermark) is not JournalCursorCandidate:
+            raise ValueError("ledger commitment requires a canonical high-watermark")
+        if cursor is None:
+            secret = self._keyring.keys[self._keyring.active_kid]
+        else:
+            _decoded, secret = self._authenticated_token(cursor)
+        anchor = b"" if high_watermark is None else _anchor_value(high_watermark)
+        value = hmac.new(
+            secret,
+            _frame(_LEDGER_HWM_PREFIX, _binding_context(bindings), anchor),
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(value).decode("ascii")
 
     def issue(
         self,
