@@ -71,9 +71,12 @@ not change the proof kernel's refusal to become a global lineage service.
 
 There is exactly one external-ingestion boundary. After cutover, all in-scope
 external search, URL extraction, origin capture, file intake, media intake, and
-transcription are requests to `houndd`-owned adapters. Every attempt, success,
-failure, refusal, partial result, and recovered crash outcome is journaled by
-`houndd` before the caller receives a completed result.
+transcription are requests to `houndd`-owned adapters. Every accepted attempt
+that has not failed integrity—including success, failure, refusal, partial
+result, and recovered crash outcome—is journaled by `houndd` before the caller
+receives a completed result. Pre-acceptance authentication, authorization,
+readiness, and integrity failures create no durable attempt and use the
+already-defined `400` / `404` / `503` response semantics as applicable.
 
 `hound_cli` remains a separate repository-execution proof kernel. A driver
 invocation against an owner Git tree is not an external-ingestion boundary and
@@ -148,9 +151,11 @@ Slice 3B exposes exactly `GET /v1/journal`, `GET /v1/health`, and
 `GET /v1/ready`. Route binding requires the exact method, raw path,
 `operation.name`, and `producer.capability`; the journal operation is exactly
 `journal.query`. Health and readiness are generic and disclose no protected
-metadata. Event/record get, verify/rebuild API, ingestion/import/transcription,
-providers, systemd activation, streaming, policy writes or hot reload, durable
-provenance, migrations, and no-bypass cutover are deferred.
+metadata. Event/record get, verify/rebuild API, providers, systemd activation,
+streaming, policy writes or hot reload, durable provenance, migrations, and
+no-bypass cutover are deferred from Slice 3B. Ingestion, import, and
+transcription POST routes are new Slice 3C additions defined separately below;
+they are not existing Slice 3B surface or evidence.
 
 The Slice 3B API is a logical method/path contract carried only over a local
 `AF_UNIX` `SOCK_STREAM`; it is not HTTP and never TCP, remote, or provider
@@ -186,21 +191,21 @@ and `idempotency_key` are invalid:
 The exact Slice 3B response schema is `houndd.read-response.v1`. Its required
 fields are `schema_version`, `request_id`, `ok`, `outcome`, `record_ids`,
 `entry_ids`, and `usage`; its only optional fields are `result`, `cursor`, and
-policy-safe `error`; unknown fields fail. `result`, `cursor`, and `error` are
-mutually appropriate to the outcome:
+policy-safe `error`; unknown fields fail. For a successful authorized journal
+query, `result` and `cursor` may appear together; `error` appears only for an
+applicable non-success outcome:
 
 ```json
 {
   "schema_version": "houndd.read-response.v1",
   "request_id": "...",
   "ok": true,
-  "outcome": "...",
+  "outcome": "completed",
   "record_ids": ["..."],
   "entry_ids": ["..."],
   "usage": { "requests": 0, "bytes": 0, "cost": 0 },
   "result": ["authorized canonical journal event envelopes in chronological order"],
-  "cursor": "...",
-  "error": { "code": "...", "retryable": false, "message": "..." }
+  "cursor": "..."
 }
 ```
 
@@ -214,10 +219,190 @@ Pure reads are fresh and stateless: a cursorless query selects a newly verified
 journal snapshot/high-watermark on every invocation, so a later append may
 appear in a repeated cursorless request. Only a returned cursor preserves the
 original high-watermark for continuation or replay. Deterministic projection
-maintenance retains no request-result state. Durable commit operations alone,
-when later introduced, require an idempotency key scoped to kernel principal,
-capability, and canonical request hash; same-key same-request replay is stable,
-and changed-request reuse is rejected as a collision.
+maintenance retains no request-result state. Slice 3C durable commit operations
+alone require an idempotency key scoped to kernel principal, capability, and
+canonical request hash; same-key same-request replay is stable, and
+changed-request reuse is rejected as a collision.
+
+### Slice 3C durable commit additions
+
+Slice 3C adds exactly these local `AF_UNIX` `SOCK_STREAM` POST routes over the
+existing `houndd.uds.v1` framing contract:
+
+```text
+POST /v1/ingest/search  -> ingest.search
+POST /v1/ingest/url     -> ingest.url
+POST /v1/ingest/file    -> ingest.file
+POST /v1/ingest/media   -> ingest.media
+POST /v1/transcribe     -> transcribe
+POST /v1/import-record  -> import.record
+```
+
+These are logical method/path routes, not HTTP, TCP, remote, provider, or
+scheduler transports. They use one request and one response per connection,
+canonical UTF-8 JSON, EOF-before-dispatch, exact raw path binding, and the
+existing 1,048,576-byte encoded JSON body ceiling. POST support and commit
+dispatch are new Slice 3C work; they do not expand or rewrite Slice 3B.
+
+The exact durable request body is `houndd.commit-request.v1`:
+
+```json
+{
+  "schema_version": "houndd.commit-request.v1",
+  "request_id": "...",
+  "idempotency_key": "...",
+  "producer": { "owner_id": "...", "capability": "...", "run_id": "..." },
+  "requested_access": "public|workspace|restricted",
+  "policy_id": "...",
+  "operation": { "name": "...", "payload": {} }
+}
+```
+
+Unknown fields are invalid. `idempotency_key` is required for these durable
+POSTs and remains forbidden in the pure-read request. The route, operation name,
+and `producer.capability` bind exactly to the six mappings above. The caller
+supplies one exact `policy_id`; the daemon resolves exactly that policy and
+never unions policy IDs or their rules. Authorization and the effective access
+ceiling occur before source lookup, record lookup, provider selection, or
+provider invocation. Authorization denial or an absent protected target is a
+generic logical `404` / CLI exit 3. Policy-file integrity, change, replacement,
+or recovery/readiness failure is logical `503` / CLI exit 5, not an authorization
+denial.
+
+The exact durable response body is `houndd.commit-response.v1`:
+
+```json
+{
+  "schema_version": "houndd.commit-response.v1",
+  "request_id": "...",
+  "ok": true,
+  "outcome": "completed",
+  "record_ids": ["..."],
+  "entry_ids": ["..."],
+  "usage": { "requests": 0, "bytes": 0, "cost": 0 }
+}
+```
+
+`error` is the only optional field, is omitted for a completed success, and is
+always policy-safe when present. Unknown fields fail. Durable responses return
+IDs, outcome, usage, and optional policy-safe error only: they never return a
+`result`, `cursor`, source bytes, transcript body, provider response, or other
+result body. A completed outcome is logical
+`200`, `ok: true`, CLI exit 0.
+Every durable non-completed outcome—`failed`, `partial`, `degraded`, `refused`,
+or `interrupted`—is logical `200`, `ok: false`, and CLI exit 4. Invalid framing,
+envelopes, payloads, source declarations, import ID/byte conflicts, and changed
+idempotency-key reuse are logical `400` / CLI exit 2. Unavailable service or
+adapter readiness, integrity, recovery, or required-primitive failures before
+acceptance are logical `503` / CLI exit 5 and create no durable attempt. After
+acceptance, an absent adapter or adapter abstention is a durable `degraded` or
+`refused` outcome, logical `200` / `ok: false` / CLI exit 4, with one final
+outcome record and journal event.
+
+The operation payloads are strict and contain no unknown fields:
+
+- `ingest.search`: `{ "query": "...", "limit": 1..50 }`.
+- `ingest.url`: `{ "url": "...", "lineage": { "kind": "direct" } }`, or
+  `{ "url": "...", "lineage": { "kind": "search", "record_id": "...", "lead_id": "..." } }`;
+  optional `max_pages` is bounded to 2..20. The URL uses the existing
+  public-URL validator.
+- `ingest.file` and `ingest.media`: `{ "source": SOURCE, "media_type": "..." }`.
+- `import.record`: `{ "record_id": "...", "source": SOURCE }`.
+- `transcribe`: `{ "capture_id": "..." }` and no provider/model fields.
+
+`SOURCE` is exactly one of these shapes, with no additional fields:
+
+```json
+{ "kind": "bytes", "body_base64": "...", "sha256": "...", "byte_length": 0 }
+{ "kind": "path", "path": "...", "sha256": "...", "byte_length": 0 }
+```
+
+`byte_length` is an unsigned integer from 0 through 16,777,216 (16 MiB), and
+the declared SHA-256 and length must match the bytes actually read. The wire
+ceiling applies to the encoded JSON body, while the 16 MiB cap applies to
+decoded inline bytes, path bytes, and any adapter-returned source bytes before
+staging. For an inline bytes source of decoded length `N`, acceptance requires
+`4*ceil(N/3) + canonical_metadata_bytes <= 1,048,576`; the complete canonical
+encoded request is authoritative. Larger approved sources use a path.
+Before request hashing or durable staging, the daemon reads/decodes SOURCE and
+replaces it with exactly `{ "sha256": "...", "byte_length": N }`. `SOURCE.kind`,
+`path`, and `body_base64` are excluded from canonical identity and are never
+persisted, logged, returned, journaled, indexed, or placed in diagnostics.
+For a path, the daemon opens the absolute owner-readable path with no symlink
+following, holds that descriptor, and reads only from it. It validates a
+regular-file held-FD identity and size before and after the read (including
+device/inode stability), then verifies the declared digest and length; any
+TOCTOU change, non-regular file, oversize, or mismatch fails closed. No source
+path participates in identity.
+
+`ingest.media` creates an immutable authorized media-capture record and returns
+its capture record ID. That record retains the exact source-byte hash, media
+type, and source lineage. `transcribe` accepts only that ID; it must resolve to
+an authorized `kind=media` capture under the effective scope with that exact
+hash, type, and lineage before any model call. Provider, model, exact model
+version, language, segment/timing hashes, text hash, and transcription status
+are daemon-produced provenance, never caller-controlled request fields.
+
+For `import.record`, `record_id` is the supplied legacy identity, not
+necessarily the byte SHA-256. The daemon mirrors the exact source bytes
+create-only, verifies the declared digest and length, preserves the supplied
+legacy ID, exact bytes, and legacy lineage, and rejects an ID/byte conflict
+without rewriting anything. If legacy lineage is absent, it records the explicit
+canonical no-lineage value. A new idempotency key for an identical existing
+record creates a distinct journal occurrence; a same-key retry returns the
+original IDs and appends no event. This import contract is the legacy-record
+preservation boundary.
+
+Every operation-specific record includes `attempt_id`, canonical request hash,
+operation, outcome, evidence status, and source/lineage provenance appropriate
+to the operation. Transcription records additionally retain origin capture,
+provider/model/version, language, segment/timing hashes, text hash, source
+lineage, and explicit `completed|partial|failed|degraded|refused|interrupted`
+status. Records retain policy-safe hashes and provenance only where content
+could contain PHI.
+
+Under the transaction lock, the daemon creates and fsyncs the idempotency
+reservation and private attempt-open marker as one validated pair before any
+adapter call. A partial pair is an integrity failure; neither file is canonical
+journal truth. The reservation/open metadata is owner-only transaction state,
+not an additional journal event. For a normalized request, `request_hash` is
+the SHA-256 of canonical JSON containing the bound route, producer, requested
+access, exact policy ID, operation, and normalized payload, excluding only
+`request_id` and `idempotency_key`. The durable attempt identity is
+`attempt_id = SHA256(canonical JSON({"principal": principal, "capability": capability, "idempotency_key": idempotency_key, "request_hash": request_hash}))`.
+
+Commit ordering is fixed:
+
+1. Authenticate the peer, validate the exact route/envelope, resolve the one
+   requested policy, authorize, then normalize/read/verify/hash any `SOURCE`
+   supplied by the operation and compute the canonical request hash before any
+   durable reservation.
+2. Under the transaction lock, create and fsync the idempotency reservation and
+   private open marker as one validated pair. A partial pair is an integrity
+   failure; neither file is canonical journal truth.
+3. Invoke exactly one allowlisted adapter, with no retry, fallback, escalation,
+   or caller-selected provider; after acceptance, an absent adapter or
+   abstention records the durable `degraded` or `refused` outcome.
+4. PHI-scan before persistence, then durably stage exact returned bytes or a
+   bounded policy-safe failure/partial diagnostic.
+5. Create-only publish the immutable outcome record and content blob.
+6. Append and durably persist exactly one immutable journal event referencing
+   that record.
+7. Persist the completed idempotency response and acknowledge only when the
+   record/event pair is logically crash-recoverable. Record/event publication
+   is logically crash-recoverable, not filesystem-atomic.
+
+Recovery never retries a provider call. Recovery states are exactly:
+`open/no stage` becomes one explicit `interrupted` outcome; `staged` publishes
+once; `record/no event` appends the verified event once; and `event/no record`,
+`partial pair`, hash disagreement, or ambiguous metadata fails closed as an
+integrity failure and is never silently repaired or deleted. A committed attempt
+replays the same IDs without a second record, blob occurrence, or journal event.
+Every accepted attempt that has not failed integrity therefore has one final
+immutable outcome record and one final immutable journal event.
+
+This section freezes the Slice 3C contract only. It makes no HSP completion
+claim and does not alter the keyless pure-read contract above.
 
 The portable defaults are `$XDG_RUNTIME_DIR/hound/houndd.sock` for the socket
 and `${XDG_STATE_HOME:-$HOME/.local/state}/hound/discovery` for state. The
@@ -256,9 +441,11 @@ frame/envelope/path/cursor and unavailable derived filters are logical `400` /
 CLI 2. Unresolved scope is generic logical `404` / CLI 3 with empty IDs and no
 result, cursor, count, hint, or metadata; a resolved authorized collection with
 no visible matches is completed empty / 0. Unready, integrity, recovery,
-policy, connection, and timeout failures are logical `503` / CLI 5. Exit 4 is
-reserved for durable failed/partial/degraded/refused operations and is unused
-by Slice 3B.
+policy-file integrity/change/recovery/readiness, connection, and timeout
+failures are logical `503` / CLI 5. Authorization denial or an absent protected
+target is always logical `404` / CLI 3. Exit 4 is reserved for durable
+failed/partial/degraded/refused/interrupted operations and is unused by Slice
+3B.
 
 ## Immutable records and journal
 
@@ -330,13 +517,15 @@ and every hop remains observable to an authorized principal.
 
 ## Atomic and idempotent commit semantics
 
-Every provider attempt, including authentication failure, rate limit, timeout,
-truncated bytes, model failure, refusal, partial output, and process
-interruption, receives a durable immutable attempt record and journal event.
-The service durably records an attempt-open marker before invoking a provider;
-the provider outcome is then committed as the same attempt's immutable outcome
-record. If the process dies before an outcome is received, recovery commits an
-explicit interrupted outcome rather than erasing the attempt.
+Every accepted Slice 3C provider attempt that has not failed integrity,
+including authentication failure, rate limit, timeout, truncated bytes, model
+failure, refusal, partial output, adapter abstention, and process interruption,
+receives one durable immutable final outcome record and one journal event. A
+private attempt-open marker is transaction metadata only; it is not an immutable
+record or journal truth. If the process dies before an outcome is received,
+recovery commits an explicit interrupted outcome rather than erasing the
+attempt. Integrity-failed attempts are excluded from this final-outcome
+guarantee.
 
 Only a durable commit request has an idempotency key scoped to the kernel
 principal, capability, and canonical request hash. The key is commit
@@ -350,19 +539,31 @@ deferred from Slice 3B.
 
 The commit protocol is:
 
-1. Authenticate and authorize before any provider call; canonicalize the
-   request and reserve the idempotency key.
-2. Durably write the attempt-open record, invoke exactly one allowed adapter,
-   and durably stage returned bytes or the exact failure/partial diagnostic.
-3. Atomically publish the immutable content record and its journal event with
-   both durable before the response is acknowledged. No journal event may
-   point to a missing record, and no completed record may claim a committed
-   event that is absent.
-4. On restart, reconcile staged data and the idempotency key. A complete
-   staged result commits once; an incomplete provider call commits an
-   interrupted/failure outcome once; a committed pair is never duplicated.
-5. Rebuild projections only from committed journal events. A crash during
-   projection update cannot alter record or event identity.
+1. Authenticate the peer, validate the exact route/envelope, resolve the one
+   requested policy, authorize, then normalize/read/verify/hash any `SOURCE`
+   supplied by the operation and compute the canonical request hash before any
+   durable reservation.
+2. Under the transaction lock, create and fsync the idempotency reservation and
+   private open marker as one validated pair. A partial pair is an integrity
+   failure; neither file is canonical journal truth.
+3. Invoke exactly one allowlisted adapter, with no retry, fallback, escalation,
+   or caller-selected provider; after acceptance, an absent adapter or
+   abstention records the durable `degraded` or `refused` outcome.
+4. PHI-scan before persistence, then durably stage exact returned bytes or a
+   bounded policy-safe failure/partial diagnostic.
+5. Create-only publish the immutable outcome record and content blob.
+6. Append and durably persist exactly one immutable journal event referencing
+   that record.
+7. Persist the completed idempotency response and acknowledge only when the
+   record/event pair is logically crash-recoverable. Record/event publication
+   is logically crash-recoverable, not filesystem-atomic.
+
+Recovery uses the same exact state rules specified in the Slice 3C commit
+ordering: `open/no stage` becomes `interrupted`; `staged` publishes once;
+`record/no event` appends the verified event once; `event/no record`,
+`partial pair`, hash disagreement, or ambiguous metadata fails closed.
+Projection rebuild uses only committed journal events; a crash during projection
+maintenance never changes canonical truth or re-invokes a provider.
 
 Crash-point tests cover before provider call, after provider return/before
    publish, after record publish/before journal fsync, after journal fsync/before
@@ -436,15 +637,21 @@ Restricted records have policy-defined retention and erasure. Erasure removes
 permitted blobs and projections and appends an erasure tombstone that preserves
 the record identity, lineage relation, policy, and audit fact without exposing
 the erased content. The immutable journal is not rewritten. Hound stores no
-caregiver runtime data and no PHI; suspected PHI is rejected or quarantined
-before persistence, with no PHI in error, index, snippet, or metrics output.
+caregiver runtime data and no PHI. Suspected or confirmed PHI is rejected or
+quarantined before persistence. A quarantine is a non-PHI manifest containing
+only the hash, length, reason, and access metadata; raw suspected or confirmed
+PHI is never persisted. No source, transcript, provider response, error, index,
+metric, or response may contain PHI. Transcription records retain hashes and
+policy-safe provenance only, unless a separately approved non-PHI
+representation is established.
 
 ## Transcription provenance
 
 Every transcription record names the origin media capture, model/provider and
 exact model version, language, segment/timing hashes, text hash, status, and
 exact source lineage. Status is explicit (`completed`, `partial`, `failed`, or
-`refused`); partial and failed transcripts are durable outcomes, never silently
+`degraded`, `refused`, or `interrupted`); partial, failed, degraded, refused,
+and interrupted transcripts are durable non-completed outcomes, never silently
 promoted to complete evidence. A transcription cannot exist without an
 authorized capture lineage, and segment hashes permit independent verification
 of the relationship between source media, timings, and text.
@@ -570,18 +777,18 @@ must pass.
 | --- | --- | --- |
 | HSP-01 | There is one external-ingestion boundary after cutover: all external search, URL extraction, capture, file/media intake, and transcription goes through `houndd`-owned adapters and is journaled; `hound_cli` is repository execution only and is not an acquisition boundary. | Fixture: migrated consumer with fake provider credential and direct-client imports. Test/command: static boundary checker plus Unix-socket integration test with the credential unset. Assert: only the allowlisted `houndd` adapter reaches the provider; direct and `hound_cli` acquisition paths fail closed. Retain: boundary scan JSON and journal event bundle. |
 | HSP-02 | The proof kernel preserves existing `hound_cli` semantics, legacy record IDs, hashes, exact bytes, guarded-write checks, and verification; it gains no domain logic, scheduler, lineage service, central queue, or approval DB. | Fixture: `tests/golden/config_migration` and a copied legacy run directory. Test/command: `PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_orchestrator.py tests/test_runtime.py`; Assert: exact effects, run verification, and legacy hashes/bytes are unchanged. Retain: pytest output, verified run record, and hash manifest. |
-| HSP-03 | Slice 3B is future-facing partial coverage only: `houndd serve` is foreground/no-scheduler and `hound-research journal query` uses exactly `GET /v1/journal`, `GET /v1/health`, and `GET /v1/ready`. It uses local `AF_UNIX` `SOCK_STREAM`, wire `houndd.uds.v1`, one length-prefixed canonical-JSON request/response per connection, strict raw method/path binding, EOF-before-dispatch, and no HTTP/TCP/remote/provider transport. Pure reads use exactly `houndd.read-request.v1`, forbid `idempotency_key`, and use strict `houndd.read-response.v1` with optional appropriate `result`, `cursor`, and policy-safe `error`; durable commit idempotency is deferred. The XDG defaults, absolute-only explicit override, owner-only runtime/state/socket/policy permissions, and exits 0/2/3/5 apply; exit 4 is unused by this slice. | Fixture: Slice 3B CLI/API golden request/response/error, frame-negative, permission, and socket-only service sets. Test/command: Slice 3B CLI and service-contract tests. Assert: the only public routes and envelope fields are exact; invalid framing/path/body fails as specified; pure reads retain no result state; defaults/overrides preserve identity; no scheduler or alternate transport starts; and all claims remain partial. Retain: request/response/error transcript, framing matrix, permission report, and service capability report. |
+| HSP-03 | Slice 3B is future-facing partial coverage only: `houndd serve` is foreground/no-scheduler and `hound-research journal query` uses exactly `GET /v1/journal`, `GET /v1/health`, and `GET /v1/ready`. It uses local `AF_UNIX` `SOCK_STREAM`, wire `houndd.uds.v1`, one length-prefixed canonical-JSON request/response per connection, strict raw method/path binding, EOF-before-dispatch, and no HTTP/TCP/remote/provider transport. Pure reads use exactly `houndd.read-request.v1`, forbid `idempotency_key`, and use strict `houndd.read-response.v1` with optional appropriate `result`, `cursor`, and policy-safe `error`; durable commit idempotency is deferred from Slice 3B. Slice 3C separately adds only the six exact POST routes and commit envelopes defined above; that addition is not claimed as Slice 3B evidence. The XDG defaults, absolute-only explicit override, owner-only runtime/state/socket/policy permissions, and exits 0/2/3/5 apply to Slice 3B; exit 4 is unused by that slice. | Fixture: Slice 3B CLI/API golden request/response/error, frame-negative, permission, and socket-only service sets. Test/command: Slice 3B CLI and service-contract tests. Assert: the only Slice 3B public routes and envelope fields are exact; invalid framing/path/body fails as specified; pure reads retain no result state; defaults/overrides preserve identity; no scheduler or alternate transport starts; Slice 3C POST additions are tested separately; and all Slice 3B claims remain partial. Retain: request/response/error transcript, framing matrix, permission report, and service capability report. |
 | HSP-04 | The immutable journal envelope contains exactly the required fields and omits summary, priority, status, next_action, approval, CRM/wiki claims, and domain tags from canonical truth. | Fixture: one record for each artifact kind plus an unknown-usage case. Test/command: envelope schema/negative-schema test and `journal verify`. Assert: required field set, value domains, hashes, and omission set match this contract; unknown usage is omitted. Retain: canonical envelope JSONL and verifier report. |
-| HSP-05 | Provider attempts, including failures, are durable; content record plus journal event commit atomically; idempotency keys make retries one commit; all specified crash points recover without duplicate or orphan truth. | Fixture: fault-injecting adapter for success, 429, timeout, truncation, and process kill at each commit point. Test/command: atomic-commit recovery test with repeated idempotency key. Assert: one attempt/event identity, durable failure or interrupted outcome, no event without record, no acknowledged record without event, and retry returns the original identity. Retain: fault schedule, recovery journal, record hashes, and idempotency result. |
-| HSP-06 | Search, extract, capture, import, and transcription lineage is exact and durable; transcription records name origin media, model/provider/version, language, segment/timing hashes, text hash, status, and source lineage; partial/failure remains explicit. | Fixture: media capture with two timed segments, partial model result, failed model result, and imported record. Test/command: provenance verifier and transcription lineage test. Assert: every edge and hash resolves, partial/failed statuses remain non-complete, and no transcription lacks its capture. Retain: lineage graph JSON, segment manifest, and verifier output. |
+| HSP-05 | Provider attempts that have not failed integrity, including failures, are durable; outcome-record and journal-event publication is logically crash-recoverable, not filesystem-atomic; idempotency keys make retries one commit; durable `failed`, `partial`, `degraded`, `refused`, and `interrupted` outcomes use logical 200/`ok:false` and CLI exit 4; all specified crash points recover without duplicate or orphan truth. The reservation and private open marker are a lock-held, fsynced validated pair and neither is journal truth. | Fixture: fault-injecting adapter for success, 429, timeout, truncation, abstention, and process kill at each commit point. Test/command: atomic-commit recovery test with repeated idempotency key. Assert: one attempt, one outcome record, and one journal event; their identifiers need not be equal; durable non-completed outcome, no event without record, no acknowledged record without event, no provider retry, and replay returns the original IDs. Retain: fault schedule, recovery journal, record hashes, and idempotency result. |
+| HSP-06 | Search, extract, capture, import, and transcription lineage is exact and durable; `ingest.media` creates an authorized immutable media-capture ID with exact source hash/type/lineage, and transcription records name that origin media, model/provider/version, language, segment/timing hashes, text hash, status, and source lineage; `partial`, `failed`, `degraded`, `refused`, and `interrupted` remain explicit and PHI-free. | Fixture: media capture with two timed segments, partial model result, failed model result, degraded/abstained result, interrupted result, and imported record. Test/command: provenance verifier and transcription lineage test. Assert: every edge and hash resolves, `transcribe` accepts only the authorized media-capture ID, all non-completed statuses remain non-complete, and no transcription lacks its capture or emits PHI. Retain: lineage graph JSON, segment manifest, and verifier output. |
 | HSP-07 | Every occurrence remains a distinct event; equal blobs may share storage; `object_key` groups revisions; `content_sha256` identifies bytes; URL dedupe is never destructive. | Fixture: concurrent same-content captures from two providers and two URL revisions. Test/command: concurrent dedupe test plus `journal query`. Assert: distinct entry/record identities and lineage with shared blob only where exact bytes match; no URL occurrence is deleted. Retain: event list, blob index, and dedupe report. |
 | HSP-08 | `journal query`/`GET /v1/journal` has the specified ANDed filter families (OR within a multi-value family), chronological ascending canonical-event results, and no totals or snippets. Until durable provenance exists, `lane`, `topic`, and `entity` return `filter_not_available` / logical 400 / CLI 2. A cursorless read selects a newly verified high-watermark on every invocation; only a returned opaque cursor binds service generation, filter hash, principal, last sequence, and its original high-watermark for continuation/replay. Consumers own cursors/ack/progress; Hound retains no saved query, delivery, acknowledgement, subscriber, or pure-read result state; streaming is deferred from Slice 3B. | Fixture: two principals, available-filter matrix, unavailable-derived-filter set, later append, cursor continuation/replay, and independently stored consumer cursors. Test/command: query, cursor-binding, and replay tests. Assert: filters, ordering, fresh cursorless high-watermarks, preserved cursor high-watermarks, generic authorization behavior, and no server request-result/subscriber state are exact. Retain: query fixtures, cursor transcript, and storage inventory. |
-| HSP-09 | The certified Linux principal is exactly `linux-uid:<decimal uid>` from accepted-socket `SO_PEERCRED`, before request evaluation/state access; PID, GID, environment, and request/producer claims cannot override it. Owner-only runtime/state directories, socket, and canonical read-only `${state}/service/policy.json` establish a cooperative same-UID boundary only. The frozen `houndd.policy.v1` policy uses `PolicyBundle`/`PolicyRule`/`ProducerSelector` semantics, selects exactly one policy ID without unions, fails readiness on change, and has no DB/write API. Policy grants intersect the `requested_access` disclosure ceiling; authorization precedes every journal/record access, filter, count, pagination, result, and cursor action. Unauthorized scope is the generic empty logical 404/CLI 3 result. | Fixture: distinct peer UIDs, forged identity claims, policy-ID rules, replacement policy, one event per tier, out-of-scope filter, and unauthorized query. Test/command: Unix-peer ACL and policy-lifecycle negative tests before journal access. Assert: exact principal formation/non-override, permission checks, no policy unions, ceiling intersection, fail-closed replacement, and zero protected metadata/count/cursor/result leakage. Retain: redacted peer-ACL transcript, policy decision log, and readiness report. |
+| HSP-09 | The certified Linux principal is exactly `linux-uid:<decimal uid>` from accepted-socket `SO_PEERCRED`, before request evaluation/state access; PID, GID, environment, and request/producer claims cannot override it. Owner-only runtime/state directories, socket, and canonical read-only `${state}/service/policy.json` establish a cooperative same-UID boundary only. The frozen `houndd.policy.v1` policy uses `PolicyBundle`/`PolicyRule`/`ProducerSelector` semantics; the caller supplies one exact policy ID, the daemon selects exactly that ID without unions, and policy change/integrity/recovery fails readiness. Policy grants intersect the `requested_access` disclosure ceiling; authorization precedes every source/record/provider access. Authorization denial or an absent protected target is generic 404/CLI 3; policy integrity/change/recovery is 503/CLI 5. | Fixture: distinct peer UIDs, forged identity claims, exact policy-ID rules, replacement policy, one event per tier, out-of-scope target, and unauthorized query. Test/command: Unix-peer ACL and policy-lifecycle negative tests before source/provider access. Assert: exact principal formation/non-override, one-policy selection/no unions, ceiling intersection, 404 versus 503 distinction, fail-closed replacement, and zero protected metadata/count/cursor/result leakage. Retain: redacted peer-ACL transcript, policy decision log, and readiness report. |
 | HSP-10 | Workpad remains the human-readable proposal/review surface; `plus`/`amplify` is only an immutable preference/ranking annotation; Ali makes the exact decision; `decisions.jsonl` is audit only; the native owner gate alone applies; receipt and outcome remain distinct. | Fixture: immutable records/proposal, plus annotation, exact Ali approve and decline decisions, tampered decision-log copy. Test/command: approval-binding integration test. Assert: annotation cannot fan out/approve/apply/publish/contact/execute/queue, decisions log cannot gate, exact hashes are validated by the native gate, and receipt differs from outcome. Retain: proposal, decision, gate receipt, outcome, and audit JSONL. |
 | HSP-11 | Observability exposes provider errors, spend, freshness, capture completeness, dedupe rate, consumer lag, unprocessed demand, and journal/index/recovery health without protected data. | Fixture: successful, failed, partial, stale, duplicate, lagging, and unprocessed jobs. Test/command: telemetry contract test. Assert: each signal is present, numerically consistent with the fixture, access-filtered, and free of credentials/PHI/snippets. Retain: redacted metrics snapshot and consistency report. |
-| HSP-12 | Failure/recovery acceptance covers concurrent same-content captures, crash after fetch/before commit, 429s, timeouts, truncated bytes, transcript failures, outage abstention, cursor replay, ACL non-leakage, backup restore, and exact-hash approval binding. | Fixture: the complete fault matrix and portable backup. Test/command: `PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider` plus recovery/fault integration suite. Assert: no loss, no unauthorized disclosure, no downstream duplicate effect, preserved IDs/lineage after restore, and approval rejection on any hash drift. Retain: full pytest log, fault matrix, restored-store verification, and approval failure report. |
+| HSP-12 | Failure/recovery acceptance covers concurrent same-content captures, crash after fetch/before commit, 429s, timeouts, truncated bytes, transcript failures, outage abstention, cursor replay, ACL non-leakage, backup restore, exact-hash approval binding, 0/1/16 MiB source limits, base64 wire overhead, digest mismatch, held-FD nofollow regular-file TOCTOU checks, PHI quarantine, and ambiguous record/event recovery. | Fixture: the complete fault matrix and portable backup. Test/command: `PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider` plus recovery/fault integration suite. Assert: no loss, no unauthorized disclosure, no `SOURCE` path/base64/kind persistence, no downstream duplicate effect, preserved IDs/lineage after restore, and approval rejection on any hash drift. Retain: full pytest log, fault matrix, restored-store verification, and approval failure report. |
 | HSP-13 | The complete audited migration inventory is present with each lane’s explicit owner and cadence-authority/category: Pulse: `gc-web` / `givecare/pulse-daily`, daily. Benefits radar: `gc-benefits` / `givecare/discovery-benefits`, daily. Benefits legacy: `gc-benefits` / `givecare/discovery-benefits`, on-demand/manual. Wiki refresh: `gc-wiki` / `givecare/refresh-wiki`, weekly. Intel refresh: `gc-intel` / `givecare/intel-refresh`, daily. Civic policy radar: `scty-civic` / `givecare/refresh-policy`, weekly. Weekly radar curation: `GiveCare root` / `givecare/radar-curation`, weekly. Gmail/newsletters/attachments: mailbox/router owner, event-driven. Manual web, X, YouTube/transcription: research operator, on-demand. Atelier entity discovery: Atelier, event-driven. Helm external ingestion: Helm, event-driven/mixed. Signal daily: `GiveCare root` / `givecare/signal-daily`, daily. Exact timer values remain canonical only in each lane automation contract, not this inventory or Hound. `gc-gtm`/CRM remains a consumer only. | Fixture: checked-in inventory manifest mirroring the table and lane automation contracts. Test/command: inventory completeness checker. Assert: every required lane has one explicit owner, one cadence category, one consumer/boundary, and one migration stage; timer truth is absent from Hound; `gc-gtm`/CRM is consumer-only; and the explicit out-of-scope list is absent from the inventory. Retain: inventory report, owner attestations, and timer-authority references. |
-| HSP-14 | Existing repo-local records are imported/mirrored without rewriting IDs or bytes; lineage and hashes survive; SQLite is disposable and rebuilds from journal/records; portability has no absolute-path dependency. | Fixture: legacy records with nontrivial bytes, IDs, lineage, and a copied store on a second path. Test/command: import, delete-index, rebuild-index, and portable restore test. Assert: byte-for-byte/hash-for-hash identity, unchanged IDs/lineage, rebuilt projection equality, and successful verification at the second path. Retain: before/after manifests, restore log, and projection diff. |
+| HSP-14 | Existing repo-local records are imported/mirrored through `import.record` without rewriting caller-supplied IDs or exact bytes; lineage and hashes survive; SQLite is disposable and rebuilds from journal/records; portability has no absolute-path dependency. | Fixture: legacy records with nontrivial bytes, IDs, lineage, and a copied store on a second path. Test/command: create-only `import.record`, delete-index, rebuild-index, and portable restore test. Assert: byte-for-byte/hash-for-hash identity, unchanged IDs/lineage, ID/byte conflicts reject without overwrite, rebuilt projection equality, and successful verification at the second path. Retain: before/after manifests, restore log, and projection diff. |
 | HSP-15 | Migration follows the exact staged order: freeze contracts; import/mirror; shadow Pulse and Benefits; cut over Pulse then Benefits; wiki/intel/Civic; radar/Gmail/manual web/X/YouTube; Atelier and Helm external reads; enable no-bypass; delete only after recovery drill and one full scheduled cycle per lane. | Fixture: stage ledger with one lane per gate and scheduled-cycle evidence. Test/command: migration-order checker. Assert: no stage can be skipped/reordered, no deletion occurs before both gates, and Signal daily uses the scheduled-cycle gate. Retain: signed stage ledger, recovery-drill report, and per-lane cycle receipts. |
 | HSP-16 | Pulse shadow parity requires the same query set/windows/caps, explained eligible lead differences, same capture lineage/evidence bundle, freshness/lane/quality gates, no-edition/recovery behavior, downstream input hash or adjudicated semantic equivalence, no publish during shadow, and cutover with provider credentials absent from Pulse. | Fixture: frozen Pulse shadow window with identical queries, caps, provider response variants, recovery, and publish sink. Test/command: Pulse parity comparator. Assert: every parity clause, explicit differences, equal/equivalent downstream input, zero publish, and credential-free cutover. Retain: parity report, evidence-bundle hashes, and no-publish audit. |
 | HSP-17 | Benefits shadow parity requires the same 8 rotating queries/as-of/budgets, known URL/title suppression/cap, candidate IDs/targets/classifications, finalizer and human proposal/apply boundary, explicit zero-leads degraded result, and cutover with provider credentials absent from Benefits. | Fixture: eight-query Benefits shadow window with duplicates, zero-lead, finalizer, proposal, and apply cases. Test/command: Benefits parity comparator and credential-unset cutover test. Assert: all query/budget/suppression/candidate/classification/degraded/approval clauses and no direct provider access. Retain: parity report, candidate manifest, degraded-result record, and approval-bound proposal. |
