@@ -17,6 +17,7 @@ from .access import (
     ProducerClaim,
     ProducerSelector,
     authorize_event_header,
+    resolve_commit_access,
     resolve_effective_access,
     resolve_scope,
 )
@@ -226,6 +227,7 @@ __all__ = [
     "parse_query_filter",
     "parse_query_request",
     "parse_utc_instant",
+    "resolve_commit_access",
     "resolve_effective_access",
     "resolve_scope",
     "validate_forbidden_fields",

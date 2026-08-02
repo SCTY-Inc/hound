@@ -377,6 +377,36 @@ def resolve_effective_access(
     return AccessRefusal()
 
 
+def resolve_commit_access(
+    rule: PolicyRule,
+    requested_access: object,
+) -> EffectiveAccess | AccessRefusal:
+    """Resolve durable output access without exceeding its disclosure ceiling."""
+
+    if type(rule) is not PolicyRule:
+        raise AccessPolicyError("commit access requires a policy rule")
+    if type(requested_access) is not str or requested_access not in ACCESS_TIERS:
+        return AccessRefusal()
+    allowed_output_tiers = rule.allowed_output_tiers
+    if type(allowed_output_tiers) is not frozenset:
+        return AccessRefusal()
+    sanitized_allowed_output_tiers = frozenset(
+        tier for tier in allowed_output_tiers if type(tier) is str and tier in ACCESS_TIERS
+    )
+    if len(sanitized_allowed_output_tiers) != len(allowed_output_tiers):
+        return AccessRefusal()
+    ceilings = {
+        "public": frozenset({"public"}),
+        "workspace": frozenset({"public", "workspace"}),
+        "restricted": frozenset({"public", "workspace", "restricted"}),
+    }
+    permitted = sanitized_allowed_output_tiers & ceilings[requested_access]
+    for tier in ("restricted", "workspace", "public"):
+        if tier in permitted:
+            return EffectiveAccess(tier, clamped=tier != requested_access)
+    return AccessRefusal()
+
+
 __all__ = [
     "ACCESS_TIERS",
     "AccessPolicyError",
@@ -390,6 +420,7 @@ __all__ = [
     "ProducerClaim",
     "ProducerSelector",
     "authorize_event_header",
+    "resolve_commit_access",
     "resolve_effective_access",
     "resolve_scope",
 ]

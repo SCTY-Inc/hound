@@ -16,6 +16,7 @@ from houndd.access import (
     ProducerClaim,
     ProducerSelector,
     authorize_event_header,
+    resolve_commit_access,
     resolve_effective_access,
     resolve_scope,
 )
@@ -225,6 +226,104 @@ def test_hsp09_effective_access_refuses_when_safe_restricted_output_is_not_allow
         code="access_not_permitted",
         message="requested access cannot be granted safely",
     )
+
+
+@pytest.mark.parametrize(
+    ("requested", "allowed", "expected", "clamped"),
+    [
+        ("public", frozenset({"public", "restricted"}), "public", False),
+        ("workspace", frozenset({"public", "restricted"}), "public", True),
+        ("workspace", frozenset({"workspace", "restricted"}), "workspace", False),
+        ("restricted", frozenset({"public", "workspace"}), "workspace", True),
+        ("restricted", frozenset({"public", "workspace", "restricted"}), "restricted", False),
+    ],
+)
+def test_hsp09_commit_access_intersects_requested_disclosure_ceiling(
+    requested: str,
+    allowed: frozenset[str],
+    expected: str,
+    clamped: bool,
+) -> None:
+    decision = resolve_commit_access(_rule(allowed_output_tiers=allowed), requested)
+    assert decision == EffectiveAccess(expected, clamped=clamped)
+
+
+def test_hsp09_commit_access_refuses_when_ceiling_intersection_is_empty() -> None:
+    assert resolve_commit_access(
+        _rule(allowed_output_tiers=frozenset({"workspace", "restricted"})),
+        "public",
+    ) == AccessRefusal()
+
+
+@pytest.mark.parametrize("requested", [None, "unknown", [], "public" + " "])
+def test_hsp09_commit_access_invalid_requested_access_fails_closed(requested: object) -> None:
+    decision = resolve_commit_access(
+        _rule(allowed_output_tiers=frozenset({"public", "workspace", "restricted"})),
+        requested,
+    )
+    assert decision == AccessRefusal()
+
+
+class SpoofTier(str):
+    def __new__(cls, actual_tier: str, forged_tier: str) -> "SpoofTier":
+        return str.__new__(cls, forged_tier)
+
+    def __hash__(self) -> int:
+        return hash("restricted")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "restricted" or str.__eq__(self, other)
+
+
+def test_hsp09_commit_access_rejects_hostile_scalar_and_rule_subclasses() -> None:
+    class HostileAccess(str):
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return hash("restricted")
+
+    class HostileRule(PolicyRule):
+        def __getattribute__(self, name: str) -> object:
+            if name == "allowed_output_tiers":
+                return frozenset({"public", "workspace", "restricted"})
+            return super().__getattribute__(name)
+
+    assert resolve_commit_access(
+        _rule(allowed_output_tiers=frozenset({"restricted"})),
+        HostileAccess("public"),
+    ) == AccessRefusal()
+    with pytest.raises(AccessPolicyError):
+        resolve_commit_access(
+            HostileRule(
+                subject="peer:1000",
+                claim_selector=ProducerSelector(owner_id="query-owner", capability="journal.query"),
+                policy_id="policy-a",
+                event_producer_selectors=(ProducerSelector(owner_id="event-owner", capability="capture"),),
+                readable_tiers=frozenset({"public"}),
+                allowed_output_tiers=frozenset({"public"}),
+            ),
+            "public",
+        )
+
+
+@pytest.mark.parametrize(
+    ("allowed_output_tiers", "requested_access"),
+    [
+        (frozenset({SpoofTier("workspace", "restricted")}), "restricted"),
+        (("public", "workspace"), "workspace"),
+        (frozenset({"public", "private"}), "public"),
+        (frozenset({"public", 1}), "public"),
+    ],
+)
+def test_hsp09_commit_access_rejects_non_exact_or_unsafe_allowed_output_tiers(
+    allowed_output_tiers: object,
+    requested_access: str,
+) -> None:
+    rule = _rule(allowed_output_tiers=frozenset({"public"}))
+    object.__setattr__(rule, "allowed_output_tiers", allowed_output_tiers)
+
+    assert resolve_commit_access(rule, requested_access) == AccessRefusal()
 
 
 def test_hsp09_validated_structures_reject_empty_and_wrong_typed_identity_values() -> None:
