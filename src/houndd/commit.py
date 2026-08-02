@@ -68,6 +68,15 @@ def _uint(value: Any, label: str, *, maximum: int | None = None) -> int:
     return value
 
 
+def _legacy_record_id(value: Any) -> str:
+    """Keep the legacy store's safe filename grammar at the public boundary."""
+
+    value = _str(value, "import.record.record_id")
+    if len(value) > 255 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in value):
+        raise CommitContractError("import.record.record_id is invalid")
+    return value
+
+
 def _strict(value: dict[str, Any], required: set[str], label: str, *, optional: set[str] = set()) -> None:
     keys = set(value)
     missing = required - keys
@@ -460,12 +469,14 @@ class CommitRequest:
                 raise CommitContractError("ingest.file media_type is unsupported")
         elif route.operation == "import.record":
             _strict(payload, {"record_id", "source"}, "import.record payload")
-            _str(payload["record_id"], "import.record.record_id")
+            _legacy_record_id(payload["record_id"])
         else:
             raise CommitContractError("operation is unavailable in Slice 3C1")
         source = SourceDeclaration.from_value(payload["source"])
         copied = dict(payload)
         copied["source"] = source
+        if route.operation == "import.record":
+            copied["record_id"] = _legacy_record_id(copied["record_id"])
         request = cls(request_id, key, producer, obj["requested_access"], policy_id, route.operation, copied, source)
         if len(canonical_bytes(request.to_wire_dict())) > MAX_WIRE_BODY_BYTES:
             raise CommitContractError("commit request body exceeds the encoded JSON limit")

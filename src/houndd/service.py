@@ -16,7 +16,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .access import AuthenticatedPrincipal, PolicyBundle, PolicyRule, ProducerClaim, ProducerSelector, resolve_scope
+from .access import AccessRefusal, AuthenticatedPrincipal, PolicyBundle, PolicyRule, ProducerClaim, ProducerSelector, resolve_commit_access, resolve_scope
+from .commit import CommitContractError, CommitRequest, SourceError, make_commit_response, normalize_source, parse_commit_request, resolve_route
+from .commit_runtime import CommitCollision, CommitIntegrityError, CommitRuntime, CommitRuntimeError, CommitUnavailable
+from .phi import PhiInputError, PhiManifestError, PhiScanner, phi_manifest_path
 from .contracts import canonical_bytes
 from .query_contracts import QueryContractError, parse_query_request
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
@@ -24,6 +27,8 @@ from .intake_projection import IntakeProjectionError, project_intake_ledger_page
 from .service_identity import ServiceIdentity, ServiceIdentityError
 from . import HounddStore
 from ._safety import AnchoredRoot
+from .journal import JournalError
+from .store import StoreError
 
 
 WIRE_VERSION = "houndd.uds.v1"
@@ -74,9 +79,10 @@ class FrameError(ServiceError):
     the wire contract without manufacturing an identifier from damaged bytes.
     """
 
-    def __init__(self, message: str, *, request_id: str | None = None) -> None:
+    def __init__(self, message: str, *, request_id: str | None = None, commit: bool = False) -> None:
         super().__init__(message)
         self.request_id = request_id
+        self.commit = commit
 
 
 class RequestError(ServiceError):
@@ -243,25 +249,27 @@ def _read_exact(connection: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def _recover_frame_request_id(raw: bytes) -> str | None:
-    """Extract precisely one body request ID without accepting the frame."""
+def _recover_frame_context(raw: bytes) -> tuple[str | None, bool]:
+    """Extract one body request ID and an exact POST hint without accepting."""
 
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=lambda pairs: pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite number")))
     except (UnicodeError, ValueError):
-        return None
+        return None, False
     if type(value) is not list:
-        return None
+        return None, False
+    methods = [item for key, item in value if type(key) is str and key == "method"]
+    is_commit = len(methods) == 1 and type(methods[0]) is str and methods[0] == "POST"
     bodies = [item for key, item in value if type(key) is str and key == "body"]
     if len(bodies) != 1 or type(bodies[0]) is not list:
-        return None
+        return None, is_commit
     ids = [item for key, item in bodies[0] if type(key) is str and key == "request_id"]
     if len(ids) != 1:
-        return None
+        return None, is_commit
     try:
-        return _text(ids[0], "request_id")
+        return _text(ids[0], "request_id"), is_commit
     except RequestError:
-        return None
+        return None, is_commit
 
 
 def read_frame(connection: socket.socket) -> dict[str, Any]:
@@ -270,17 +278,17 @@ def read_frame(connection: socket.socket) -> dict[str, Any]:
     if not 0 < size <= MAX_WIRE_FRAME_BYTES:
         raise FrameError("frame size is invalid")
     raw = _read_exact(connection, size)
-    request_id = _recover_frame_request_id(raw)
+    request_id, is_commit = _recover_frame_context(raw)
     if connection.recv(1):
-        raise FrameError("connection contains trailing or second frame bytes", request_id=request_id)
+        raise FrameError("connection contains trailing or second frame bytes", request_id=request_id, commit=is_commit)
     try:
         value = _canonical_load(raw, "wire frame", FrameError)
     except FrameError as error:
-        raise FrameError(str(error), request_id=request_id) from error
-    if set(value) != _FRAME_FIELDS or value.get("wire_version") != WIRE_VERSION or value.get("method") != "GET" or type(value.get("path")) is not str or type(value.get("body")) is not dict:
-        raise FrameError("wire frame fields are invalid", request_id=request_id)
+        raise FrameError(str(error), request_id=request_id, commit=is_commit) from error
+    if set(value) != _FRAME_FIELDS or value.get("wire_version") != WIRE_VERSION or value.get("method") not in {"GET", "POST"} or type(value.get("path")) is not str or type(value.get("body")) is not dict:
+        raise FrameError("wire frame fields are invalid", request_id=request_id, commit=is_commit)
     if len(canonical_bytes(value["body"])) > MAX_FRAME_BYTES:
-        raise FrameError("read envelope body exceeds 1048576 bytes", request_id=request_id)
+        raise FrameError("read envelope body exceeds 1048576 bytes", request_id=request_id, commit=is_commit)
     return value
 
 
@@ -374,6 +382,41 @@ def _generic_response(request_id: str, *, ready: bool) -> dict[str, Any]:
     return _response(request_id, 200 if ready else 503, outcome="completed" if ready else "unavailable", error=None if ready else ("service_unavailable", True, "service is not ready"))
 
 
+def _commit_response(
+    request_id: str,
+    status: int,
+    *,
+    ok: bool,
+    outcome: str,
+    record_ids: list[str] | None = None,
+    entry_ids: list[str] | None = None,
+    usage: dict[str, int] | None = None,
+    error_code: str | None = None,
+) -> EncodedResponse:
+    """Encode the strict Slice 3C1 response without borrowing read fields."""
+
+    error = None
+    if error_code is not None:
+        safe = {
+            "source_refused": {"code": "source_refused", "retryable": False, "message": "source refused"},
+            "invalid_request": {"code": "invalid_request", "retryable": False, "message": "invalid request"},
+            "request_conflict": {"code": "request_conflict", "retryable": False, "message": "request conflict"},
+            "unavailable": {"code": "unavailable", "retryable": True, "message": "service unavailable"},
+        }
+        error = safe[error_code]
+    body = make_commit_response(
+        request_id,
+        ok=ok,
+        outcome=outcome,
+        record_ids=[] if record_ids is None else record_ids,
+        entry_ids=[] if entry_ids is None else entry_ids,
+        usage={"requests": 0, "bytes": 0, "cost": 0} if usage is None else usage,
+        error=error,
+    )
+    value = {"wire_version": WIRE_VERSION, "status": status, "body": body}
+    return EncodedResponse(value, _encode_response(value))
+
+
 class HounddService:
     """Foreground-only local service; it owns no scheduler or request cache."""
 
@@ -388,6 +431,8 @@ class HounddService:
         self.store: HounddStore | None = None
         self.identity: ServiceIdentity | None = None
         self.policy: FrozenPolicy | None = None
+        self.phi_scanner: PhiScanner | None = None
+        self.commit_runtime: CommitRuntime | None = None
         self._socket_identity: tuple[int, int] | None = None
         self._runtime_root: AnchoredRoot | None = None
         try:
@@ -397,6 +442,18 @@ class HounddService:
                 raise ServiceError("startup recovery verification failed")
             self.policy = load_frozen_policy(self.state_root)
             self.identity = ServiceIdentity(self.state_root, create=True)
+            # Slice 3B reads remain available without a 3C1 scanner.  The
+            # scanner is nevertheless frozen at startup when provisioned, and
+            # commits fail unavailable rather than loading it lazily.
+            try:
+                self.phi_scanner = PhiScanner.from_path(phi_manifest_path(self.state_root))
+            except PhiManifestError:
+                self.phi_scanner = None
+            # Durable POST publication remains unavailable until the accepted
+            # startup-recovery contract can certify every crash state.  The
+            # strict parser/client/framing boundary is still active and fails
+            # closed with the commit response schema.
+            self.commit_runtime = None
             self._bind()
         except Exception:
             self.close()
@@ -467,6 +524,26 @@ class HounddService:
         from .access import EventSelector, PrincipalScope
         return PrincipalScope(principal, frozenset(tiers), tuple(EventSelector(selector.policy_id, selector.producer_selector, selector.readable_tiers & tiers) for selector in selectors))
 
+    def _commit_scope(self, principal: AuthenticatedPrincipal, request: CommitRequest):
+        """Select exactly one policy/rule and clamp output to its ceiling."""
+
+        assert self.policy is not None
+        claim = ProducerClaim(request.producer.owner_id, request.producer.capability, request.producer.run_id)
+        matches = tuple(
+            rule
+            for rule in self.policy.bundle.rules
+            if rule.subject == principal.subject and rule.claim_selector.matches(claim) and rule.policy_id == request.policy_id
+        )
+        if len(matches) != 1:
+            return None
+        access = resolve_commit_access(matches[0], request.requested_access)
+        if type(access) is AccessRefusal:
+            return None
+        # The read scope is used only to authorize the legacy lineage scan;
+        # source, record and transaction work occurs after this point.
+        scope = resolve_scope(PolicyBundle((matches[0],)), principal, claim)
+        return access.access, scope
+
     def _assert_socket_binding(self) -> None:
         listener = self._listener
         identity = self._socket_identity
@@ -484,7 +561,53 @@ class HounddService:
         ):
             raise ServiceError("service socket binding changed")
 
+    def _dispatch_commit(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch the two 3C1 routes after peer/policy authorization."""
+
+        request_id = _request_id(frame.get("body"))
+        if request_id is None:
+            raise RequestError("commit request ID is invalid")
+        try:
+            route = resolve_route(frame["method"], frame["path"], require_available=True)
+            request = parse_commit_request(frame["body"], route)
+            assert self.policy is not None
+            _assert_frozen(self.policy, self.state_root)
+            authorized = self._commit_scope(principal, request)
+            if authorized is None:
+                return _commit_response(request.request_id, 404, ok=False, outcome="invalid")
+            if self.phi_scanner is None or self.commit_runtime is None:
+                return _commit_response(request.request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
+            access, lineage_scope = authorized
+            replay = self.commit_runtime.probe(request, route, principal=principal.subject)
+            if replay.response_template is not None:
+                response = replay.response_template
+                return _commit_response(
+                    request.request_id,
+                    200,
+                    ok=response["ok"], outcome=response["outcome"], record_ids=response["record_ids"], entry_ids=response["entry_ids"], usage=response["usage"],
+                )
+            source = normalize_source(request.source.to_wire())
+            decision = self.phi_scanner.scan(source.data, "application/octet-stream", "identity", request.operation)
+            if decision != "clear":
+                return _commit_response(request.request_id, 400, ok=False, outcome="invalid", error_code="source_refused")
+            response = self.commit_runtime.execute(request, route, principal=principal.subject, access=access, source=source, scanner_clear=True, scope=lineage_scope)
+            return _commit_response(
+                request.request_id,
+                200,
+                ok=response["ok"], outcome=response["outcome"], record_ids=response["record_ids"], entry_ids=response["entry_ids"], usage=response["usage"],
+            )
+        except CommitCollision:
+            return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="request_conflict")
+        except (CommitContractError, SourceError, PhiInputError, ValueError):
+            return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
+        except (CommitIntegrityError, CommitUnavailable, CommitRuntimeError, PhiManifestError, StoreError, JournalError, OSError):
+            return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
+
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
+        if frame["method"] == "POST":
+            return self._dispatch_commit(principal, frame)
+        if frame["method"] != "GET":
+            raise RequestError("method is invalid")
         request = parse_read_request(frame["body"])
         path = frame["path"]
         if path not in {"/v1/journal", "/v1/health", "/v1/ready"}:
@@ -601,12 +724,20 @@ class HounddService:
                 except FrameError as error:
                     if error.request_id is None:
                         continue
-                    response = _response(error.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+                    response = (
+                        _commit_response(error.request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
+                        if error.commit
+                        else _response(error.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+                    )
                 except (RequestError, ValueError) as error:
                     request_id = _request_id(locals().get("frame", {}).get("body") if isinstance(locals().get("frame"), dict) else None)
                     if request_id is None:
                         continue
-                    response = _response(request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+                    response = (
+                        _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
+                        if isinstance(locals().get("frame"), dict) and locals()["frame"].get("method") == "POST"
+                        else _response(request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+                    )
                 except (ServiceError, OSError):
                     # A broken or idle peer is not a daemon failure.  The
                     # connection is already scoped by the context manager;
@@ -619,7 +750,12 @@ class HounddService:
                     request_id = _request_id(locals().get("frame", {}).get("body") if isinstance(locals().get("frame"), dict) else None)
                     if request_id is None:
                         continue
-                    connection.sendall(_response(request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable")).wire)
+                    fallback = (
+                        _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
+                        if isinstance(locals().get("frame"), dict) and locals()["frame"].get("method") == "POST"
+                        else _response(request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
+                    )
+                    connection.sendall(fallback.wire)
                 except OSError:
                     pass
 
@@ -651,6 +787,9 @@ class HounddService:
         identity, self.identity = self.identity, None
         if identity is not None:
             identity.close()
+        commit_runtime, self.commit_runtime = self.commit_runtime, None
+        if commit_runtime is not None:
+            commit_runtime.close()
         store, self.store = self.store, None
         if store is not None:
             store.close()

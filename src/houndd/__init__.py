@@ -134,6 +134,14 @@ from .phi import (
     phi_manifest_path,
     scan_phi,
 )
+from .commit_runtime import (
+    CommitCollision,
+    CommitIntegrityError,
+    CommitRuntime,
+    CommitRuntimeError,
+    CommitUnavailable,
+    ReplayProbe,
+)
 
 
 class HounddStore:
@@ -274,6 +282,12 @@ __all__ = [
     "validate_request",
     "validate_response",
     "verify_store",
+    "CommitCollision",
+    "CommitIntegrityError",
+    "CommitRuntime",
+    "CommitRuntimeError",
+    "CommitUnavailable",
+    "ReplayProbe",
     "AVAILABLE_ROUTE_BINDINGS",
     "COMMIT_REQUEST_SCHEMA",
     "COMMIT_RESPONSE_SCHEMA",
