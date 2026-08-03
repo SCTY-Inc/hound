@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evidence-hound"
-version = "0.4.0"
+version = "0.5.0"
 description = "Plan-bound capability execution for Git repositories."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,7 +39,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hound_cli", "src/hound_research", "src/hound_web_adapters", "src/houndd"]
+packages = ["src/hound_cli", "src/hound_client", "src/hound_research", "src/hound_web_adapters", "src/houndd"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --ignore=tests/test_slice3a_evidence.py"
