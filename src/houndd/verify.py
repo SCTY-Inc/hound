@@ -154,6 +154,7 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
 
             referenced_records: set[str] = set()
             referenced_blobs: set[str] = set()
+            outcome_event_counts: dict[str, int] = {}
             for event in events:
                 """Verify public 3C1 import truth without inventing a blob.
 
@@ -180,8 +181,21 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                     if not records.verify_record(record_id, artifact["hash"]):
                         failures.append(f"journal record hash mismatch: {record_id}")
                         continue
-                    if artifact.get("schema") == "houndd.import-outcome.v1":
-                        outcome = records.read_json(record_id)
+                    schema = artifact.get("schema")
+                    try:
+                        record = records.read_json(record_id)
+                    except StoreError:
+                        record = None
+                    if (
+                        type(record) is dict
+                        and record.get("schema_version") in {"houndd.import-outcome.v1", "houndd.file-record.v1"}
+                        and schema != record["schema_version"]
+                    ):
+                        raise ValueError("outcome record schema does not bind the journal event")
+                    if schema in {"houndd.import-outcome.v1", "houndd.file-record.v1"}:
+                        outcome_event_counts[record_id] = outcome_event_counts.get(record_id, 0) + 1
+                    if schema == "houndd.import-outcome.v1":
+                        outcome = record
                         if (
                             type(outcome) is not dict
                             or set(outcome) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "legacy", "lineage"}
@@ -200,15 +214,30 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                             type(legacy_id) is not str
                             or type(legacy_digest) is not str
                             or type(legacy_length) is not int
+                            or legacy_length < 0
+                            or len(legacy_digest) != 64
+                            or any(character not in "0123456789abcdef" for character in legacy_digest)
                             or legacy.get("media_type") != "application/octet-stream"
                             or legacy.get("encoding") != "identity"
-                            or event.get("source", {}).get("provider") != "legacy"
-                            or event.get("source", {}).get("native_id") != legacy_id
+                            or event.get("artifact") != {
+                                "kind": "import",
+                                "schema": "houndd.import-outcome.v1",
+                                "record_id": record_id,
+                                "hash": record_id,
+                                "authorized_uri": f"houndd://record/{record_id}",
+                            }
+                            or event.get("source") != {"provider": "legacy", "native_id": legacy_id, "canonical_url": "none"}
+                            or event.get("lineage") != outcome.get("lineage")
+                            or type(outcome.get("lineage")) is not dict
+                            or set(outcome["lineage"]) != {"relation", "record_id", "lead_id"}
+                            or any(type(item) is not str for item in outcome["lineage"].values())
+                            or event.get("usage") != {"requests": 0, "bytes": legacy_length, "cost": 0}
                         ):
                             raise ValueError("import outcome does not bind the journal event")
                         if outcome.get("outcome") == "completed":
                             if (
-                                event.get("classification") != {"outcome": "completed", "evidence_status": "clear"}
+                                outcome.get("evidence_status") != "clear"
+                                or event.get("classification") != {"outcome": "completed", "evidence_status": "clear"}
                                 or legacy_digest != digest
                                 or dedupe != {"object_key": f"legacy:{legacy_id}", "content_sha256": legacy_digest}
                             ):
@@ -223,24 +252,61 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                                 raise ValueError("legacy import bytes do not verify")
                         elif outcome.get("outcome") == "interrupted":
                             if (
-                                event.get("classification") != {"outcome": "interrupted", "evidence_status": "interrupted"}
+                                outcome.get("evidence_status") != "interrupted"
+                                or event.get("classification") != {"outcome": "interrupted", "evidence_status": "interrupted"}
                                 or dedupe != {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}
                             ):
                                 raise ValueError("interrupted import claims raw legacy truth")
                         else:
                             raise ValueError("import outcome is unsupported")
-                    elif artifact.get("schema") == "houndd.file-record.v1":
-                        file_outcome = records.read_json(record_id)
+                    elif schema == "houndd.file-record.v1":
+                        file_outcome = record
                         if (
                             type(file_outcome) is not dict
+                            or set(file_outcome) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "source", "lineage"}
                             or file_outcome.get("schema_version") != "houndd.file-record.v1"
                             or file_outcome.get("operation") != "ingest.file"
+                            or type(file_outcome.get("source")) is not dict
                         ):
                             raise ValueError("file outcome record is malformed")
+                        source = file_outcome["source"]
+                        source_digest = source.get("sha256")
+                        source_length = source.get("byte_length")
+                        if (
+                            set(source) != {"sha256", "byte_length", "media_type", "encoding"}
+                            or type(source_digest) is not str
+                            or len(source_digest) != 64
+                            or any(character not in "0123456789abcdef" for character in source_digest)
+                            or type(source_length) is not int
+                            or source_length < 0
+                            or source.get("media_type") != "application/octet-stream"
+                            or source.get("encoding") != "identity"
+                            or file_outcome.get("lineage") != {"relation": "none", "record_id": "none", "lead_id": "none"}
+                            or event.get("artifact") != {
+                                "kind": "file",
+                                "schema": "houndd.file-record.v1",
+                                "record_id": record_id,
+                                "hash": record_id,
+                                "authorized_uri": f"houndd://record/{record_id}",
+                            }
+                            or event.get("source") != {"provider": "local", "native_id": source_digest, "canonical_url": "none"}
+                            or event.get("lineage") != file_outcome["lineage"]
+                            or event.get("classification") != {"outcome": file_outcome.get("outcome"), "evidence_status": file_outcome.get("evidence_status")}
+                            or dedupe != {"object_key": f"file:{source_digest}", "content_sha256": source_digest}
+                            or event.get("usage") != {"requests": 0, "bytes": source_length, "cost": 0}
+                        ):
+                            raise ValueError("file outcome does not bind the journal event")
                         if file_outcome.get("outcome") == "completed":
-                            referenced_blobs.add(digest)
-                            records.blobs.get(digest)
-                        elif file_outcome.get("outcome") != "interrupted":
+                            if file_outcome.get("evidence_status") != "clear":
+                                raise ValueError("completed file outcome evidence is invalid")
+                            blob = records.blobs.get(source_digest)
+                            if len(blob) != source_length:
+                                raise ValueError("file outcome blob length does not bind its source")
+                            referenced_blobs.add(source_digest)
+                        elif file_outcome.get("outcome") == "interrupted":
+                            if file_outcome.get("evidence_status") != "interrupted":
+                                raise ValueError("interrupted file outcome evidence is invalid")
+                        else:
                             raise ValueError("file outcome is unsupported")
                     else:
                         referenced_blobs.add(digest)
@@ -249,6 +315,10 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                             failures.append(f"invalid blob length: {digest}")
                 except Exception as error:
                     failures.append(f"journal artifact verification {event.get('entry_id', '<unknown>')}: {error}")
+
+            for record_id, count in outcome_event_counts.items():
+                if count != 1:
+                    failures.append(f"Slice 3C1 outcome event cardinality is invalid: {record_id}")
 
             for record_id in sorted(set(record_ids) - referenced_records):
                 failures.append(f"orphan record: {record_id}")

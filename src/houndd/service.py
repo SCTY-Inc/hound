@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .access import AccessRefusal, AuthenticatedPrincipal, PolicyBundle, PolicyRule, ProducerClaim, ProducerSelector, resolve_commit_access, resolve_scope
+from .access import AccessRefusal, AuthenticatedPrincipal, EventSelector, PolicyBundle, PolicyRule, PrincipalScope, ProducerClaim, ProducerSelector, resolve_commit_access, resolve_scope
 from .commit import CommitContractError, CommitRequest, SourceError, make_commit_response, normalize_source, parse_commit_request, resolve_route
 from .commit_runtime import CommitCollision, CommitIntegrityError, CommitRuntime, CommitRuntimeError, CommitUnavailable
 from .phi import PhiInputError, PhiManifestError, PhiScanner, phi_manifest_path
@@ -522,6 +522,17 @@ class HounddService:
             listener.close()
             raise
 
+    @staticmethod
+    def _clamp_scope(principal: AuthenticatedPrincipal, scope: PrincipalScope, tiers: frozenset[str]) -> PrincipalScope:
+        """Intersect a resolved scope's readable tiers with a disclosure ceiling."""
+
+        selectors = tuple(
+            EventSelector(selector.policy_id, selector.producer_selector, selector.readable_tiers & tiers)
+            for selector in scope.permitted_event_selectors
+            if selector.readable_tiers & tiers
+        )
+        return PrincipalScope(principal, frozenset(tiers), selectors)
+
     def _scope(self, principal: AuthenticatedPrincipal, request: ReadRequest):
         assert self.policy is not None
         matches = tuple(rule for rule in self.policy.bundle.rules if rule.subject == principal.subject and rule.claim_selector.matches(request.claim) and rule.policy_id == request.policy_id)
@@ -534,14 +545,13 @@ class HounddService:
         tiers = scope.readable_tiers & _ACCESS_CEILINGS[request.requested_access]
         if not tiers:
             return None
-        selectors = tuple(selector for selector in scope.permitted_event_selectors if selector.readable_tiers & tiers)
-        if not selectors:
+        clamped = self._clamp_scope(principal, scope, tiers)
+        if not clamped.permitted_event_selectors:
             return None
-        from .access import EventSelector, PrincipalScope
-        return PrincipalScope(principal, frozenset(tiers), tuple(EventSelector(selector.policy_id, selector.producer_selector, selector.readable_tiers & tiers) for selector in selectors))
+        return clamped
 
     def _commit_scope(self, principal: AuthenticatedPrincipal, request: CommitRequest):
-        """Select exactly one policy/rule and clamp output to its ceiling."""
+        """Select exactly one policy/rule and clamp output and lineage scope to its ceiling."""
 
         assert self.policy is not None
         claim = ProducerClaim(request.producer.owner_id, request.producer.capability, request.producer.run_id)
@@ -556,9 +566,14 @@ class HounddService:
         if type(access) is AccessRefusal:
             return None
         # The read scope is used only to authorize the legacy lineage scan;
-        # source, record and transaction work occurs after this point.
+        # source, record and transaction work occurs after this point. An
+        # empty clamped scope is a legitimate "selects nothing" lineage scan,
+        # not an authorization denial, so it is never collapsed to None here.
         scope = resolve_scope(PolicyBundle((matches[0],)), principal, claim)
-        return access.access, scope
+        if scope is None:
+            return None
+        tiers = scope.readable_tiers & _ACCESS_CEILINGS[request.requested_access]
+        return access.access, self._clamp_scope(principal, scope, tiers)
 
     def _assert_socket_binding(self) -> None:
         listener = self._listener
@@ -577,19 +592,25 @@ class HounddService:
         ):
             raise ServiceError("service socket binding changed")
 
-    def _assert_frozen_phi(self) -> None:
-        """Reject any manifest replacement before caller source normalization."""
+    def _frozen_phi_snapshot(self) -> PhiScanner:
+        """Load one bounded manifest snapshot that still matches startup truth."""
 
         scanner = self.phi_scanner
         fingerprint = self._phi_fingerprint
         if scanner is None or fingerprint is None:
             raise PhiManifestError("clear manifest is unavailable")
         path = phi_manifest_path(self.state_root)
-        if _phi_fingerprint(path) != fingerprint:
+        before = _phi_fingerprint(path)
+        if before != fingerprint:
             raise PhiManifestError("clear manifest changed after service startup")
         current = PhiScanner.from_path(path)
-        if current.manifest_entries != scanner.manifest_entries or _phi_fingerprint(path) != fingerprint:
+        after = _phi_fingerprint(path)
+        if before != after or current.manifest_entries != scanner.manifest_entries:
             raise PhiManifestError("clear manifest changed after service startup")
+        return current
+
+    def _assert_frozen_phi(self) -> None:
+        self._frozen_phi_snapshot()
 
     def _dispatch_commit(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the two 3C1 routes after peer/policy authorization."""
@@ -607,9 +628,8 @@ class HounddService:
             authorized = self._commit_scope(principal, request)
             if authorized is None:
                 return _commit_response(request.request_id, 404, ok=False, outcome="invalid")
-            if self.phi_scanner is None or self.commit_runtime is None:
+            if self.commit_runtime is None:
                 return _commit_response(request.request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
-            self._assert_frozen_phi()
             access, lineage_scope = authorized
             replay = self.commit_runtime.probe(request, route, principal=principal.subject)
             if replay.response_template is not None:
@@ -619,11 +639,25 @@ class HounddService:
                     200,
                     ok=response["ok"], outcome=response["outcome"], record_ids=response["record_ids"], entry_ids=response["entry_ids"], usage=response["usage"],
                 )
+            scanner = self._frozen_phi_snapshot()
             source = normalize_source(request.source.to_wire())
-            decision = self.phi_scanner.scan(source.data, "application/octet-stream", "identity", request.operation)
+            decision = scanner.scan(source.data, "application/octet-stream", "identity", request.operation)
             if decision != "clear":
                 return _commit_response(request.request_id, 400, ok=False, outcome="invalid", error_code="source_refused")
-            response = self.commit_runtime.execute(request, route, principal=principal.subject, access=access, source=source, scanner_clear=True, scope=lineage_scope)
+            # Re-read the frozen leaf after source normalization and scanning,
+            # then once more inside the commit lock immediately before durable
+            # reservation.  A replacement is unavailable, never acceptance.
+            self._assert_frozen_phi()
+            response = self.commit_runtime.execute(
+                request,
+                route,
+                principal=principal.subject,
+                access=access,
+                source=source,
+                scanner_clear=True,
+                scope=lineage_scope,
+                pre_accept=self._assert_frozen_phi,
+            )
             return _commit_response(
                 request.request_id,
                 200,
@@ -631,7 +665,7 @@ class HounddService:
             )
         except CommitCollision:
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="request_conflict")
-        except PhiManifestError:
+        except (PolicyError, PhiManifestError):
             return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
         except (CommitContractError, SourceError, PhiInputError, ValueError):
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
@@ -672,7 +706,9 @@ class HounddService:
             if query_request.filter.access is not None and not set(query_request.filter.access) <= scope.readable_tiers:
                 return _response(request.request_id, 404, outcome="not_found")
             adapter = DurableJournalQueryAdapter(self.store.journal, self.identity)
-        except (QueryContractError, QueryFilterNotAvailable, ValueError):
+        except QueryFilterNotAvailable:
+            return _response(request.request_id, 400, outcome="invalid", error=("filter_not_available", False, "filter is not available"))
+        except (QueryContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
         except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
             return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
@@ -713,7 +749,9 @@ class HounddService:
 
                 ledger = adapter.execute_ledger_bounded(query_request, scope, ledger_fits)
                 page = None if ledger is None else ledger[0]
-        except (QueryContractError, QueryFilterNotAvailable, ValueError):
+        except QueryFilterNotAvailable:
+            return _response(request.request_id, 400, outcome="invalid", error=("filter_not_available", False, "filter is not available"))
+        except (QueryContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
         except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
             return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
@@ -726,8 +764,8 @@ class HounddService:
         if not hasattr(socket, "SO_PEERCRED"):
             raise ServiceError("SO_PEERCRED is unavailable")
         try:
-            raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-            _pid, uid, _gid = struct.unpack("3i", raw)
+            raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"))
+            _pid, uid, _gid = struct.unpack("iII", raw)
         except OSError as error:
             raise ServiceError("cannot certify Unix peer credentials") from error
         return AuthenticatedPrincipal(f"linux-uid:{uid}")

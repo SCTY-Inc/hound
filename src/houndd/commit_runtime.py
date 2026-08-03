@@ -222,12 +222,14 @@ class CommitRuntime:
         reservation_exists = self.anchor.exists("commit3c1", "reservations", reservation_name)
         if reservation_exists:
             reservation = self._load("commit3c1", "reservations", reservation_name, fields=_RESERVATION_FIELDS, label="commit reservation")
+            stored_attempt_id = _sha(reservation.get("attempt_id"), "reservation attempt_id")
+            stored_open_name = f"{stored_attempt_id}.json"
+            if not self.anchor.exists("commit3c1", "open", stored_open_name):
+                raise CommitIntegrityError("reservation counterpart is missing")
+            marker = self._load("commit3c1", "open", stored_open_name, fields=_OPEN_FIELDS, label="commit open marker")
+            self._validate_pair_values(reservation_name, reservation, stored_open_name, marker)
             if reservation.get("request_hash") != request_hash or reservation.get("canonical_request") != canonical:
                 raise CommitCollision("idempotency key is bound to another request")
-            if not self.anchor.exists("commit3c1", "open", open_name):
-                raise CommitIntegrityError("reservation counterpart is missing")
-            marker = self._load("commit3c1", "open", open_name, fields=_OPEN_FIELDS, label="commit open marker")
-            self._validate_pair_values(reservation_name, reservation, open_name, marker)
             if reservation.get("scope_id") != scope_id or reservation.get("principal") != principal or reservation.get("capability") != capability or reservation.get("idempotency_key") != request.idempotency_key or reservation.get("attempt_id") != attempt_id:
                 raise CommitIntegrityError("reservation identity is invalid")
             return reservation, marker
@@ -248,6 +250,26 @@ class CommitRuntime:
             response.pop("schema_version", None)
             response.pop("request_id", None)
             return ReplayProbe(response)
+
+    @staticmethod
+    def _pair_phase(reservation: dict[str, Any], marker: dict[str, Any]) -> str:
+        """Accept only the two ordered, crash-recoverable metadata writes."""
+
+        transition = (reservation.get("status"), marker.get("status"))
+        phases = {
+            ("open", "open"): "open",
+            # Marker first makes the outcome/event plan durable before the
+            # reservation exposes it as prepared.
+            ("open", "prepared"): "preparing",
+            ("prepared", "prepared"): "prepared",
+            # The event is durable before the marker declares it final.
+            ("prepared", "complete"): "finalizing",
+            ("complete", "complete"): "complete",
+        }
+        try:
+            return phases[transition]
+        except KeyError as error:
+            raise CommitIntegrityError("reservation/open status transition is invalid") from error
 
     def _validate_pair_values(self, reservation_name: str, reservation: dict[str, Any], open_name: str, marker: dict[str, Any]) -> None:
         """Validate both metadata members and every shared identity symmetrically."""
@@ -355,7 +377,7 @@ class CommitRuntime:
             or marker.get("policy_id") != canonical.get("policy_id")
             or type(marker.get("access")) is not str
             or marker.get("access") not in {"public", "workspace", "restricted"}
-            or marker.get("status") != status
+            or marker.get("status") not in {"open", "prepared", "complete"}
             or type(source) is not dict
             or set(source) != {"sha256", "byte_length"}
             or _sha(source.get("sha256"), "open source sha256") != source.get("sha256")
@@ -396,7 +418,327 @@ class CommitRuntime:
             or (envelope["dedupe"] != expected_dedupe if expected_dedupe is not None else envelope["dedupe"]["content_sha256"] != source["sha256"])
         ):
             raise CommitIntegrityError("open marker journal binding disagrees")
-        self._template(reservation.get("response"))
+        phase = self._pair_phase(reservation, marker)
+        expected = self._plan_template(marker)
+        stored = self._template(reservation.get("response"))
+        # During the first write of open -> prepared recovery the reservation
+        # still contains its obsolete completed template.  It is not trusted,
+        # returned, or used for publication; recovery replaces it from the
+        # marker's already-persisted plan.  Every other state binds both files.
+        if phase != "preparing" and stored != self._template(expected):
+            raise CommitIntegrityError("reservation response does not bind the outcome plan")
+
+    def _plan_template(self, marker: dict[str, Any]) -> dict[str, Any]:
+        """Validate one private outcome/event plan and derive its response."""
+
+        operation = marker.get("operation")
+        source = marker.get("source")
+        lineage = marker.get("lineage")
+        body = marker.get("record_body")
+        envelope = marker.get("envelope")
+        record_id = _sha(marker.get("record_id"), "planned record_id")
+        if type(source) is not dict or type(lineage) is not dict or type(body) is not dict or type(envelope) is not dict:
+            raise CommitIntegrityError("outcome plan is malformed")
+        source_record = {
+            "sha256": source.get("sha256"),
+            "byte_length": source.get("byte_length"),
+            "media_type": "application/octet-stream",
+            "encoding": "identity",
+        }
+        if type(source_record["byte_length"]) is not int or source_record["byte_length"] < 0:
+            raise CommitIntegrityError("outcome plan source is malformed")
+        outcome = body.get("outcome")
+        if outcome not in {"completed", "interrupted"}:
+            raise CommitIntegrityError("outcome plan is unsupported")
+        evidence_status = "clear" if outcome == "completed" else "interrupted"
+        expected_common = {
+            "attempt_id": marker.get("attempt_id"),
+            "request_hash": marker.get("request_hash"),
+            "operation": operation,
+            "outcome": outcome,
+            "evidence_status": evidence_status,
+            "lineage": lineage,
+        }
+        if operation == "ingest.file":
+            if (
+                set(body) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "source", "lineage"}
+                or body.get("schema_version") != "houndd.file-record.v1"
+                or {key: body.get(key) for key in expected_common} != expected_common
+                or body.get("source") != source_record
+            ):
+                raise CommitIntegrityError("file outcome plan is malformed")
+            artifact = {
+                "kind": "file",
+                "schema": "houndd.file-record.v1",
+                "record_id": record_id,
+                "hash": record_id,
+                "authorized_uri": f"houndd://record/{record_id}",
+            }
+            event_source = {"provider": "local", "native_id": source_record["sha256"], "canonical_url": "none"}
+            dedupe = {"object_key": f"file:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
+            record_ids = [record_id]
+        elif operation == "import.record":
+            legacy = body.get("legacy")
+            if (
+                set(body) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "legacy", "lineage"}
+                or body.get("schema_version") != "houndd.import-outcome.v1"
+                or {key: body.get(key) for key in expected_common} != expected_common
+                or type(legacy) is not dict
+                or set(legacy) != {"record_id", "sha256", "byte_length", "media_type", "encoding"}
+                or _legacy_id(legacy.get("record_id"), "planned legacy record_id") != legacy.get("record_id")
+                or legacy.get("record_id") != marker["canonical_request"]["operation"]["payload"].get("record_id")
+                or legacy != {"record_id": legacy.get("record_id"), **source_record}
+            ):
+                raise CommitIntegrityError("import outcome plan is malformed")
+            artifact = {
+                "kind": "import",
+                "schema": "houndd.import-outcome.v1",
+                "record_id": record_id,
+                "hash": record_id,
+                "authorized_uri": f"houndd://record/{record_id}",
+            }
+            event_source = {"provider": "legacy", "native_id": legacy["record_id"], "canonical_url": "none"}
+            dedupe = (
+                {"object_key": f"legacy:{legacy['record_id']}", "content_sha256": source_record["sha256"]}
+                if outcome == "completed"
+                else {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}
+            )
+            record_ids = [legacy["record_id"], record_id] if outcome == "completed" else [record_id]
+        else:
+            raise CommitIntegrityError("outcome plan operation is invalid")
+        if (
+            canonical_hash(body) != record_id
+            or envelope.get("artifact") != artifact
+            or envelope.get("source") != event_source
+            or envelope.get("classification") != {"outcome": outcome, "evidence_status": evidence_status}
+            or envelope.get("lineage") != lineage
+            or envelope.get("dedupe") != dedupe
+            or envelope.get("usage") != {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}
+        ):
+            raise CommitIntegrityError("outcome plan does not bind its public event")
+        template = {
+            "ok": outcome == "completed",
+            "outcome": outcome,
+            "record_ids": record_ids,
+            "entry_ids": [envelope.get("entry_id")],
+            "usage": {"requests": 0, "bytes": source_record["byte_length"], "cost": 0},
+        }
+        self._template(template)
+        return template
+
+    def _source_is_published(self, marker: dict[str, Any]) -> bool:
+        """Verify the exact source object for a completed plan, without I/O guesses."""
+
+        assert self.records is not None
+        body = marker["record_body"]
+        source = marker["source"]
+        if body["outcome"] != "completed":
+            return False
+        if marker["operation"] == "ingest.file":
+            digest = source["sha256"]
+            try:
+                data = self.records.blobs.get(digest)
+            except StoreError as error:
+                if self.records.anchor.exists("blobs", digest):
+                    raise CommitIntegrityError("completed source blob is unsafe") from error
+                return False
+            if len(data) != source["byte_length"]:
+                raise CommitIntegrityError("completed source blob length changed")
+            return True
+        legacy = body["legacy"]
+        legacy_id = legacy["record_id"]
+        with self.records.anchor.operation():
+            has_raw = self.records.anchor.exists("records", f"{legacy_id}.bin")
+            has_manifest = self.records.anchor.exists("legacy", f"{legacy_id}.json")
+        if has_raw != has_manifest:
+            raise CommitIntegrityError("completed legacy import state is partial")
+        if not has_raw:
+            return False
+        self._verify_legacy_binding(legacy_id, source["sha256"], source["byte_length"])
+        return True
+
+    def _ensure_plan_record(self, marker: dict[str, Any]) -> None:
+        """Create or confirm the one immutable outcome record named by the plan."""
+
+        assert self.records is not None
+        body = marker["record_body"]
+        record_id = marker["record_id"]
+        try:
+            result = self.records.put_json(body)
+        except StoreError as error:
+            raise CommitIntegrityError("planned outcome record cannot be persisted") from error
+        if result.record_id != record_id or result.content_sha256 != record_id:
+            raise CommitIntegrityError("planned outcome record identity disagrees")
+
+    def _verify_published_plan(self, marker: dict[str, Any]) -> None:
+        """Require the full public record/source truth before an event append."""
+
+        assert self.records is not None
+        self._plan_template(marker)
+        record_id = marker["record_id"]
+        if not self.records.verify_record(record_id, record_id) or self.records.read_json(record_id) != marker["record_body"]:
+            raise CommitIntegrityError("planned outcome record is missing or changed")
+        if marker["record_body"]["outcome"] == "completed" and not self._source_is_published(marker):
+            raise CommitIntegrityError("completed source object is missing")
+
+    def _prepare_pair(
+        self,
+        reservation: dict[str, Any],
+        reservation_name: str,
+        marker: dict[str, Any],
+        open_name: str,
+    ) -> None:
+        """Persist the marker plan first, then bind the prepared response."""
+
+        template = self._plan_template(marker)
+        marker["status"] = "prepared"
+        self._write("commit3c1", "open", open_name, value=marker)
+        reservation["response"] = template
+        reservation["status"] = "prepared"
+        self._write("commit3c1", "reservations", reservation_name, value=reservation)
+
+    def _resequence_pair(
+        self,
+        reservation: dict[str, Any],
+        reservation_name: str,
+        marker: dict[str, Any],
+        open_name: str,
+    ) -> None:
+        """Re-place a still-unappended planned event the journal outgrew."""
+
+        assert self.journal is not None
+        envelope = marker["envelope"]
+        if self.journal.get(envelope["entry_id"]) is not None or envelope["sequence"] == self.journal.high_watermark() + 1:
+            return
+        # Only the event's journal position is renewed; its record, artifact,
+        # lineage, and dedupe bindings are the same durable plan.  Demoting the
+        # reservation first keeps the intermediate one-file states inside the
+        # tolerated preparing phase, so a crash here still recovers once.
+        reservation["status"] = "open"
+        self._write("commit3c1", "reservations", reservation_name, value=reservation)
+        marker["envelope"] = make_journal_envelope(
+            sequence=self.journal.high_watermark() + 1,
+            appended_at=_now(),
+            producer=envelope["producer"],
+            artifact=envelope["artifact"],
+            lineage=envelope["lineage"],
+            source=envelope["source"],
+            classification=envelope["classification"],
+            access=envelope["access"],
+            policy_id=envelope["policy_id"],
+            dedupe=envelope["dedupe"],
+            usage=envelope["usage"],
+        )
+        self._prepare_pair(reservation, reservation_name, marker, open_name)
+
+    def _append_prepared_event(self, marker: dict[str, Any]) -> None:
+        """Append the one persisted event plan, or prove its exact prior append."""
+
+        assert self.journal is not None
+        self._verify_published_plan(marker)
+        envelope = marker["envelope"]
+        entry_id = envelope["entry_id"]
+        event = self.journal.get(entry_id)
+        if event is None:
+            try:
+                self.journal.append(envelope)
+            except JournalError as error:
+                raise CommitIntegrityError("prepared event cannot be recovered") from error
+        elif event != envelope:
+            raise CommitIntegrityError("journal event disagrees with prepared commit")
+
+    def _complete_pair(
+        self,
+        reservation: dict[str, Any],
+        reservation_name: str,
+        marker: dict[str, Any],
+        open_name: str,
+    ) -> None:
+        """Finalize only after the exact public outcome/event pair exists."""
+
+        assert self.journal is not None
+        self._verify_published_plan(marker)
+        if self.journal.get(marker["envelope"]["entry_id"]) != marker["envelope"]:
+            raise CommitIntegrityError("planned journal event is missing or changed")
+        marker["status"] = "complete"
+        self._write("commit3c1", "open", open_name, value=marker)
+        reservation["response"] = self._plan_template(marker)
+        reservation["status"] = "complete"
+        self._write("commit3c1", "reservations", reservation_name, value=reservation)
+
+    def _interrupted_plan(self, marker: dict[str, Any]) -> None:
+        """Replace an open/no-stage plan with one persisted interrupted plan."""
+
+        assert self.records is not None and self.journal is not None
+        self._plan_template(marker)
+        source = marker["source"]
+        source_record = {
+            "sha256": source["sha256"],
+            "byte_length": source["byte_length"],
+            "media_type": "application/octet-stream",
+            "encoding": "identity",
+        }
+        operation = marker["operation"]
+        if operation == "ingest.file":
+            body = {
+                "schema_version": "houndd.file-record.v1",
+                "attempt_id": marker["attempt_id"],
+                "request_hash": marker["request_hash"],
+                "operation": operation,
+                "outcome": "interrupted",
+                "evidence_status": "interrupted",
+                "source": source_record,
+                "lineage": marker["lineage"],
+            }
+            artifact_kind = "file"
+            schema = "houndd.file-record.v1"
+            native_id = source_record["sha256"]
+            dedupe = {"object_key": f"file:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
+        elif operation == "import.record":
+            legacy_id = marker["canonical_request"]["operation"]["payload"]["record_id"]
+            if _legacy_id(legacy_id, "open import legacy record_id") != legacy_id:
+                raise CommitIntegrityError("open import recovery metadata is malformed")
+            body = {
+                "schema_version": "houndd.import-outcome.v1",
+                "attempt_id": marker["attempt_id"],
+                "request_hash": marker["request_hash"],
+                "operation": operation,
+                "outcome": "interrupted",
+                "evidence_status": "interrupted",
+                "legacy": {"record_id": legacy_id, **source_record},
+                "lineage": marker["lineage"],
+            }
+            artifact_kind = "import"
+            schema = "houndd.import-outcome.v1"
+            native_id = legacy_id
+            dedupe = None
+        else:  # pragma: no cover - fixed bindings are exhaustive
+            raise CommitIntegrityError("open commit operation is malformed")
+        try:
+            result = self.records.put_json(body)
+        except StoreError as error:
+            raise CommitIntegrityError("interrupted outcome cannot be recorded") from error
+        if result.record_id != canonical_hash(body) or result.content_sha256 != result.record_id:
+            raise CommitIntegrityError("interrupted outcome identity disagrees")
+        if dedupe is None:
+            dedupe = {"object_key": f"import-outcome:{result.record_id}", "content_sha256": result.record_id}
+        envelope = make_journal_envelope(
+            sequence=self.journal.high_watermark() + 1,
+            appended_at=_now(),
+            producer=marker["producer"],
+            artifact={"kind": artifact_kind, "schema": schema, "record_id": result.record_id, "hash": result.record_id, "authorized_uri": f"houndd://record/{result.record_id}"},
+            lineage=marker["lineage"],
+            source={"provider": "local" if operation == "ingest.file" else "legacy", "native_id": native_id, "canonical_url": "none"},
+            classification={"outcome": "interrupted", "evidence_status": "interrupted"},
+            access=marker["access"],
+            policy_id=marker["policy_id"],
+            dedupe=dedupe,
+            usage={"requests": 0, "bytes": source_record["byte_length"], "cost": 0},
+        )
+        marker["record_id"] = result.record_id
+        marker["record_body"] = body
+        marker["envelope"] = envelope
+        self._plan_template(marker)
 
     def _validate_inventory(self) -> list[tuple[str, dict[str, Any], str, dict[str, Any]]]:
         """Validate the private namespace as a strict one-to-one pair set.
@@ -437,7 +779,7 @@ class CommitRuntime:
             self._validate_pair_values(f"{scope_id}.json", reservation, f"{attempt_id}.json", marker)
             if marker_scope != scope_id:
                 raise CommitIntegrityError("reservation/open pair disagrees")
-            if reservation["status"] == "complete":
+            if self._pair_phase(reservation, marker) == "complete":
                 self._completed_binding(reservation, marker)
             pairs.append((scope_id, reservation, attempt_id, marker))
         if len(opens) != len(pairs):
@@ -453,7 +795,9 @@ class CommitRuntime:
         assert type(legacy_id) is str
         matches: list[dict[str, str]] = []
         for event in journal.entries():
-            if scope is not None and not authorize_event_header(scope, event):
+            # Only an authorized existing event may be selected, so an absent
+            # scope authorizes none of them and can reach only no-lineage.
+            if scope is None or not authorize_event_header(scope, event):
                 continue
             source = event.get("source")
             if type(source) is dict and source.get("provider") == "legacy" and source.get("native_id") == legacy_id:
@@ -550,60 +894,30 @@ class CommitRuntime:
     def _completed_binding(self, reservation: dict[str, Any], marker: dict[str, Any]) -> dict[str, Any]:
         """Re-derive a replay only from verified durable public truth."""
         assert self.records is not None and self.journal is not None
-        if reservation.get("status") != "complete" or marker.get("status") != "complete":
+        if self._pair_phase(reservation, marker) != "complete":
             raise CommitIntegrityError("completed commit is not complete")
         response = self._template(reservation.get("response"))
-        record_id = _sha(marker.get("record_id"), "completed record_id")
-        body = marker.get("record_body")
-        envelope = marker.get("envelope")
-        if type(body) is not dict or canonical_hash(body) != record_id or type(envelope) is not dict:
-            raise CommitIntegrityError("completed marker identity is malformed")
-        if not self.records.verify_record(record_id, record_id) or self.records.read_json(record_id) != body:
-            raise CommitIntegrityError("completed outcome record changed")
-        entry_id = envelope.get("entry_id")
-        if type(entry_id) is not str or self.journal.get(entry_id) != envelope:
-            raise CommitIntegrityError("completed journal event changed")
-        source = marker.get("source")
-        if type(source) is not dict:
-            raise CommitIntegrityError("completed event/source binding disagrees")
-        operation = marker.get("operation")
-        if (
-            response["outcome"] != body.get("outcome")
-            or envelope.get("classification") != {"outcome": body.get("outcome"), "evidence_status": body.get("evidence_status")}
-            or envelope.get("lineage") != body.get("lineage")
-        ):
-            raise CommitIntegrityError("completed outcome graph disagrees")
-        expected_records = [record_id]
-        if operation == "import.record":
-            legacy = body.get("legacy")
-            if (
-                type(legacy) is not dict
-                or set(legacy) != {"record_id", "sha256", "byte_length", "media_type", "encoding"}
-                or type(legacy.get("record_id")) is not str
-                or legacy.get("sha256") != source.get("sha256")
-                or legacy.get("byte_length") != source.get("byte_length")
-            ):
-                raise CommitIntegrityError("completed legacy import changed")
-            if body.get("outcome") == "completed":
-                if envelope.get("dedupe") != {"object_key": f"legacy:{legacy['record_id']}", "content_sha256": source["sha256"]}:
-                    raise CommitIntegrityError("completed event/source binding disagrees")
-                self._verify_legacy_binding(legacy["record_id"], legacy["sha256"], legacy["byte_length"])
-                expected_records = [legacy["record_id"], record_id]
-            elif body.get("outcome") == "interrupted":
-                # Open/no-stage recovery has only declared attempt metadata.
-                # It must never turn that metadata into a raw legacy-object
-                # lookup, claim, or dedupe identity.
-                if envelope.get("dedupe") != {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}:
-                    raise CommitIntegrityError("interrupted import dedupe binding disagrees")
-            else:
-                raise CommitIntegrityError("completed import outcome is invalid")
-        elif envelope.get("dedupe", {}).get("content_sha256") != source.get("sha256"):
-            raise CommitIntegrityError("completed event/source binding disagrees")
-        if response["outcome"] not in {"completed", "interrupted"} or response["record_ids"] != expected_records or response["entry_ids"] != [entry_id]:
+        expected = self._plan_template(marker)
+        if response != self._template(expected):
             raise CommitIntegrityError("completed response does not bind durable truth")
+        self._verify_published_plan(marker)
+        envelope = marker["envelope"]
+        if self.journal.get(envelope["entry_id"]) != envelope:
+            raise CommitIntegrityError("completed journal event changed")
         return response
 
-    def execute(self, request: CommitRequest, route: RouteBinding, *, principal: str, access: str, source: NormalizedSource, scanner_clear: bool, scope: PrincipalScope | None = None) -> dict[str, Any]:
+    def execute(
+        self,
+        request: CommitRequest,
+        route: RouteBinding,
+        *,
+        principal: str,
+        access: str,
+        source: NormalizedSource,
+        scanner_clear: bool,
+        scope: PrincipalScope | None = None,
+        pre_accept: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Publish exactly one strict outcome record/event after all prechecks."""
         if type(access) is not str or access not in {"public", "workspace", "restricted"}:
             raise CommitRuntimeError("effective output access is invalid")
@@ -624,7 +938,6 @@ class CommitRuntime:
             scope_id, attempt_id, request_hash, capability, canonical = self._pair(request, route, principal)
             lineage = self._lineage(request, scope, self.journal)
             body = self._record_body(request, request_hash, attempt_id, lineage)
-            record_bytes = canonical_bytes(body)
             record_id = canonical_hash(body)
             appended_at = _now()
             envelope = self._event(request, access=access, record_id=record_id, record_hash=record_id, lineage=lineage, sequence=self.journal.high_watermark() + 1, appended_at=appended_at)
@@ -632,6 +945,8 @@ class CommitRuntime:
             template = {"ok": True, "outcome": "completed", "record_ids": ([request.payload["record_id"], record_id] if request.operation == "import.record" else [record_id]), "entry_ids": [envelope["entry_id"]], "usage": {"requests": 0, "bytes": source.byte_length, "cost": 0}}
             reservation = {"schema_version": _RESERVATION_SCHEMA, "scope_id": scope_id, "principal": principal, "capability": capability, "idempotency_key": request.idempotency_key, "request_hash": request_hash, "canonical_request": canonical, "attempt_id": attempt_id, "status": "open", "response": template}
             marker = {"schema_version": _OPEN_SCHEMA, "scope_id": scope_id, "attempt_id": attempt_id, "request_hash": request_hash, "canonical_request": canonical, "operation": request.operation, "source": source.identity, "record_id": record_id, "record_body": body, "lineage": lineage, "access": access, "policy_id": request.policy_id, "producer": request.producer.to_dict(), "status": "open", "envelope": envelope}
+            if pre_accept is not None:
+                pre_accept()
             self._write("commit3c1", "reservations", reservation_name, value=reservation)
             self._fault("after_reservation")
             self._write("commit3c1", "open", open_name, value=marker)
@@ -648,22 +963,19 @@ class CommitRuntime:
                 raise CommitUnavailable("durable record publication failed") from error
             if result.record_id != record_id or result.content_sha256 != record_id:
                 raise CommitIntegrityError("outcome record identity disagrees")
-            reservation["status"] = marker["status"] = "prepared"
-            self._write("commit3c1", "reservations", reservation_name, value=reservation)
-            self._write("commit3c1", "open", open_name, value=marker)
+            self._prepare_pair(reservation, reservation_name, marker, open_name)
             self._fault("after_record")
+            self._verify_published_plan(marker)
             try:
                 self.journal.append(envelope)
             except JournalError as error:
                 raise CommitUnavailable("journal publication failed") from error
             self._fault("after_journal")
-            reservation["status"] = marker["status"] = "complete"
-            self._write("commit3c1", "open", open_name, value=marker)
-            self._write("commit3c1", "reservations", reservation_name, value=reservation)
+            self._complete_pair(reservation, reservation_name, marker, open_name)
             return make_commit_response(request.request_id, ok=True, outcome="completed", record_ids=template["record_ids"], entry_ids=template["entry_ids"], usage=template["usage"])
 
     def reconcile(self) -> list[dict[str, Any]]:
-        """Finish only a proved record/no-event prepared state; otherwise fail closed."""
+        """Finish only proved monotonic crash states; reject every other state."""
         assert self.anchor is not None and self.records is not None and self.journal is not None
         repaired: list[dict[str, Any]] = []
         with self._lock():
@@ -676,91 +988,38 @@ class CommitRuntime:
                 if not self.anchor.exists("commit3c1", "open", open_name):
                     raise CommitIntegrityError("reservation counterpart is missing")
                 marker = self._load("commit3c1", "open", open_name, fields=_OPEN_FIELDS, label="commit open marker")
-                if marker.get("status") != reservation.get("status") or marker.get("attempt_id") != attempt_id:
+                if marker.get("attempt_id") != attempt_id:
                     raise CommitIntegrityError("reservation/open pair disagrees")
-                if reservation["status"] == "complete":
+                self._validate_pair_values(name, reservation, open_name, marker)
+                phase = self._pair_phase(reservation, marker)
+                if phase == "complete":
+                    self._completed_binding(reservation, marker)
                     continue
-                if reservation["status"] == "open":
-                    # The pair itself proves acceptance, but no source object or
-                    # outcome record was published.  Make the required one
-                    # explicit interrupted outcome without rereading a source
-                    # or retrying any work.
-                    canonical = marker.get("canonical_request")
-                    source = marker.get("source")
-                    lineage = marker.get("lineage")
-                    producer = marker.get("producer")
-                    if type(canonical) is not dict or type(source) is not dict or type(lineage) is not dict or type(producer) is not dict:
-                        raise CommitIntegrityError("open commit recovery metadata is malformed")
-                    operation = marker.get("operation")
-                    if operation not in {"ingest.file", "import.record"}:
-                        raise CommitIntegrityError("open commit operation is malformed")
-                    request_hash = _sha(marker.get("request_hash"), "request_hash")
-                    source_record = {"sha256": source.get("sha256"), "byte_length": source.get("byte_length"), "media_type": "application/octet-stream", "encoding": "identity"}
-                    if operation == "ingest.file":
-                        body = {"schema_version": "houndd.file-record.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": operation, "outcome": "interrupted", "evidence_status": "interrupted", "source": source_record, "lineage": lineage}
-                        artifact_kind, schema, native_id, object_key, content_sha256 = "file", "houndd.file-record.v1", source.get("sha256"), f"file:{source.get('sha256')}", source_record["sha256"]
+                if phase == "open":
+                    if self._source_is_published(marker):
+                        self._ensure_plan_record(marker)
                     else:
-                        payload = canonical.get("operation", {}).get("payload") if type(canonical.get("operation")) is dict else None
-                        legacy_id = payload.get("record_id") if type(payload) is dict else None
-                        if type(legacy_id) is not str:
-                            raise CommitIntegrityError("open import metadata is malformed")
-                        body = {"schema_version": "houndd.import-outcome.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": operation, "outcome": "interrupted", "evidence_status": "interrupted", "legacy": {"record_id": legacy_id, **source_record}, "lineage": lineage}
-                        artifact_kind, schema, native_id = "import", "houndd.import-outcome.v1", legacy_id
-                    try:
-                        result = self.records.put_json(body)
-                    except StoreError as error:
-                        raise CommitIntegrityError("interrupted outcome cannot be recorded") from error
-                    if operation == "import.record":
-                        object_key = f"import-outcome:{result.record_id}"
-                        content_sha256 = result.content_sha256
-                    access = marker.get("access")
-                    policy_id = marker.get("policy_id")
-                    if type(access) is not str or type(policy_id) is not str:
-                        raise CommitIntegrityError("open commit access metadata is malformed")
-                    envelope = make_journal_envelope(
-                        sequence=self.journal.high_watermark() + 1,
-                        appended_at=_now(),
-                        producer=producer,
-                        artifact={"kind": artifact_kind, "schema": schema, "record_id": result.record_id, "hash": result.content_sha256, "authorized_uri": f"houndd://record/{result.record_id}"},
-                        lineage=lineage,
-                        source={"provider": "local" if operation == "ingest.file" else "legacy", "native_id": native_id, "canonical_url": "none"},
-                        classification={"outcome": "interrupted", "evidence_status": "interrupted"},
-                        access=access,
-                        policy_id=policy_id,
-                        dedupe={"object_key": object_key, "content_sha256": content_sha256},
-                        usage={"requests": 0, "bytes": source_record["byte_length"], "cost": 0},
-                    )
-                    try:
-                        self.journal.append(envelope)
-                    except JournalError as error:
-                        raise CommitIntegrityError("interrupted event cannot be recorded") from error
-                    reservation["response"] = {"ok": False, "outcome": "interrupted", "record_ids": [result.record_id], "entry_ids": [envelope["entry_id"]], "usage": {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}}
-                    marker["record_id"] = result.record_id
-                    marker["record_body"] = body
-                    marker["envelope"] = envelope
-                    reservation["status"] = marker["status"] = "complete"
-                    self._write("commit3c1", "open", open_name, value=marker)
-                    self._write("commit3c1", "reservations", name, value=reservation)
-                    repaired.append({"attempt_id": attempt_id, "outcome": "interrupted"})
+                        if self.records.has(marker["record_id"]):
+                            raise CommitIntegrityError("open outcome record lacks its completed source")
+                        self._interrupted_plan(marker)
+                    self._prepare_pair(reservation, name, marker, open_name)
+                elif phase == "preparing":
+                    # The marker is the durable plan.  Its old reservation
+                    # template is intentionally ignored and replaced below.
+                    self._verify_published_plan(marker)
+                    self._prepare_pair(reservation, name, marker, open_name)
+                elif phase == "prepared":
+                    self._verify_published_plan(marker)
+                elif phase == "finalizing":
+                    self._complete_pair(reservation, name, marker, open_name)
+                    repaired.append({"attempt_id": attempt_id, "outcome": marker["record_body"]["outcome"]})
                     continue
-                if reservation["status"] != "prepared":
+                else:  # pragma: no cover - _pair_phase is exhaustive
                     raise CommitIntegrityError("reservation status is invalid")
-                record_id = marker.get("record_id")
-                envelope = marker.get("envelope")
-                if type(record_id) is not str or type(envelope) is not dict or not self.records.verify_record(record_id, record_id):
-                    raise CommitIntegrityError("prepared record is missing or changed")
-                event = self.journal.get(envelope.get("entry_id")) if type(envelope.get("entry_id")) is str else None
-                if event is None:
-                    try:
-                        self.journal.append(envelope)
-                    except JournalError as error:
-                        raise CommitIntegrityError("prepared event cannot be recovered") from error
-                elif event != envelope:
-                    raise CommitIntegrityError("journal event disagrees with prepared commit")
-                reservation["status"] = marker["status"] = "complete"
-                self._write("commit3c1", "open", open_name, value=marker)
-                self._write("commit3c1", "reservations", name, value=reservation)
-                repaired.append({"attempt_id": attempt_id, "outcome": "completed"})
+                self._resequence_pair(reservation, name, marker, open_name)
+                self._append_prepared_event(marker)
+                self._complete_pair(reservation, name, marker, open_name)
+                repaired.append({"attempt_id": attempt_id, "outcome": marker["record_body"]["outcome"]})
         return repaired
 
 
