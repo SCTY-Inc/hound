@@ -17,11 +17,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from .access import AccessRefusal, AuthenticatedPrincipal, EventSelector, PolicyBundle, PolicyRule, PrincipalScope, ProducerClaim, ProducerSelector, resolve_commit_access, resolve_scope
-from .commit import CommitContractError, CommitRequest, SourceError, make_commit_response, normalize_source, parse_commit_request, resolve_route
-from .commit_runtime import CommitCollision, CommitIntegrityError, CommitRuntime, CommitRuntimeError, CommitUnavailable
+from .adapter_host import ADAPTER_ENV_KEYS, AdapterHost, AdapterHostError
+from .commit import ADAPTER_OPERATIONS, CommitContractError, CommitRequest, SourceError, make_commit_response, normalize_source, parse_commit_request, resolve_route
+from .commit_runtime import CommitCollision, CommitIntegrityError, CommitRefusal, CommitRuntime, CommitRuntimeError, CommitUnavailable
 from .phi import PhiInputError, PhiManifestError, PhiScanner, phi_manifest_path
 from .contracts import canonical_bytes
 from .query_contracts import QueryContractError, parse_query_request
+from .query_engine import QuerySnapshotError
+from .reads import ReadContractError, parse_entry_request, parse_record_request, read_record, select_entry, select_record, verified_events
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
 from .intake_projection import IntakeProjectionError, project_intake_ledger_page
 from .service_identity import ServiceIdentity, ServiceIdentityError
@@ -43,6 +46,7 @@ _REQUEST_FIELDS = frozenset({"schema_version", "request_id", "producer", "reques
 _RESPONSE_REQUIRED = frozenset({"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"})
 _RESPONSE_OPTIONAL = frozenset({"result", "cursor", "projection", "error"})
 _FRAME_FIELDS = frozenset({"wire_version", "method", "path", "body"})
+_READ_OPERATIONS = frozenset({"service.health", "service.ready", "journal.query", "journal.get", "record.get"})
 _ACCESS_CEILINGS = {
     "public": frozenset({"public"}),
     "workspace": frozenset({"public", "workspace"}),
@@ -345,6 +349,8 @@ def parse_read_request(value: object) -> ReadRequest:
     requested_access = value["requested_access"]
     if requested_access not in _ACCESS_CEILINGS:
         raise RequestError("requested_access is invalid")
+    if operation["name"] not in _READ_OPERATIONS:
+        raise RequestError("operation.name is not a read operation")
     try:
         return ReadRequest(
             _text(value["request_id"], "request_id"),
@@ -365,12 +371,14 @@ def _encode_response(value: dict[str, Any]) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, cursor: str | None = None, projection: dict[str, str] | None = None, error: tuple[str, bool, str] | None = None) -> EncodedResponse:
+def _response(request_id: str, status: int, *, outcome: str, result: list[dict[str, Any]] | None = None, entry_ids: list[str] | None = None, record_ids: list[str] | None = None, cursor: str | None = None, projection: dict[str, str] | None = None, error: tuple[str, bool, str] | None = None) -> EncodedResponse:
     body: dict[str, Any] = {"schema_version": RESPONSE_SCHEMA, "request_id": request_id, "ok": status == 200, "outcome": outcome, "record_ids": [], "entry_ids": [], "usage": {"requests": 0, "bytes": 0, "cost": 0}}
     if result is not None:
+        # Canonical-event results derive their aligned IDs; a record result is
+        # not a journal event and must state the IDs it aligns with instead.
         body["result"] = result
-        body["entry_ids"] = [event["entry_id"] for event in result]
-        body["record_ids"] = [event["artifact"]["record_id"] for event in result]
+        body["entry_ids"] = [event["entry_id"] for event in result] if entry_ids is None else entry_ids
+        body["record_ids"] = [event["artifact"]["record_id"] for event in result] if record_ids is None else record_ids
     if cursor is not None:
         body["cursor"] = cursor
     if projection is not None:
@@ -433,12 +441,18 @@ def _commit_response(
 class HounddService:
     """Foreground-only local service; it owns no scheduler or request cache."""
 
-    def __init__(self, *, state_root: str | Path, socket_path: str | Path) -> None:
+    def __init__(self, *, state_root: str | Path, socket_path: str | Path, adapter_host: AdapterHost | None = None) -> None:
         self._owner_pid = os.getpid()
         self.state_root = Path(state_root)
         self.socket_path = Path(socket_path)
         if not self.state_root.is_absolute() or not self.socket_path.is_absolute():
             raise ServiceError("state and socket paths must be absolute")
+        # Provider credentials are captured once, here, and never re-read from
+        # the process environment on a request path.
+        try:
+            self.adapter_host = adapter_host if adapter_host is not None else AdapterHost.from_env({key: os.environ[key] for key in ADAPTER_ENV_KEYS if key in os.environ})
+        except AdapterHostError as error:
+            raise ServiceError("adapter host cannot be frozen at startup") from error
         self._listener: socket.socket | None = None
         self._closed = False
         self.store: HounddStore | None = None
@@ -639,6 +653,23 @@ class HounddService:
                     200,
                     ok=response["ok"], outcome=response["outcome"], record_ids=response["record_ids"], entry_ids=response["entry_ids"], usage=response["usage"],
                 )
+            if route.operation in ADAPTER_OPERATIONS:
+                # These operations declare no SOURCE and are gated by the
+                # post-acceptance text scan inside the runtime, so the 3C1
+                # clear manifest is not a readiness prerequisite for them.
+                response = self.commit_runtime.execute_adapter(
+                    request,
+                    route,
+                    principal=principal.subject,
+                    access=access,
+                    adapter_host=self.adapter_host,
+                    scope=lineage_scope,
+                )
+                return _commit_response(
+                    request.request_id,
+                    200,
+                    ok=response["ok"], outcome=response["outcome"], record_ids=response["record_ids"], entry_ids=response["entry_ids"], usage=response["usage"],
+                )
             scanner = self._frozen_phi_snapshot()
             source = normalize_source(request.source.to_wire())
             decision = scanner.scan(source.data, "application/octet-stream", "identity", request.operation)
@@ -665,12 +696,61 @@ class HounddService:
             )
         except CommitCollision:
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="request_conflict")
+        except CommitRefusal:
+            return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
         except (PolicyError, PhiManifestError):
             return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
         except (CommitContractError, SourceError, PhiInputError, ValueError):
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
         except (CommitIntegrityError, CommitUnavailable, CommitRuntimeError, StoreError, JournalError, OSError):
             return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
+
+    def _dispatch_entry(self, principal: AuthenticatedPrincipal, request: ReadRequest) -> dict[str, Any]:
+        """Return exactly one authorized canonical journal event."""
+
+        try:
+            assert self.policy is not None and self.store is not None
+            _assert_frozen(self.policy, self.state_root)
+            scope = self._scope(principal, request)
+            if scope is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            entry = parse_entry_request(request.payload)
+            event = select_entry(verified_events(self.store.journal), scope, entry.entry_id)
+            if event is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            return _response(request.request_id, 200, outcome="completed", result=[_plain_json(event)])
+        except ResponseTooLarge:
+            return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
+        except (PolicyError, QuerySnapshotError, StoreError, OSError):
+            # Integrity conditions are listed before the request-shape clause
+            # because a verified-snapshot failure is also a ``ValueError``.
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        except (ReadContractError, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+
+    def _dispatch_record(self, principal: AuthenticatedPrincipal, request: ReadRequest) -> dict[str, Any]:
+        """Return exactly one authorized stored object with its exact bytes."""
+
+        try:
+            assert self.policy is not None and self.store is not None
+            _assert_frozen(self.policy, self.state_root)
+            scope = self._scope(principal, request)
+            if scope is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            record = parse_record_request(request.payload)
+            binding = select_record(verified_events(self.store.journal), scope, record.record_id)
+            if binding is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            result = read_record(self.store.records, binding, include_content=record.include_content)
+            return _response(request.request_id, 200, outcome="completed", result=[result], entry_ids=[], record_ids=[binding.record_id])
+        except ResponseTooLarge:
+            # Never a partial or re-encoded object: the caller learns only that
+            # this exact response cannot cross the fixed wire bound.
+            return _response(request.request_id, 400, outcome="invalid", error=("content_too_large", False, "record content is too large"))
+        except (PolicyError, QuerySnapshotError, StoreError, OSError):
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        except (ReadContractError, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
 
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         if frame["method"] == "POST":
@@ -679,7 +759,7 @@ class HounddService:
             raise RequestError("method is invalid")
         request = parse_read_request(frame["body"])
         path = frame["path"]
-        if path not in {"/v1/journal", "/v1/health", "/v1/ready"}:
+        if path not in {"/v1/journal", "/v1/journal/entry", "/v1/record", "/v1/health", "/v1/ready"}:
             raise RequestError("path is invalid")
         if path == "/v1/health":
             if request.operation != "service.health" or request.claim.capability != "service.health":
@@ -694,6 +774,14 @@ class HounddService:
             except PolicyError:
                 return _generic_response(request.request_id, ready=False)
             return _generic_response(request.request_id, ready=True)
+        if path == "/v1/journal/entry":
+            if request.operation != "journal.get" or request.claim.capability != "journal.get":
+                raise RequestError("journal entry route operation binding is invalid")
+            return self._dispatch_entry(principal, request)
+        if path == "/v1/record":
+            if request.operation != "record.get" or request.claim.capability != "record.get":
+                raise RequestError("record route operation binding is invalid")
+            return self._dispatch_record(principal, request)
         if request.operation != "journal.query" or request.claim.capability != "journal.query":
             raise RequestError("journal route operation binding is invalid")
         try:

@@ -1,4 +1,4 @@
-"""Durable Slice 3C1 file/import coordinator.
+"""Durable Slice 3C1 file/import and Slice 3C2 adapter commit coordinator.
 
 This is deliberately separate from :mod:`houndd.transactions`.  The older
 coordinator owns the legacy generic request envelope; accepting its more
@@ -10,6 +10,7 @@ events remain the durable public truth.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -20,7 +21,16 @@ from typing import Any, Callable, Iterator
 
 from ._safety import AnchoredRoot
 from .access import PrincipalScope, authorize_event_header
+from .adapter_host import (
+    ADAPTER_MEDIA_TYPES,
+    AdapterAbstained,
+    AdapterHost,
+    AdapterHostError,
+    AdapterUnavailable,
+)
 from .commit import (
+    ADAPTER_OPERATIONS,
+    SOURCE_OPERATIONS,
     CommitContractError,
     CommitRequest,
     NormalizedSource,
@@ -32,6 +42,7 @@ from .commit import (
 )
 from .contracts import canonical_bytes, canonical_hash, make_journal_envelope, validate_journal_envelope
 from .journal import Journal, JournalError
+from .phi import PhiInputError, scan_text
 from .store import ImmutableConflict, RecordStore, StoreError
 
 
@@ -51,11 +62,27 @@ class CommitUnavailable(CommitRuntimeError):
     """A required local durable primitive is unavailable."""
 
 
+class CommitRefusal(CommitRuntimeError):
+    """A declared reference does not resolve inside the effective scope."""
+
+
 FaultHook = Callable[[str], None]
 _RESERVATION_SCHEMA = "houndd.commit-reservation.v1"
 _OPEN_SCHEMA = "houndd.commit-open.v1"
 _RESERVATION_FIELDS = frozenset({"schema_version", "scope_id", "principal", "capability", "idempotency_key", "request_hash", "canonical_request", "attempt_id", "status", "response"})
-_OPEN_FIELDS = frozenset({"schema_version", "scope_id", "attempt_id", "request_hash", "canonical_request", "operation", "source", "record_id", "record_body", "lineage", "access", "policy_id", "producer", "status", "envelope"})
+_OPEN_FIELDS = frozenset({"schema_version", "scope_id", "attempt_id", "request_hash", "canonical_request", "operation", "source", "record_id", "record_body", "lineage", "access", "policy_id", "producer", "status", "usage", "envelope"})
+_LEGACY_OPEN_FIELDS = _OPEN_FIELDS - {"usage"}
+QUARANTINE_SCHEMA = "houndd.quarantine-record.v1"
+SEARCH_RECORD_SCHEMA = "houndd.search-record.v1"
+URL_RECORD_SCHEMA = "houndd.url-record.v1"
+_ADAPTER_ARTIFACTS: dict[str, tuple[str, str]] = {"ingest.search": ("search", SEARCH_RECORD_SCHEMA), "ingest.url": ("extract", URL_RECORD_SCHEMA)}
+_ADAPTER_PROVIDERS: dict[str, str] = {"ingest.search": "exa", "ingest.url": "firecrawl"}
+_ADAPTER_REASONS = frozenset({"none", "provider_failed", "provider_abstained", "adapter_absent", "interrupted"})
+_EVIDENCE_STATUS: dict[str, str] = {"completed": "clear", "partial": "partial", "failed": "failure", "degraded": "degraded", "refused": "refused", "interrupted": "interrupted"}
+_STAGED_OUTCOMES = frozenset({"completed", "partial"})
+_NO_LINEAGE: dict[str, str] = {"relation": "none", "record_id": "none", "lead_id": "none"}
+_NO_CONTENT = "none"
+_EMPTY_CONTENT: dict[str, Any] = {"sha256": hashlib.sha256(b"").hexdigest(), "byte_length": 0}
 
 
 def _now() -> str:
@@ -185,6 +212,14 @@ class CommitRuntime:
                 raise CommitIntegrityError(f"{label} is non-canonical")
         except ValueError as error:
             raise CommitIntegrityError(f"{label} is non-canonical") from error
+        if fields is _OPEN_FIELDS and type(value) is dict and set(value) == _LEGACY_OPEN_FIELDS:
+            # A pre-3C2 marker: source-operation usage was implicit, and the
+            # derived value below is byte-identical to what that slice bound
+            # into its finalized response template.
+            source = value.get("source")
+            if type(source) is dict and type(source.get("byte_length")) is int and source["byte_length"] >= 0:
+                value = dict(value)
+                value["usage"] = {"requests": 0, "bytes": source["byte_length"], "cost": 0}
         return _object(value, fields, label)
 
     def _write(self, *parts: str, value: dict[str, Any]) -> None:
@@ -339,16 +374,19 @@ class CommitRuntime:
         ):
             raise CommitIntegrityError("canonical commit route is invalid")
         payload = operation["payload"]
-        canonical_source = payload.get("source")
-        if (
-            type(canonical_source) is not dict
-            or set(canonical_source) != {"sha256", "byte_length"}
-            or _sha(canonical_source.get("sha256"), "canonical source sha256") != canonical_source.get("sha256")
-            or type(canonical_source.get("byte_length")) is not int
-            or canonical_source["byte_length"] < 0
-        ):
-            raise CommitIntegrityError("canonical source payload is invalid")
-        if binding.operation == "ingest.file":
+        if binding.operation in SOURCE_OPERATIONS:
+            canonical_source = payload.get("source")
+            if (
+                type(canonical_source) is not dict
+                or set(canonical_source) != {"sha256", "byte_length"}
+                or _sha(canonical_source.get("sha256"), "canonical source sha256") != canonical_source.get("sha256")
+                or type(canonical_source.get("byte_length")) is not int
+                or canonical_source["byte_length"] < 0
+            ):
+                raise CommitIntegrityError("canonical source payload is invalid")
+        if binding.operation in ADAPTER_OPERATIONS:
+            self._validate_adapter_payload(binding.operation, payload)
+        elif binding.operation == "ingest.file":
             if (
                 set(payload) != {"source", "media_type"}
                 or type(payload.get("media_type")) is not str
@@ -381,7 +419,7 @@ class CommitRuntime:
             or type(source) is not dict
             or set(source) != {"sha256", "byte_length"}
             or _sha(source.get("sha256"), "open source sha256") != source.get("sha256")
-            or payload.get("source") != source
+            or (payload.get("source") != source if capability in SOURCE_OPERATIONS else False)
             or type(source.get("byte_length")) is not int
             or source["byte_length"] < 0
             or type(lineage) is not dict
@@ -403,11 +441,6 @@ class CommitRuntime:
         if checked_event != envelope:
             raise CommitIntegrityError("open marker journal event changed during validation")
         artifact = envelope["artifact"]
-        expected_dedupe = (
-            {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}
-            if capability == "import.record" and body.get("outcome") == "interrupted"
-            else None
-        )
         if (
             artifact["record_id"] != record_id
             or artifact["hash"] != record_id
@@ -415,18 +448,141 @@ class CommitRuntime:
             or envelope["policy_id"] != canonical["policy_id"]
             or envelope["access"] != marker["access"]
             or envelope["lineage"] != lineage
-            or (envelope["dedupe"] != expected_dedupe if expected_dedupe is not None else envelope["dedupe"]["content_sha256"] != source["sha256"])
         ):
             raise CommitIntegrityError("open marker journal binding disagrees")
         phase = self._pair_phase(reservation, marker)
         expected = self._plan_template(marker)
         stored = self._template(reservation.get("response"))
         # During the first write of open -> prepared recovery the reservation
-        # still contains its obsolete completed template.  It is not trusted,
+        # still contains its obsolete completed template.  An adapter operation
+        # cannot know its outcome plan before its one provider call, so its
+        # open-phase template is likewise a placeholder.  Neither is trusted,
         # returned, or used for publication; recovery replaces it from the
         # marker's already-persisted plan.  Every other state binds both files.
-        if phase != "preparing" and stored != self._template(expected):
+        placeholder = phase == "preparing" or (phase == "open" and capability in ADAPTER_OPERATIONS)
+        if not placeholder and stored != self._template(expected):
             raise CommitIntegrityError("reservation response does not bind the outcome plan")
+
+    @staticmethod
+    def _validate_adapter_payload(operation: str, payload: object) -> dict[str, Any]:
+        """Accept only the exact canonical payload of a source-less operation."""
+
+        if type(payload) is not dict:
+            raise CommitIntegrityError("canonical adapter payload is invalid")
+        if operation == "ingest.search":
+            if (
+                set(payload) != {"query", "limit"}
+                or type(payload.get("query")) is not str
+                or not payload["query"]
+                or type(payload.get("limit")) is not int
+                or not 1 <= payload["limit"] <= 50
+            ):
+                raise CommitIntegrityError("canonical ingest.search payload is invalid")
+            return payload
+        lineage = payload.get("lineage")
+        if (
+            set(payload) - {"max_pages"} != {"url", "lineage"}
+            or type(payload.get("url")) is not str
+            or not payload["url"]
+            or type(lineage) is not dict
+            or ("max_pages" in payload and (type(payload["max_pages"]) is not int or not 2 <= payload["max_pages"] <= 20))
+        ):
+            raise CommitIntegrityError("canonical ingest.url payload is invalid")
+        if lineage.get("kind") == "direct":
+            if set(lineage) != {"kind"}:
+                raise CommitIntegrityError("canonical ingest.url lineage is invalid")
+        elif (
+            set(lineage) != {"kind", "record_id", "lead_id"}
+            or lineage.get("kind") != "search"
+            or _sha(lineage.get("record_id"), "canonical url lineage record_id") != lineage.get("record_id")
+            or type(lineage.get("lead_id")) is not str
+            or not lineage["lead_id"]
+        ):
+            raise CommitIntegrityError("canonical ingest.url lineage is invalid")
+        return payload
+
+    @staticmethod
+    def _plan_requires_content(marker: dict[str, Any]) -> bool:
+        """Report whether the plan's outcome names a durable content object."""
+
+        body = marker["record_body"]
+        if body.get("schema_version") == QUARANTINE_SCHEMA:
+            return False
+        if marker["operation"] in ADAPTER_OPERATIONS:
+            return body.get("outcome") in _STAGED_OUTCOMES
+        return body.get("outcome") == "completed"
+
+    def _adapter_plan(self, marker: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str]]:
+        """Validate one adapter outcome body and derive its exact event binding."""
+
+        operation = marker["operation"]
+        body = marker["record_body"]
+        lineage = marker["lineage"]
+        content = marker["source"]
+        record_id = marker["record_id"]
+        payload = self._validate_adapter_payload(operation, marker["canonical_request"]["operation"]["payload"])
+        kind, schema = _ADAPTER_ARTIFACTS[operation]
+        outcome = body.get("outcome")
+        if outcome not in _EVIDENCE_STATUS or body.get("evidence_status") != _EVIDENCE_STATUS[outcome]:
+            raise CommitIntegrityError("adapter outcome plan is unsupported")
+        common = {"attempt_id": marker["attempt_id"], "request_hash": marker["request_hash"], "operation": operation, "lineage": lineage}
+        if {key: body.get(key) for key in common} != common:
+            raise CommitIntegrityError("adapter outcome plan is malformed")
+        staged = self._plan_requires_content(marker)
+        if body.get("schema_version") == QUARANTINE_SCHEMA:
+            quarantine = body.get("quarantine")
+            if (
+                outcome != "refused"
+                or set(body) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "quarantine", "lineage"}
+                or lineage != _NO_LINEAGE
+                or type(quarantine) is not dict
+                or set(quarantine) != {"content_sha256", "byte_length", "reason", "access"}
+                or _sha(quarantine.get("content_sha256"), "quarantine content_sha256") != content.get("sha256")
+                or quarantine.get("byte_length") != content.get("byte_length")
+                or type(content.get("byte_length")) is not int
+                or quarantine.get("reason") != "phi_suspected"
+                or quarantine.get("access") != marker.get("access")
+            ):
+                raise CommitIntegrityError("quarantine outcome plan is malformed")
+            schema = QUARANTINE_SCHEMA
+            canonical_url = "none"
+            dedupe = {"object_key": f"quarantine:{record_id}", "content_sha256": record_id}
+        else:
+            required = {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "reason", "provider", "retrieved_at", "content_sha256", "byte_length", "lineage"}
+            required |= {"query", "limit", "leads"} if operation == "ingest.search" else {"url"}
+            if (
+                set(body) != required
+                or body.get("schema_version") != schema
+                or body.get("provider") != _ADAPTER_PROVIDERS[operation]
+                or body.get("reason") not in _ADAPTER_REASONS
+                or (body.get("reason") == "none") is not staged
+                or type(body.get("retrieved_at")) is not str
+                or not body["retrieved_at"]
+            ):
+                raise CommitIntegrityError("adapter outcome plan is malformed")
+            if staged:
+                if body.get("content_sha256") != content.get("sha256") or body.get("byte_length") != content.get("byte_length") or type(content.get("byte_length")) is not int or content["byte_length"] <= 0:
+                    raise CommitIntegrityError("staged adapter plan does not bind its content")
+                dedupe = {"object_key": f"{kind}:{content['sha256']}", "content_sha256": content["sha256"]}
+            else:
+                if body.get("content_sha256") != _NO_CONTENT or body.get("byte_length") != 0 or content != _EMPTY_CONTENT:
+                    raise CommitIntegrityError("unstaged adapter plan claims content")
+                dedupe = {"object_key": f"{kind}-outcome:{record_id}", "content_sha256": record_id}
+            if operation == "ingest.search":
+                leads = body.get("leads")
+                if body.get("query") != payload["query"] or body.get("limit") != payload["limit"] or type(leads) is not list or (leads and not staged):
+                    raise CommitIntegrityError("search outcome plan is malformed")
+                for lead in leads:
+                    if type(lead) is not dict or set(lead) != {"url", "title", "native_id"} or any(type(value) is not str or not value for value in lead.values()):
+                        raise CommitIntegrityError("search outcome lead is malformed")
+                canonical_url = "none"
+            else:
+                if body.get("url") != payload["url"]:
+                    raise CommitIntegrityError("url outcome plan is malformed")
+                canonical_url = body["url"]
+        artifact = {"kind": kind, "schema": schema, "record_id": record_id, "hash": record_id, "authorized_uri": f"houndd://record/{record_id}"}
+        event_source = {"provider": _ADAPTER_PROVIDERS[operation], "native_id": record_id, "canonical_url": canonical_url}
+        return artifact, event_source, dedupe, [record_id]
 
     def _plan_template(self, marker: dict[str, Any]) -> dict[str, Any]:
         """Validate one private outcome/event plan and derive its response."""
@@ -436,9 +592,19 @@ class CommitRuntime:
         lineage = marker.get("lineage")
         body = marker.get("record_body")
         envelope = marker.get("envelope")
+        usage = marker.get("usage")
         record_id = _sha(marker.get("record_id"), "planned record_id")
         if type(source) is not dict or type(lineage) is not dict or type(body) is not dict or type(envelope) is not dict:
             raise CommitIntegrityError("outcome plan is malformed")
+        if (
+            type(usage) is not dict
+            or set(usage) != {"requests", "bytes", "cost"}
+            or any(type(usage[key]) is not int or usage[key] < 0 for key in ("requests", "bytes"))
+            or type(usage["cost"]) not in {int, float}
+            or type(usage["cost"]) is bool
+            or usage["cost"] < 0
+        ):
+            raise CommitIntegrityError("outcome plan usage is malformed")
         source_record = {
             "sha256": source.get("sha256"),
             "byte_length": source.get("byte_length"),
@@ -448,9 +614,17 @@ class CommitRuntime:
         if type(source_record["byte_length"]) is not int or source_record["byte_length"] < 0:
             raise CommitIntegrityError("outcome plan source is malformed")
         outcome = body.get("outcome")
+        if operation in ADAPTER_OPERATIONS:
+            artifact, event_source, dedupe, record_ids = self._adapter_plan(marker)
+            evidence_status = body["evidence_status"]
+            if usage["bytes"] != (source["byte_length"] if self._plan_requires_content(marker) else 0):
+                raise CommitIntegrityError("adapter plan usage does not bind its content")
+            return self._bind_plan_event(marker, record_id, body, envelope, artifact, event_source, dedupe, record_ids, usage, outcome, evidence_status, lineage)
         if outcome not in {"completed", "interrupted"}:
             raise CommitIntegrityError("outcome plan is unsupported")
         evidence_status = "clear" if outcome == "completed" else "interrupted"
+        if usage != {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}:
+            raise CommitIntegrityError("outcome plan usage is malformed")
         expected_common = {
             "attempt_id": marker.get("attempt_id"),
             "request_hash": marker.get("request_hash"),
@@ -506,6 +680,26 @@ class CommitRuntime:
             record_ids = [legacy["record_id"], record_id] if outcome == "completed" else [record_id]
         else:
             raise CommitIntegrityError("outcome plan operation is invalid")
+        return self._bind_plan_event(marker, record_id, body, envelope, artifact, event_source, dedupe, record_ids, usage, outcome, evidence_status, lineage)
+
+    def _bind_plan_event(
+        self,
+        marker: dict[str, Any],
+        record_id: str,
+        body: dict[str, Any],
+        envelope: dict[str, Any],
+        artifact: dict[str, Any],
+        event_source: dict[str, str],
+        dedupe: dict[str, str],
+        record_ids: list[str],
+        usage: dict[str, Any],
+        outcome: str,
+        evidence_status: str,
+        lineage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Require the derived plan and its persisted event to be one truth."""
+
+        del marker
         if (
             canonical_hash(body) != record_id
             or envelope.get("artifact") != artifact
@@ -513,7 +707,7 @@ class CommitRuntime:
             or envelope.get("classification") != {"outcome": outcome, "evidence_status": evidence_status}
             or envelope.get("lineage") != lineage
             or envelope.get("dedupe") != dedupe
-            or envelope.get("usage") != {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}
+            or envelope.get("usage") != usage
         ):
             raise CommitIntegrityError("outcome plan does not bind its public event")
         template = {
@@ -521,20 +715,20 @@ class CommitRuntime:
             "outcome": outcome,
             "record_ids": record_ids,
             "entry_ids": [envelope.get("entry_id")],
-            "usage": {"requests": 0, "bytes": source_record["byte_length"], "cost": 0},
+            "usage": dict(usage),
         }
         self._template(template)
         return template
 
     def _source_is_published(self, marker: dict[str, Any]) -> bool:
-        """Verify the exact source object for a completed plan, without I/O guesses."""
+        """Verify the exact content object a plan names, without I/O guesses."""
 
         assert self.records is not None
         body = marker["record_body"]
         source = marker["source"]
-        if body["outcome"] != "completed":
+        if not self._plan_requires_content(marker):
             return False
-        if marker["operation"] == "ingest.file":
+        if marker["operation"] != "import.record":
             digest = source["sha256"]
             try:
                 data = self.records.blobs.get(digest)
@@ -578,8 +772,8 @@ class CommitRuntime:
         record_id = marker["record_id"]
         if not self.records.verify_record(record_id, record_id) or self.records.read_json(record_id) != marker["record_body"]:
             raise CommitIntegrityError("planned outcome record is missing or changed")
-        if marker["record_body"]["outcome"] == "completed" and not self._source_is_published(marker):
-            raise CommitIntegrityError("completed source object is missing")
+        if self._plan_requires_content(marker) and not self._source_is_published(marker):
+            raise CommitIntegrityError("planned content object is missing")
 
     def _prepare_pair(
         self,
@@ -666,11 +860,89 @@ class CommitRuntime:
         reservation["status"] = "complete"
         self._write("commit3c1", "reservations", reservation_name, value=reservation)
 
+    def _adapter_plan_into(
+        self,
+        marker: dict[str, Any],
+        *,
+        outcome: str,
+        reason: str,
+        retrieved_at: str,
+        content: bytes = b"",
+        leads: tuple[Any, ...] = (),
+        requests: int = 0,
+        cost: float = 0,
+        quarantine: bool = False,
+    ) -> dict[str, Any]:
+        """Replace the marker's plan with one validated adapter outcome plan."""
+
+        assert self.journal is not None
+        operation = marker["operation"]
+        payload = marker["canonical_request"]["operation"]["payload"]
+        staged = outcome in _STAGED_OUTCOMES and not quarantine
+        digest = hashlib.sha256(content).hexdigest()
+        common = {
+            "attempt_id": marker["attempt_id"],
+            "request_hash": marker["request_hash"],
+            "operation": operation,
+            "outcome": outcome,
+            "evidence_status": _EVIDENCE_STATUS[outcome],
+        }
+        if quarantine:
+            marker["lineage"] = dict(_NO_LINEAGE)
+            body: dict[str, Any] = {
+                "schema_version": QUARANTINE_SCHEMA,
+                **common,
+                "quarantine": {"content_sha256": digest, "byte_length": len(content), "reason": "phi_suspected", "access": marker["access"]},
+                "lineage": marker["lineage"],
+            }
+            marker["source"] = {"sha256": digest, "byte_length": len(content)}
+        else:
+            body = {
+                "schema_version": _ADAPTER_ARTIFACTS[operation][1],
+                **common,
+                "reason": reason,
+                "provider": _ADAPTER_PROVIDERS[operation],
+                "retrieved_at": retrieved_at,
+                "content_sha256": digest if staged else _NO_CONTENT,
+                "byte_length": len(content) if staged else 0,
+                "lineage": marker["lineage"],
+            }
+            if operation == "ingest.search":
+                body |= {"query": payload["query"], "limit": payload["limit"], "leads": [dict(lead) for lead in leads]}
+            else:
+                body["url"] = payload["url"]
+            marker["source"] = {"sha256": digest, "byte_length": len(content)} if staged else dict(_EMPTY_CONTENT)
+        usage = {"requests": requests, "bytes": len(content) if staged else 0, "cost": cost}
+        marker["usage"] = usage
+        marker["record_id"] = canonical_hash(body)
+        marker["record_body"] = body
+        artifact, event_source, dedupe, _ids = self._adapter_plan(marker)
+        marker["envelope"] = make_journal_envelope(
+            sequence=self.journal.high_watermark() + 1,
+            appended_at=_now(),
+            producer=marker["producer"],
+            artifact=artifact,
+            lineage=marker["lineage"],
+            source=event_source,
+            classification={"outcome": outcome, "evidence_status": _EVIDENCE_STATUS[outcome]},
+            access=marker["access"],
+            policy_id=marker["policy_id"],
+            dedupe=dedupe,
+            usage=usage,
+        )
+        return self._plan_template(marker)
+
     def _interrupted_plan(self, marker: dict[str, Any]) -> None:
         """Replace an open/no-stage plan with one persisted interrupted plan."""
 
         assert self.records is not None and self.journal is not None
         self._plan_template(marker)
+        if marker["operation"] in ADAPTER_OPERATIONS:
+            # Recovery never re-invokes the adapter; an unstaged attempt is
+            # interrupted regardless of whether the provider ever answered.
+            self._adapter_plan_into(marker, outcome="interrupted", reason="interrupted", retrieved_at=_now())
+            self._ensure_plan_record(marker)
+            return
         source = marker["source"]
         source_record = {
             "sha256": source["sha256"],
@@ -789,8 +1061,29 @@ class CommitRuntime:
 
     @staticmethod
     def _lineage(request: CommitRequest, scope: PrincipalScope | None, journal: Journal) -> dict[str, str]:
-        if request.operation == "ingest.file":
-            return {"relation": "none", "record_id": "none", "lead_id": "none"}
+        if request.operation in {"ingest.file", "ingest.search"}:
+            return dict(_NO_LINEAGE)
+        if request.operation == "ingest.url":
+            declared = request.payload["lineage"]
+            if declared["kind"] == "direct":
+                return dict(_NO_LINEAGE)
+            parent = declared["record_id"]
+            for event in journal.entries():
+                # A declared parent is usable only when it is an authorized,
+                # completed search event inside the effective scope.
+                if scope is None or not authorize_event_header(scope, event):
+                    continue
+                artifact = event.get("artifact")
+                classification = event.get("classification")
+                if (
+                    type(artifact) is dict
+                    and artifact.get("schema") == SEARCH_RECORD_SCHEMA
+                    and artifact.get("record_id") == parent
+                    and type(classification) is dict
+                    and classification.get("outcome") == "completed"
+                ):
+                    return {"relation": "search", "record_id": parent, "lead_id": declared["lead_id"]}
+            raise CommitRefusal("declared search lineage does not resolve in scope")
         legacy_id = request.payload["record_id"]
         assert type(legacy_id) is str
         matches: list[dict[str, str]] = []
@@ -944,7 +1237,7 @@ class CommitRuntime:
             reservation_name, open_name = self._names(scope_id, attempt_id)
             template = {"ok": True, "outcome": "completed", "record_ids": ([request.payload["record_id"], record_id] if request.operation == "import.record" else [record_id]), "entry_ids": [envelope["entry_id"]], "usage": {"requests": 0, "bytes": source.byte_length, "cost": 0}}
             reservation = {"schema_version": _RESERVATION_SCHEMA, "scope_id": scope_id, "principal": principal, "capability": capability, "idempotency_key": request.idempotency_key, "request_hash": request_hash, "canonical_request": canonical, "attempt_id": attempt_id, "status": "open", "response": template}
-            marker = {"schema_version": _OPEN_SCHEMA, "scope_id": scope_id, "attempt_id": attempt_id, "request_hash": request_hash, "canonical_request": canonical, "operation": request.operation, "source": source.identity, "record_id": record_id, "record_body": body, "lineage": lineage, "access": access, "policy_id": request.policy_id, "producer": request.producer.to_dict(), "status": "open", "envelope": envelope}
+            marker = {"schema_version": _OPEN_SCHEMA, "scope_id": scope_id, "attempt_id": attempt_id, "request_hash": request_hash, "canonical_request": canonical, "operation": request.operation, "source": source.identity, "record_id": record_id, "record_body": body, "lineage": lineage, "access": access, "policy_id": request.policy_id, "producer": request.producer.to_dict(), "status": "open", "usage": dict(template["usage"]), "envelope": envelope}
             if pre_accept is not None:
                 pre_accept()
             self._write("commit3c1", "reservations", reservation_name, value=reservation)
@@ -974,6 +1267,103 @@ class CommitRuntime:
             self._complete_pair(reservation, reservation_name, marker, open_name)
             return make_commit_response(request.request_id, ok=True, outcome="completed", record_ids=template["record_ids"], entry_ids=template["entry_ids"], usage=template["usage"])
 
+    def _finalize_adapter(
+        self,
+        reservation: dict[str, Any],
+        reservation_name: str,
+        marker: dict[str, Any],
+        open_name: str,
+        request: CommitRequest,
+        **plan: Any,
+    ) -> dict[str, Any]:
+        """Publish one adapter outcome: plan, content, record, event, response."""
+
+        assert self.records is not None and self.journal is not None
+        template = self._adapter_plan_into(marker, **plan)
+        # The plan is durable before any content or record exists, so a crash
+        # here recovers to interrupted rather than orphaning either object.
+        self._write("commit3c1", "open", open_name, value=marker)
+        self._fault("after_plan")
+        content = plan.get("content", b"")
+        try:
+            if self._plan_requires_content(marker):
+                self.records.blob(content)
+                self._fault("after_content")
+            self._ensure_plan_record(marker)
+        except ImmutableConflict as error:
+            raise CommitCollision("immutable record conflicts") from error
+        except StoreError as error:
+            raise CommitUnavailable("durable record publication failed") from error
+        self._prepare_pair(reservation, reservation_name, marker, open_name)
+        self._fault("after_record")
+        self._verify_published_plan(marker)
+        try:
+            self.journal.append(marker["envelope"])
+        except JournalError as error:
+            raise CommitUnavailable("journal publication failed") from error
+        self._fault("after_journal")
+        self._complete_pair(reservation, reservation_name, marker, open_name)
+        return make_commit_response(request.request_id, ok=template["ok"], outcome=template["outcome"], record_ids=template["record_ids"], entry_ids=template["entry_ids"], usage=template["usage"])
+
+    def execute_adapter(
+        self,
+        request: CommitRequest,
+        route: RouteBinding,
+        *,
+        principal: str,
+        access: str,
+        adapter_host: AdapterHost,
+        scope: PrincipalScope | None = None,
+        pre_accept: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run exactly one allowlisted adapter and publish one durable outcome."""
+
+        if type(access) is not str or access not in {"public", "workspace", "restricted"}:
+            raise CommitRuntimeError("effective output access is invalid")
+        if request.operation not in ADAPTER_OPERATIONS or request.source is not None:
+            raise CommitRuntimeError("request is not an adapter operation")
+        with self._lock():
+            existing = self._read_pair(request, route, principal)
+            if existing is not None:
+                reservation, marker = existing
+                if reservation["status"] != "complete":
+                    raise CommitIntegrityError("incomplete commit requires recovery")
+                template = self._completed_binding(reservation, marker)
+                return make_commit_response(request.request_id, ok=template["ok"], outcome=template["outcome"], record_ids=template["record_ids"], entry_ids=template["entry_ids"], usage=template["usage"])
+            assert self.anchor is not None and self.records is not None and self.journal is not None
+            scope_id, attempt_id, request_hash, capability, canonical = self._pair(request, route, principal)
+            lineage = self._lineage(request, scope, self.journal)
+            reservation_name, open_name = self._names(scope_id, attempt_id)
+            marker = {"schema_version": _OPEN_SCHEMA, "scope_id": scope_id, "attempt_id": attempt_id, "request_hash": request_hash, "canonical_request": canonical, "operation": request.operation, "source": dict(_EMPTY_CONTENT), "record_id": "", "record_body": {}, "lineage": lineage, "access": access, "policy_id": request.policy_id, "producer": request.producer.to_dict(), "status": "open", "usage": {"requests": 0, "bytes": 0, "cost": 0}, "envelope": {}}
+            template = self._adapter_plan_into(marker, outcome="interrupted", reason="interrupted", retrieved_at=_now())
+            reservation = {"schema_version": _RESERVATION_SCHEMA, "scope_id": scope_id, "principal": principal, "capability": capability, "idempotency_key": request.idempotency_key, "request_hash": request_hash, "canonical_request": canonical, "attempt_id": attempt_id, "status": "open", "response": template}
+            if pre_accept is not None:
+                pre_accept()
+            self._write("commit3c1", "reservations", reservation_name, value=reservation)
+            self._fault("after_reservation")
+            self._write("commit3c1", "open", open_name, value=marker)
+            self._fault("after_open")
+            # One adapter call, no retry, no fallback, no caller-selected
+            # provider.  Every failure below is a durable outcome, never a 5xx.
+            try:
+                result = adapter_host.invoke(request.operation, dict(request.payload))
+            except AdapterUnavailable as error:
+                return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="degraded", reason="adapter_absent", retrieved_at=_now(), requests=error.requests)
+            except AdapterAbstained as error:
+                return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="refused", reason="provider_abstained", retrieved_at=_now(), requests=error.requests)
+            except AdapterHostError as error:
+                return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="failed", reason="provider_failed", retrieved_at=_now(), requests=error.requests)
+            self._fault("after_adapter")
+            try:
+                decision = scan_text(result.content, ADAPTER_MEDIA_TYPES[request.operation], request.operation)
+            except (PhiInputError, ValueError) as error:
+                raise CommitUnavailable("adapter content scanner is unavailable") from error
+            if decision == "suspected":
+                return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="refused", reason="provider_abstained", retrieved_at=result.retrieved_at, content=result.content, requests=result.requests, cost=result.cost, quarantine=True)
+            if decision != "clear":
+                raise CommitUnavailable("adapter content scanner is unavailable")
+            return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome=result.outcome, reason="none", retrieved_at=result.retrieved_at, content=result.content, leads=result.leads, requests=result.requests, cost=result.cost)
+
     def reconcile(self) -> list[dict[str, Any]]:
         """Finish only proved monotonic crash states; reject every other state."""
         assert self.anchor is not None and self.records is not None and self.journal is not None
@@ -996,7 +1386,10 @@ class CommitRuntime:
                     self._completed_binding(reservation, marker)
                     continue
                 if phase == "open":
-                    if self._source_is_published(marker):
+                    # An adapter plan is written only once its outcome is
+                    # final, so it publishes as-is unless it names content that
+                    # was never staged.  Recovery never re-invokes a provider.
+                    if self._source_is_published(marker) or (marker["operation"] in ADAPTER_OPERATIONS and not self._plan_requires_content(marker)):
                         self._ensure_plan_record(marker)
                     else:
                         if self.records.has(marker["record_id"]):
@@ -1023,4 +1416,15 @@ class CommitRuntime:
         return repaired
 
 
-__all__ = ["CommitCollision", "CommitIntegrityError", "CommitRuntime", "CommitRuntimeError", "CommitUnavailable", "ReplayProbe"]
+__all__ = [
+    "QUARANTINE_SCHEMA",
+    "SEARCH_RECORD_SCHEMA",
+    "URL_RECORD_SCHEMA",
+    "CommitCollision",
+    "CommitIntegrityError",
+    "CommitRefusal",
+    "CommitRuntime",
+    "CommitRuntimeError",
+    "CommitUnavailable",
+    "ReplayProbe",
+]

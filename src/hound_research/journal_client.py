@@ -7,6 +7,9 @@ test that permits only local Unix-domain socket transport.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -161,4 +164,130 @@ def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) 
         raise JournalClientError("houndd is unavailable") from error
 
 
-__all__ = ["JournalClientError", "exchange", "strict_response"]
+_RECORD_RESULT_REQUIRED = frozenset({"schema", "record_id", "body_base64", "byte_length"})
+_RECORD_RESULT_OPTIONAL = frozenset({"content_base64", "content_sha256", "content_byte_length"})
+_SHA256_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _non_negative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _base64_bytes(value: object) -> bytes | None:
+    """Decode a base64 payload field (unbounded length, unlike short `_text` ids)."""
+
+    if type(value) is not str or not value:
+        return None
+    try:
+        return base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _record_result(value: object) -> bool:
+    if type(value) is not dict:
+        return False
+    keys = set(value)
+    if keys - (_RECORD_RESULT_REQUIRED | _RECORD_RESULT_OPTIONAL) or _RECORD_RESULT_REQUIRED - keys:
+        return False
+    has_optional = bool(keys & _RECORD_RESULT_OPTIONAL)
+    if has_optional and _RECORD_RESULT_OPTIONAL - keys:
+        return False
+    if not _text(value["schema"]) or not _text(value["record_id"]) or not _non_negative_int(value["byte_length"]):
+        return False
+    body = _base64_bytes(value["body_base64"])
+    if body is None or len(body) != value["byte_length"]:
+        return False
+    if has_optional:
+        if not _non_negative_int(value["content_byte_length"]):
+            return False
+        content = _base64_bytes(value["content_base64"])
+        if content is None or len(content) != value["content_byte_length"]:
+            return False
+        digest = value["content_sha256"]
+        if type(digest) is not str or len(digest) != 64 or set(digest) - _SHA256_HEX_DIGITS:
+            return False
+        if hashlib.sha256(content).hexdigest() != digest:
+            return False
+    return True
+
+
+def record_strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
+    """Decode and semantically validate one complete record.get response."""
+
+    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite number")))
+    except (UnicodeError, ValueError) as error:
+        raise _invalid() from error
+    if type(value) is not dict or canonical_bytes(value) != raw:
+        raise _invalid()
+    if set(value) != {"wire_version", "status", "body"} or value["wire_version"] != WIRE_VERSION or type(value["status"]) is not int or value["status"] not in {200, 400, 404, 503}:
+        raise _invalid()
+    body = value["body"]
+    required = {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"}
+    optional = {"result", "cursor", "projection", "error"}
+    if type(body) is not dict or set(body) - required - optional or required - set(body):
+        raise _invalid()
+    if body["schema_version"] != RESPONSE_SCHEMA or body["request_id"] != request_id or type(body["ok"]) is not bool or not _text(body["outcome"]):
+        raise _invalid()
+    if type(body["record_ids"]) is not list or type(body["entry_ids"]) is not list or any(not _text(item) for item in body["record_ids"] + body["entry_ids"]):
+        raise _invalid()
+    usage = body["usage"]
+    if type(usage) is not dict or set(usage) != {"requests", "bytes", "cost"} or any(type(usage[key]) is not int or usage[key] < 0 for key in usage):
+        raise _invalid()
+    status = value["status"]
+    if status == 200:
+        if body["ok"] is not True or body["outcome"] != "completed" or "error" in body or "cursor" in body or "projection" in body:
+            raise _invalid()
+        result = body.get("result")
+        if type(result) is not list or len(result) != 1 or not _record_result(result[0]):
+            raise _invalid()
+    elif status == 400:
+        if body["ok"] is not False or body["outcome"] != "invalid" or "result" in body or "cursor" in body or "projection" in body or not _error(body.get("error"), retryable=False):
+            raise _invalid()
+    elif status == 404:
+        if body["ok"] is not False or body["outcome"] != "not_found" or body["record_ids"] or body["entry_ids"] or optional & set(body):
+            raise _invalid()
+    else:
+        if body["ok"] is not False or body["outcome"] != "unavailable" or "result" in body or "cursor" in body or "projection" in body or not _error(body.get("error"), retryable=True):
+            raise _invalid()
+    return value
+
+
+def record_exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) -> dict[str, Any]:
+    """Send one canonical record.get request, half-close, then require one response."""
+
+    if not socket_path.is_absolute():
+        raise JournalClientError("journal socket must be absolute")
+    request_id = request.get("body", {}).get("request_id") if type(request.get("body")) is dict else None
+    if not _text(request_id):
+        raise JournalClientError("journal request ID is invalid")
+    raw = canonical_bytes(request)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(timeout)
+            connection.connect(os.fspath(socket_path))
+            connection.sendall(len(raw).to_bytes(4, "big") + raw)
+            connection.shutdown(socket.SHUT_WR)
+            length = int.from_bytes(_read_exact(connection, 4), "big")
+            if not 0 < length <= MAX_FRAME_BYTES:
+                raise _invalid()
+            response = record_strict_response(_read_exact(connection, length), request_id=request_id)
+            if connection.recv(1):
+                raise _invalid()
+            return response
+    except JournalClientError:
+        raise
+    except OSError as error:
+        raise JournalClientError("houndd is unavailable") from error
+
+
+__all__ = ["JournalClientError", "exchange", "record_exchange", "record_strict_response", "strict_response"]

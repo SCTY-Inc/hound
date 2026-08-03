@@ -78,8 +78,8 @@ def _manifest_entry(digest: str) -> dict[str, str]:
     return {"sha256": digest, "media_type": "application/octet-stream", "encoding": "identity"}
 
 
-def test_routes_are_exact_and_only_two_slice_3c1_bindings_are_available() -> None:
-    assert {binding.operation for binding in AVAILABLE_ROUTE_BINDINGS} == {"ingest.file", "import.record"}
+def test_routes_are_exact_and_only_declared_bindings_are_available() -> None:
+    assert {binding.operation for binding in AVAILABLE_ROUTE_BINDINGS} == {"ingest.file", "import.record", "ingest.search", "ingest.url"}
     assert resolve_route("POST", "/v1/ingest/file").available is True
     assert resolve_route("POST", "/v1/import-record").available is True
     with pytest.raises(CommitContractError):

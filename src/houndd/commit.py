@@ -1,8 +1,8 @@
-"""Private Slice 3C1 commit boundary and SOURCE normalization primitives.
+"""Private Slice 3C1/3C2 commit boundary and SOURCE normalization primitives.
 
 This module deliberately contains models and bounded source I/O only.  It does
-not dispatch routes or create durable state; callers must perform those steps
-after authorization and the PHI gate.
+not dispatch routes, invoke adapters, or create durable state; callers must
+perform those steps after authorization and the applicable PHI gate.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from hound_research.evidence import EvidenceError, validate_public_url
+
 from .contracts import canonical_bytes, canonical_hash
 
 
@@ -27,6 +29,10 @@ MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_WIRE_BODY_BYTES = 1_048_576
 SUPPORTED_SOURCE_MEDIA_TYPE = "application/octet-stream"
 SUPPORTED_SOURCE_ENCODING = "identity"
+SOURCE_OPERATIONS = frozenset({"ingest.file", "import.record"})
+ADAPTER_OPERATIONS = frozenset({"ingest.search", "ingest.url"})
+MAX_QUERY_CHARS = 1_024
+MAX_LEAD_ID_CHARS = 128
 
 
 class CommitContractError(ValueError):
@@ -77,6 +83,26 @@ def _legacy_record_id(value: Any) -> str:
     return value
 
 
+def _bounded_text(value: Any, label: str, maximum: int) -> str:
+    value = _str(value, label)
+    if len(value) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise CommitContractError(f"{label} is invalid or too long")
+    return value
+
+
+def _bounded_int(value: Any, label: str, *, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise CommitContractError(f"{label} must be an integer from {minimum} through {maximum}")
+    return value
+
+
+def _public_url(value: Any) -> str:
+    try:
+        return validate_public_url(value, "ingest.url.url")
+    except EvidenceError as error:
+        raise CommitContractError("ingest.url url is not a public HTTP URL") from error
+
+
 def _strict(value: dict[str, Any], required: set[str], label: str, *, optional: set[str] = set()) -> None:
     keys = set(value)
     missing = required - keys
@@ -88,6 +114,40 @@ def _strict(value: dict[str, Any], required: set[str], label: str, *, optional: 
         if unknown:
             detail.append(f"unknown {sorted(unknown)!r}")
         raise CommitContractError(f"{label} has {' and '.join(detail)}")
+
+
+def _url_lineage(value: Any) -> dict[str, str]:
+    lineage = _dict(value, "ingest.url.lineage")
+    kind = lineage.get("kind")
+    if kind == "direct":
+        _strict(lineage, {"kind"}, "ingest.url direct lineage")
+        return {"kind": "direct"}
+    _strict(lineage, {"kind", "record_id", "lead_id"}, "ingest.url search lineage")
+    if type(kind) is not str or kind != "search":
+        raise CommitContractError("ingest.url lineage kind must be 'direct' or 'search'")
+    return {
+        "kind": "search",
+        "record_id": _sha256(lineage["record_id"], "ingest.url.lineage.record_id"),
+        "lead_id": _bounded_text(lineage["lead_id"], "ingest.url.lineage.lead_id", MAX_LEAD_ID_CHARS),
+    }
+
+
+def _adapter_payload(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one source-less adapter payload into its canonical identity."""
+
+    if operation == "ingest.search":
+        _strict(payload, {"query", "limit"}, "ingest.search payload")
+        return {
+            "query": _bounded_text(payload["query"], "ingest.search.query", MAX_QUERY_CHARS),
+            "limit": _bounded_int(payload["limit"], "ingest.search.limit", minimum=1, maximum=50),
+        }
+    if operation != "ingest.url":  # pragma: no cover - callers bind the allowlist
+        raise CommitContractError("operation is not an adapter operation")
+    _strict(payload, {"url", "lineage"}, "ingest.url payload", optional={"max_pages"})
+    normalized: dict[str, Any] = {"url": _public_url(payload["url"]), "lineage": _url_lineage(payload["lineage"])}
+    if "max_pages" in payload:
+        normalized["max_pages"] = _bounded_int(payload["max_pages"], "ingest.url.max_pages", minimum=2, maximum=20)
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +169,8 @@ class RouteBinding:
 
 
 ROUTE_BINDINGS: tuple[RouteBinding, ...] = (
-    RouteBinding("POST", "/v1/ingest/search", "ingest.search", "ingest.search", False),
-    RouteBinding("POST", "/v1/ingest/url", "ingest.url", "ingest.url", False),
+    RouteBinding("POST", "/v1/ingest/search", "ingest.search", "ingest.search", True),
+    RouteBinding("POST", "/v1/ingest/url", "ingest.url", "ingest.url", True),
     RouteBinding("POST", "/v1/ingest/file", "ingest.file", "ingest.file", True),
     RouteBinding("POST", "/v1/ingest/media", "ingest.media", "ingest.media", False),
     RouteBinding("POST", "/v1/transcribe", "transcribe", "transcribe", False),
@@ -425,17 +485,22 @@ class CommitRequest:
     policy_id: str
     operation: str
     payload: Mapping[str, Any]
-    source: SourceDeclaration
+    source: SourceDeclaration | None
 
     def __post_init__(self) -> None:
         if type(self.request_id) is not str or not self.request_id or type(self.idempotency_key) is not str or not self.idempotency_key:
             raise TypeError("commit request identifiers must be exact non-empty strings")
         if type(self.producer) is not Producer or type(self.requested_access) is not str or self.requested_access not in {"public", "workspace", "restricted"} or type(self.policy_id) is not str or not self.policy_id:
             raise TypeError("commit request fields are invalid")
-        if type(self.operation) is not str or self.operation != self.producer.capability or type(self.source) is not SourceDeclaration or type(self.payload) is not dict:
+        if type(self.operation) is not str or self.operation != self.producer.capability or type(self.payload) is not dict:
             raise TypeError("commit request operation fields are invalid")
         payload = self.payload
-        if self.operation == "ingest.file":
+        if self.operation in ADAPTER_OPERATIONS:
+            if self.source is not None or payload != _adapter_payload(self.operation, dict(payload)):
+                raise TypeError("adapter operation payload is invalid")
+        elif type(self.source) is not SourceDeclaration:
+            raise TypeError("commit request operation fields are invalid")
+        elif self.operation == "ingest.file":
             if set(payload) != {"source", "media_type"} or payload.get("source") is not self.source or type(payload.get("media_type")) is not str or payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE:
                 raise TypeError("ingest.file payload is invalid")
         elif self.operation == "import.record":
@@ -463,24 +528,30 @@ class CommitRequest:
         if type(operation["name"]) is not str or operation["name"] != route.operation or producer.capability != route.capability:
             raise CommitContractError("operation and producer capability do not match the bound route")
         payload = _dict(operation["payload"], "request.operation.payload")
-        if route.operation == "ingest.file":
+        source: SourceDeclaration | None = None
+        if route.operation in ADAPTER_OPERATIONS:
+            copied = _adapter_payload(route.operation, payload)
+        elif route.operation == "ingest.file":
             _strict(payload, {"source", "media_type"}, "ingest.file payload")
             if payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE or type(payload["media_type"]) is not str:
                 raise CommitContractError("ingest.file media_type is unsupported")
+            source = SourceDeclaration.from_value(payload["source"])
+            copied = dict(payload) | {"source": source}
         elif route.operation == "import.record":
             _strict(payload, {"record_id", "source"}, "import.record payload")
-            _legacy_record_id(payload["record_id"])
-        else:
-            raise CommitContractError("operation is unavailable in Slice 3C1")
-        source = SourceDeclaration.from_value(payload["source"])
-        copied = dict(payload)
-        copied["source"] = source
-        if route.operation == "import.record":
-            copied["record_id"] = _legacy_record_id(copied["record_id"])
+            source = SourceDeclaration.from_value(payload["source"])
+            copied = dict(payload) | {"source": source, "record_id": _legacy_record_id(payload["record_id"])}
+        else:  # pragma: no cover - the available bindings are exhaustive
+            raise CommitContractError("operation is unavailable")
         request = cls(request_id, key, producer, obj["requested_access"], policy_id, route.operation, copied, source)
         if len(canonical_bytes(request.to_wire_dict())) > MAX_WIRE_BODY_BYTES:
             raise CommitContractError("commit request body exceeds the encoded JSON limit")
         return request
+
+    def _payload_wire(self) -> dict[str, Any]:
+        if self.source is None:
+            return {key: dict(value) if type(value) is dict else value for key, value in self.payload.items()}
+        return {**self.payload, "source": self.source.to_wire()}
 
     def to_wire_dict(self) -> dict[str, Any]:
         return {
@@ -490,7 +561,7 @@ class CommitRequest:
             "producer": self.producer.to_dict(),
             "requested_access": self.requested_access,
             "policy_id": self.policy_id,
-            "operation": {"name": self.operation, "payload": {**self.payload, "source": self.source.to_wire()}},
+            "operation": {"name": self.operation, "payload": self._payload_wire()},
         }
 
     to_dict = to_wire_dict
@@ -499,13 +570,18 @@ class CommitRequest:
         route = _available_binding(route)
         if type(self) is not CommitRequest or self.operation != route.operation or self.producer.capability != route.capability:
             raise CommitContractError("request does not match the fixed route binding")
-        if normalized_source is None:
-            source_identity: dict[str, Any] = {"sha256": self.source.sha256, "byte_length": self.source.byte_length}
+        if self.source is None:
+            if normalized_source is not None:
+                raise CommitContractError("an adapter operation has no normalized source")
+            payload = self._payload_wire()
         else:
-            if type(normalized_source) is not NormalizedSource or normalized_source.identity != self.source.identity:
-                raise CommitContractError("normalized source does not match the request declaration")
-            source_identity = normalized_source.identity
-        payload = {**self.payload, "source": source_identity}
+            if normalized_source is None:
+                source_identity: dict[str, Any] = {"sha256": self.source.sha256, "byte_length": self.source.byte_length}
+            else:
+                if type(normalized_source) is not NormalizedSource or normalized_source.identity != self.source.identity:
+                    raise CommitContractError("normalized source does not match the request declaration")
+                source_identity = normalized_source.identity
+            payload = {**self.payload, "source": source_identity}
         return {
             "route": {"method": route.method, "path": route.path, "operation": route.operation, "capability": route.capability},
             "producer": self.producer.to_dict(),
@@ -661,11 +737,13 @@ validate_request = parse_commit_request
 
 
 __all__ = [
+    "ADAPTER_OPERATIONS",
     "AVAILABLE_ROUTE_BINDINGS",
     "COMMIT_REQUEST_SCHEMA",
     "COMMIT_RESPONSE_SCHEMA",
     "MAX_SOURCE_BYTES",
     "MAX_WIRE_BODY_BYTES",
+    "SOURCE_OPERATIONS",
     "SUPPORTED_SOURCE_ENCODING",
     "SUPPORTED_SOURCE_MEDIA_TYPE",
     "CommitContractError",

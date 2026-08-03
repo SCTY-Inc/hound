@@ -743,6 +743,97 @@ refuses the source by the fixed rules above.
 This section freezes the Slice 3C contract only. It makes no HSP completion
 claim and does not alter the keyless pure-read contract above.
 
+### Slice 3C2 adapter operations
+
+Slice 3C2 makes exactly two more reserved bindings available: `POST
+/v1/ingest/search` and `POST /v1/ingest/url`; `ingest.media`, `transcribe`, and
+every other reserved binding stay unavailable. These operations declare no
+`SOURCE`, so their canonical identity is the existing one minus source
+normalization: route, `producer`, `requested_access`, policy ID, and operation
+name plus normalized payload. Their strict payloads are exactly
+`ingest.search`: `{ "query": "...", "limit": 1..50 }`,
+`query` being a bounded control-character-free 1..1024-character string; and
+`ingest.url`: `{ "url": "...", "lineage": { "kind": "direct" } }` or
+`{ "url": "...", "lineage": { "kind": "search", "record_id": "...",
+"lead_id": "..." } }`, with optional `max_pages` bounded to 2..20. The URL uses
+the existing public-URL validator; `record_id` is a lowercase SHA-256 and
+`lead_id` is bounded declared metadata.
+
+The daemon owns one adapter allowlist binding `ingest.search` to `exa` and
+`ingest.url` to `firecrawl`. Credentials come from one environment frozen at
+service startup holding only `EXA_API_KEY`, `FIRECRAWL_API_KEY`, and
+`FIRECRAWL_ENDPOINT`; no request path re-reads the process environment. An
+accepted attempt invokes exactly one adapter exactly once: no retry, fallback,
+escalation, or caller-selected provider. An unbound adapter is durable
+`degraded`, abstention is durable `refused`, and a rate limit, timeout,
+truncation, or invalid provider result is durable `failed`—each with the
+durable non-completed status mapping above, never a `5xx` and never a retry.
+
+Commit ordering is the seven-step future-adapter ordering above. The lock-held,
+fsynced reservation/open pair carries an `interrupted` placeholder plan whose
+reservation response is never returned; only then is the one adapter invoked.
+It then scans the returned content, writes the final plan into the marker,
+stages the content blob create-only, publishes the outcome record, appends one
+journal event, and persists the completed response. Recovery NEVER re-invokes
+an adapter: a plan naming unstaged content becomes exactly one `interrupted`
+record and event. Post-acceptance scanner unavailability is a `503` whose open
+attempt recovers as `interrupted`.
+
+The Slice 3C2 PHI gate is post-acceptance and scans the exact bytes about to be
+staged. Its boundary is `houndd.phi-text-scan.v1`: `scan_text(data: bytes,
+media_type: str, operation: str) -> clear | suspected | error`, where
+`media_type` is exactly `application/json` (search) or `text/markdown` (url)
+and `operation` is exactly `ingest.search` or `ingest.url`. The scan is local,
+deterministic, and bounded, with no network, model, browser, or external
+process. It case-folds the decoded UTF-8 text and matches exactly two pinned
+patterns: US SSN `\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b` and MRN
+`\b(?:mrn|medical record number)\b[ \t:#=-]{0,4}[a-z0-9][a-z0-9-]{2,63}\b`.
+A `clear` result certifies only that these two exact patterns did not match; it
+is not a claim that all PHI was detected. Undecodable or oversize data is
+`error`. A `suspected` result NEVER persists the raw bytes: it publishes the
+bounded non-PHI quarantine record `houndd.quarantine-record.v1`, whose
+`quarantine` object holds exactly `content_sha256`, `byte_length`, `reason`
+(`phi_suspected`), and `access`, with canonical no-lineage and one journal
+event, both classified `refused`.
+
+The operation records are strict canonical JSON with no unknown fields:
+`houndd.search-record.v1` has exactly `schema_version`, `attempt_id`,
+`request_hash`, `operation`, `outcome`, `evidence_status`, `reason`, `provider`
+(`exa`), `retrieved_at`, `query`, `limit`, `leads`, `content_sha256`,
+`byte_length`, and `lineage`; each lead has exactly `url`, `title`, and
+`native_id`. `houndd.url-record.v1` is the same with `url` replacing
+`query`/`limit`/`leads` and provider `firecrawl`. `reason` is exactly one of
+`none`, `provider_failed`, `provider_abstained`, `adapter_absent`, or
+`interrupted`, and is `none` only for a staged outcome. `content_sha256` and
+`byte_length` name the staged content blob for `completed`/`partial` and are
+exactly `"none"`/`0` otherwise. Each record ID is the SHA-256 of its canonical
+record bytes; staged content is a separate blob referenced by hash. Journal
+artifact kinds are `search` and `extract`, kept by the quarantine record with
+its own schema. Journal `source` is `{"provider":"exa"|"firecrawl",
+"native_id":"<outcome record id>","canonical_url":"none"}`, except that a
+`houndd.url-record.v1` event carries the fetched URL as `canonical_url`. Its
+`dedupe.object_key` is `<kind>:<content-sha256>` when staged (with that digest
+as `content_sha256`), `<kind>-outcome:<record-id>` otherwise, and
+`quarantine:<record-id>` when quarantined (record ID as `content_sha256`).
+
+`ingest.search` always uses canonical no-lineage. `ingest.url` derives one
+canonical lineage from its declared payload lineage: `direct` becomes canonical
+no-lineage, and `search` becomes `{"relation":"search","record_id":"<declared
+record id>","lead_id":"<declared lead id>"}` only after the daemon selects an
+authorized existing completed `houndd.search-record.v1` journal event with that
+exact record ID inside the effective scope. An unresolved reference refuses
+closed as logical `400` with no durable attempt; `lead_id` stays declared
+metadata, unchecked against the parent record's leads. `usage.requests` is the
+provider round-trip count the adapter exchange reports, `usage.bytes` is the
+staged content byte length (`0` when nothing is staged), and `usage.cost` is
+`0` unless the adapter reports one.
+
+Explicitly deferred from Slice 3C2: `ingest.media`, transcription, browser and
+media transport, provider or model selection, adapter retry or fallback,
+provider cost beyond zero, raw provider HTTP exchange bytes, telemetry,
+migration, and cutover or no-bypass claims. Evidence names Slice 3C2 only, adds
+no HSP row, and claims nothing about any other reserved binding.
+
 The portable defaults are `$XDG_RUNTIME_DIR/hound/houndd.sock` for the socket
 and `${XDG_STATE_HOME:-$HOME/.local/state}/hound/discovery` for state. The
 service fails closed when `XDG_RUNTIME_DIR` is missing or relative unless an
@@ -785,6 +876,55 @@ failures are logical `503` / CLI 5. Authorization denial or an absent protected
 target is always logical `404` / CLI 3. Exit 4 is reserved for durable
 failed/partial/degraded/refused/interrupted operations and is unused by Slice
 3B.
+
+### Slice 3D authorized read routes
+
+Slice 3D adds exactly two more pure reads on the existing read boundary:
+`GET /v1/journal/entry` with `operation.name` and `producer.capability` both
+exactly `journal.get`, and `GET /v1/record` with both exactly `record.get`.
+They use the existing `houndd.read-request.v1` / `houndd.read-response.v1`
+envelopes, statuses, wire, and forbidden `idempotency_key`; they are keyless,
+cursorless, viewless, and never repair. Both operation names are accepted only
+from the read parser's exact allowlist, and both payloads reject unknown
+fields. The `journal.get` payload is exactly `{"entry_id": <str>}`. The
+`record.get` payload is exactly `{"record_id": <str>}` plus optional
+`{"include_content": <bool>}`, defaulting to `false`.
+
+A `journal.get` result is the single canonical journal event envelope in a
+one-element `result`, with `entry_ids` its entry ID and `record_ids` its
+artifact record ID. Its authorization is identical to `journal.query`: exactly
+one policy rule selected by exact `policy_id`, readable tiers intersected with
+the `requested_access` ceiling, and the event authorized from only its access
+tier, policy partition, and producer selector.
+
+A record is readable only when at least one authorized event under that same
+effective scope publishes it: `artifact.record_id` names it, or a completed
+import's exact `legacy:<record id>` dedupe object key names the preserved raw
+legacy object. The `record.get` result is a one-element array containing
+exactly `schema` (the artifact schema, or `raw` for a legacy object),
+`record_id`, `body_base64`, and `byte_length`. When `include_content` is true
+and the authorizing event stages a blob distinct from the record object
+itself, exactly `content_base64`, `content_sha256`, and `content_byte_length`
+are appended to that same object; otherwise they are absent. A completed
+import stages no such blob, because those bytes are the separately readable
+legacy object. Present `record_ids` is the returned record; `entry_ids` is
+empty, because a record result is not a journal event. Base64 is RFC 4648
+standard alphabet with padding over the exact stored bytes, which are never
+rewritten, re-encoded, or truncated.
+
+Authorization precedes every entry, record, blob, and metadata lookup. An
+unauthorized scope and an absent entry or record return the same generic
+logical `404` with empty IDs and no result, error, hint, or metadata, so
+neither existence nor nonexistence is disclosed. Unknown fields, invalid
+payload values, and a present `idempotency_key` are logical `400`. When the
+encoded response would exceed the fixed wire bound, `record.get` fails logical
+`400` with policy-safe code `content_too_large` and returns no partial,
+truncated, or re-encoded content. Policy, integrity, verification, and store
+failures remain logical `503`.
+
+Explicitly deferred from Slice 3D: the verify/rebuild API, streaming or ranged
+content, and every event-by-record or record-by-event lookup family. Evidence
+names Slice 3D only and adds no HSP row or completion claim.
 
 ## Immutable records and journal
 

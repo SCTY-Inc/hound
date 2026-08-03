@@ -411,13 +411,18 @@ class DurableJournalQueryAdapter:
         with ServiceIdentity.lease(self._service_identity) as leased_state:
             state = _trusted_identity_state(leased_state)
             snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
-            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
-                return EMPTY_QUERY_PAGE
             provenance = ProvenanceProjection()
             codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
             if trusted_request.cursor is None:
+                if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
+                    return EMPTY_QUERY_PAGE
                 context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
             else:
+                # A supplied cursor is authenticated/recovered before any
+                # empty-visible-scope short-circuit: an authorized principal
+                # whose scope currently sees zero events must still reject a
+                # forged, foreign-principal, tampered, or stale-generation
+                # cursor rather than silently returning completed-empty.
                 context = self._resume_context(
                     trusted_request,
                     trusted_scope,
@@ -461,13 +466,15 @@ class DurableJournalQueryAdapter:
         with ServiceIdentity.lease(self._service_identity) as leased_state:
             state = _trusted_identity_state(leased_state)
             snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
-            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
-                return EMPTY_QUERY_PAGE if fits(EMPTY_QUERY_PAGE) else None
             provenance = ProvenanceProjection()
             codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
             if trusted_request.cursor is None:
+                if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
+                    return EMPTY_QUERY_PAGE if fits(EMPTY_QUERY_PAGE) else None
                 context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
             else:
+                # See execute(): a supplied cursor is authenticated/recovered
+                # before any empty-visible-scope short-circuit.
                 context = self._resume_context(trusted_request, trusted_scope, snapshot, provenance, codec, state)
 
             def page(limit: int) -> QueryPage:
@@ -529,24 +536,27 @@ class DurableJournalQueryAdapter:
             snapshot = build_journal_query_snapshot(Journal.verified_snapshot(self._journal))
             provenance = ProvenanceProjection()
             codec = CursorCodec(state.keyring, nonce_source=self._nonce_source)
-            # Header authorization deliberately precedes *all* HWM, cursor,
-            # or projection work.  A valid scope with no visible events gets a
-            # nonrevealing empty-anchor commitment only after this short path.
-            if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
-                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
-                commitment = codec.intake_high_watermark_commitment(
-                    CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash),
-                    None,
-                )
-                empty = EMPTY_QUERY_PAGE
-                return (empty, commitment) if fits(empty, commitment) else None
-            if trusted_request.cursor is None:
-                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
-                high_watermark = snapshot.head
-            else:
+            if trusted_request.cursor is not None:
+                # A supplied cursor is authenticated/recovered before any
+                # empty-visible-scope short-circuit: see execute().
                 context = self._resume_context(trusted_request, trusted_scope, snapshot, provenance, codec, state)
                 bindings = CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash)
                 high_watermark = codec.recover(trusted_request.cursor, bindings, snapshot.cursor_recovery_snapshot).high_watermark
+            else:
+                # Header authorization deliberately precedes *all* HWM or
+                # projection work for a cursorless request.  A valid scope
+                # with no visible events gets a nonrevealing empty-anchor
+                # commitment only after this short path.
+                if not any(authorize_event_header(trusted_scope, event) for event in snapshot.events):
+                    context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
+                    commitment = codec.intake_high_watermark_commitment(
+                        CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash),
+                        None,
+                    )
+                    empty = EMPTY_QUERY_PAGE
+                    return (empty, commitment) if fits(empty, commitment) else None
+                context = QueryContext.from_projection(state.generation, trusted_scope, snapshot, provenance)
+                high_watermark = snapshot.head
             bindings = CursorBindings(state.generation, trusted_request.filter_hash, trusted_scope.principal.subject, context.access_scoped_context_hash)
             commitment = codec.intake_high_watermark_commitment(bindings, high_watermark, cursor=trusted_request.cursor)
 

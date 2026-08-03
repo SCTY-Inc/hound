@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from pathlib import Path
@@ -438,7 +439,19 @@ class Projection:
                 if not records.verify_record(record_id, event["artifact"]["hash"]):
                     raise ProjectionError(f"record {record_id} failed before projection")
                 content_sha256 = event["dedupe"]["content_sha256"]
-                blob = records.blobs.get(content_sha256)
+                object_key = event["dedupe"]["object_key"]
+                # Only a completed outcome commits dereferenceable content: a
+                # completed import preserves exact bytes under its legacy
+                # record ID, every other completed artifact stages a blob, and
+                # non-completed outcomes carry a commitment with no object.
+                blob_length: int | None = None
+                if event["classification"]["outcome"] == "completed":
+                    if object_key.startswith("legacy:"):
+                        legacy_body = records.read(object_key[len("legacy:"):])
+                        if hashlib.sha256(legacy_body).hexdigest() != content_sha256:
+                            raise ProjectionError(f"legacy content {object_key} does not match its digest")
+                    else:
+                        blob_length = len(records.blobs.get(content_sha256))
                 producer = event["producer"]
                 source = event["source"]
                 classification = event["classification"]
@@ -463,10 +476,11 @@ class Projection:
                         source["canonical_url"],
                     ),
                 )
-                connection.execute(
-                    "INSERT OR IGNORE INTO blobs VALUES (?, ?)",
-                    (content_sha256, len(blob)),
-                )
+                if blob_length is not None:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO blobs VALUES (?, ?)",
+                        (content_sha256, blob_length),
+                    )
             connection.commit()
             directory_before_publish = anchor.stat()
             if not self._same_directory_generation(directory_before_build, directory_before_publish):

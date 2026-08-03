@@ -217,17 +217,11 @@ class RecordStore:
         path = self.record_path(record_id)
         with self.anchor.operation():
             _create_or_confirm(self.anchor, "records", f"{record_id}.bin", data=data)
-            manifest = self.legacy / f"{record_id}.json"
             _create_or_confirm(self.anchor, "legacy", f"{record_id}.json", data=canonical_bytes({
                 "record_id": record_id,
                 "sha256": digest,
                 "byte_length": len(data),
             }))
-        manifest_body = {
-            "record_id": record_id,
-            "sha256": digest,
-            "byte_length": len(data),
-        }
         return RecordRef(record_id, digest, len(data), path, legacy=True)
 
     def read(self, record_id: str) -> bytes:

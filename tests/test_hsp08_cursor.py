@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from houndd.access import AuthenticatedPrincipal, EventSelector, PrincipalScope, ProducerSelector
+from houndd.contracts import make_journal_envelope
 from houndd.cursor import (
     CursorBindings,
     CursorCodec,
@@ -15,6 +17,11 @@ from houndd.cursor import (
     CursorRejected,
     JournalCursorCandidate,
 )
+from houndd.journal import Journal
+from houndd.query_contracts import QueryRequest, parse_query_filter
+from houndd.query_engine import EMPTY_QUERY_PAGE
+from houndd.service_identity import ServiceIdentity
+from houndd.snapshot import DurableJournalQueryAdapter
 
 
 def _digest(label: str) -> str:
@@ -530,6 +537,91 @@ def test_hsp08_nonce_source_must_return_exactly_16_bytes(
 def test_hsp08_candidate_contract_is_strict(kwargs) -> None:
     with pytest.raises(ValueError):
         JournalCursorCandidate(**kwargs)
+
+
+def _journal_event(sequence: int, *, when: str) -> dict[str, object]:
+    return make_journal_envelope(
+        sequence=sequence,
+        appended_at=when,
+        producer={"owner_id": "owner", "capability": "capture", "run_id": f"run-{sequence}"},
+        artifact={
+            "kind": "capture",
+            "schema": "houndd.capture.v1",
+            "record_id": f"record-{sequence}",
+            "hash": _digest(f"record-{sequence}"),
+            "authorized_uri": f"houndd://records/{sequence}",
+        },
+        lineage={"relation": "none", "record_id": f"lineage-{sequence}", "lead_id": "none"},
+        source={"provider": "provider", "native_id": f"native-{sequence}", "canonical_url": f"https://example.test/{sequence}"},
+        classification={"outcome": "completed", "evidence_status": "evidence"},
+        access="public",
+        policy_id="policy",
+        dedupe={"object_key": f"object-{sequence}", "content_sha256": _digest(f"content-{sequence}")},
+        usage={},
+    )
+
+
+def _authorized_scope(subject: str = "peer:reader") -> PrincipalScope:
+    return PrincipalScope(
+        AuthenticatedPrincipal(subject),
+        frozenset({"public"}),
+        (EventSelector("policy", ProducerSelector(owner_id="owner", capability="capture"), frozenset({"public"})),),
+    )
+
+
+def _empty_visible_scope(subject: str = "peer:reader") -> PrincipalScope:
+    """An authenticated principal whose current selectors authorize zero events."""
+    return PrincipalScope(AuthenticatedPrincipal(subject), frozenset({"public"}), ())
+
+
+def test_hsp08_execute_rejects_a_forged_cursor_even_when_the_authorized_scope_is_currently_empty(
+    tmp_path,
+) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_journal_event(0, when="2026-07-31T00:00:00Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+    request = QueryRequest(parse_query_filter({}), limit=1, cursor="not-a-real-cursor-token")
+
+    with pytest.raises(CursorRejected, match="cursor rejected"):
+        adapter.execute(request, _empty_visible_scope())
+
+    identity.close()
+    journal.close()
+
+
+def test_hsp08_execute_rejects_a_stale_generation_cursor_replayed_after_restart_against_an_empty_scope(
+    tmp_path,
+) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_journal_event(0, when="2026-07-31T00:00:00Z"))
+    journal.append(_journal_event(1, when="2026-07-31T00:00:01Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+    issued = adapter.execute(QueryRequest(parse_query_filter({}), limit=1), _authorized_scope())
+    assert issued.next_cursor is not None
+
+    identity.roll_generation()
+    request = QueryRequest(parse_query_filter({}), limit=1, cursor=issued.next_cursor)
+
+    with pytest.raises(CursorRejected, match="cursor rejected"):
+        adapter.execute(request, _empty_visible_scope())
+
+    identity.close()
+    journal.close()
+
+
+def test_hsp08_execute_cursorless_empty_scope_still_returns_completed_empty(tmp_path) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_journal_event(0, when="2026-07-31T00:00:00Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+
+    result = adapter.execute(QueryRequest(parse_query_filter({}), limit=1), _empty_visible_scope())
+
+    assert result is EMPTY_QUERY_PAGE
+    identity.close()
+    journal.close()
 
 
 def test_hsp08_candidate_rejects_scalar_subclasses() -> None:

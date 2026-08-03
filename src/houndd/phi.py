@@ -1,10 +1,11 @@
-"""Frozen, local, exact-digest PHI-clear certification for Slice 3C1."""
+"""Local PHI gates: 3C1 exact-digest certification and the 3C2 text scan."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,9 +262,43 @@ def scan_phi(data: bytes, media_type: str, encoding: str, operation: str, manife
     return PhiScanner(manifest).scan(data, media_type, encoding, operation)
 
 
+PHI_TEXT_SCAN_SCHEMA = "houndd.phi-text-scan.v1"
+PHI_TEXT_MEDIA_TYPES = frozenset({"application/json", "text/markdown"})
+PHI_TEXT_OPERATIONS = frozenset({"ingest.search", "ingest.url"})
+# The two patterns pinned by the Slice 3C2 amendment.  They are matched against
+# the case-folded text of the exact bytes the daemon is about to stage.
+_US_SSN = re.compile(r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b")
+_MRN = re.compile(r"\b(?:mrn|medical record number)\b[ \t:#=-]{0,4}[a-z0-9][a-z0-9-]{2,63}\b")
+
+
+def scan_text(data: bytes, media_type: str, operation: str) -> str:
+    """Scan adapter-returned text locally and deterministically.
+
+    A ``clear`` result certifies only that these two exact patterns did not
+    match; it is not a claim that all PHI was detected.
+    """
+
+    if type(data) is not bytes or type(media_type) is not str or type(operation) is not str:
+        raise PhiInputError("text scanner inputs have invalid runtime types")
+    if media_type not in PHI_TEXT_MEDIA_TYPES or operation not in PHI_TEXT_OPERATIONS:
+        raise PhiInputError("text scanner representation is unsupported")
+    if len(data) > MAX_SOURCE_BYTES:
+        return "error"
+    try:
+        text = data.decode("utf-8").casefold()
+    except UnicodeError:
+        return "error"
+    if _US_SSN.search(text) is not None or _MRN.search(text) is not None:
+        return "suspected"
+    return "clear"
+
+
 __all__ = [
     "PHI_MANIFEST_FILENAME",
     "PHI_MANIFEST_SCHEMA",
+    "PHI_TEXT_MEDIA_TYPES",
+    "PHI_TEXT_OPERATIONS",
+    "PHI_TEXT_SCAN_SCHEMA",
     "PhiClearEntry",
     "PhiClearManifest",
     "PhiInputError",
@@ -274,4 +309,5 @@ __all__ = [
     "load_phi_manifest",
     "phi_manifest_path",
     "scan_phi",
+    "scan_text",
 ]

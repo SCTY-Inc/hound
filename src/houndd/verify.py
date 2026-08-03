@@ -17,6 +17,84 @@ from .transactions import TransactionCoordinator
 
 
 _RECORD_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_OUTCOME_SCHEMAS = frozenset({"houndd.import-outcome.v1", "houndd.file-record.v1", "houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
+_ADAPTER_SCHEMAS = frozenset({"houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
+_ADAPTER_BINDINGS = {"ingest.search": ("search", "houndd.search-record.v1", "exa"), "ingest.url": ("extract", "houndd.url-record.v1", "firecrawl")}
+_ADAPTER_EVIDENCE = {"completed": "clear", "partial": "partial", "failed": "failure", "degraded": "degraded", "refused": "refused", "interrupted": "interrupted"}
+
+
+def _verify_adapter_outcome(records: RecordStore, event: dict[str, Any], record: Any, schema: str, record_id: str, dedupe: Any, referenced_blobs: set[str]) -> None:
+    """Bind one Slice 3C2 outcome record to its exact journal event."""
+
+    if type(record) is not dict or record.get("schema_version") != schema:
+        raise ValueError("adapter outcome record is malformed")
+    operation = record.get("operation")
+    if operation not in _ADAPTER_BINDINGS:
+        raise ValueError("adapter outcome record names an unsupported operation")
+    kind, operation_schema, provider = _ADAPTER_BINDINGS[operation]
+    outcome = record.get("outcome")
+    evidence = _ADAPTER_EVIDENCE.get(outcome)
+    lineage = record.get("lineage")
+    usage = event.get("usage")
+    if (
+        (schema != "houndd.quarantine-record.v1" and schema != operation_schema)
+        or evidence is None
+        or record.get("evidence_status") != evidence
+        or type(lineage) is not dict
+        or set(lineage) != {"relation", "record_id", "lead_id"}
+        or any(type(item) is not str for item in lineage.values())
+        or event.get("lineage") != lineage
+        or event.get("classification") != {"outcome": outcome, "evidence_status": evidence}
+        or event.get("artifact") != {"kind": kind, "schema": schema, "record_id": record_id, "hash": record_id, "authorized_uri": f"houndd://record/{record_id}"}
+        or type(usage) is not dict
+        or set(usage) != {"requests", "bytes", "cost"}
+    ):
+        raise ValueError("adapter outcome does not bind the journal event")
+    if schema == "houndd.quarantine-record.v1":
+        quarantine = record.get("quarantine")
+        if (
+            set(record) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "quarantine", "lineage"}
+            or outcome != "refused"
+            or type(quarantine) is not dict
+            or set(quarantine) != {"content_sha256", "byte_length", "reason", "access"}
+            or quarantine.get("reason") != "phi_suspected"
+            or quarantine.get("access") != event.get("access")
+            or type(quarantine.get("byte_length")) is not int
+            or dedupe != {"object_key": f"quarantine:{record_id}", "content_sha256": record_id}
+            or event.get("source") != {"provider": provider, "native_id": record_id, "canonical_url": "none"}
+            or usage["bytes"] != 0
+        ):
+            raise ValueError("quarantine outcome does not bind the journal event")
+        return
+    staged = outcome in {"completed", "partial"}
+    digest = record.get("content_sha256")
+    length = record.get("byte_length")
+    fields = {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "reason", "provider", "retrieved_at", "content_sha256", "byte_length", "lineage"}
+    fields |= {"query", "limit", "leads"} if operation == "ingest.search" else {"url"}
+    if (
+        set(record) != fields
+        or record.get("provider") != provider
+        or (record.get("reason") == "none") is not staged
+        or event.get("source") != {"provider": provider, "native_id": record_id, "canonical_url": record["url"] if operation == "ingest.url" else "none"}
+    ):
+        raise ValueError("adapter outcome does not bind the journal event")
+    if not staged:
+        if digest != "none" or length != 0 or usage["bytes"] != 0 or dedupe != {"object_key": f"{kind}-outcome:{record_id}", "content_sha256": record_id}:
+            raise ValueError("unstaged adapter outcome claims content")
+        return
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or type(length) is not int
+        or length <= 0
+        or usage["bytes"] != length
+        or dedupe != {"object_key": f"{kind}:{digest}", "content_sha256": digest}
+    ):
+        raise ValueError("staged adapter outcome does not bind its content")
+    if len(records.blobs.get(digest)) != length:
+        raise ValueError("adapter content blob length does not bind its record")
+    referenced_blobs.add(digest)
 
 
 def _safe_record_id(value: object) -> bool:
@@ -188,11 +266,11 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                         record = None
                     if (
                         type(record) is dict
-                        and record.get("schema_version") in {"houndd.import-outcome.v1", "houndd.file-record.v1"}
+                        and record.get("schema_version") in _OUTCOME_SCHEMAS
                         and schema != record["schema_version"]
                     ):
                         raise ValueError("outcome record schema does not bind the journal event")
-                    if schema in {"houndd.import-outcome.v1", "houndd.file-record.v1"}:
+                    if schema in _OUTCOME_SCHEMAS:
                         outcome_event_counts[record_id] = outcome_event_counts.get(record_id, 0) + 1
                     if schema == "houndd.import-outcome.v1":
                         outcome = record
@@ -308,6 +386,8 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                                 raise ValueError("interrupted file outcome evidence is invalid")
                         else:
                             raise ValueError("file outcome is unsupported")
+                    elif schema in _ADAPTER_SCHEMAS:
+                        _verify_adapter_outcome(records, event, record, schema, record_id, dedupe, referenced_blobs)
                     else:
                         referenced_blobs.add(digest)
                         blob = records.blobs.get(digest)

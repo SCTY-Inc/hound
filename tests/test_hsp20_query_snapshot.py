@@ -15,6 +15,7 @@ from houndd import (
     CursorRecoverySnapshot,
     CursorRejected,
     EventSelector,
+    Journal,
     JournalCursorCandidate,
     PrincipalScope,
     ProducerSelector,
@@ -25,7 +26,9 @@ from houndd import (
     parse_query_filter,
 )
 from houndd.provenance import LaneRule, ProvenanceProjection
-from houndd.query_engine import JournalQueryEngine, JournalQuerySnapshot, QueryContext, QueryContextError, QuerySnapshotError
+from houndd.query_engine import EMPTY_QUERY_PAGE, JournalQueryEngine, JournalQuerySnapshot, QueryContext, QueryContextError, QuerySnapshotError
+from houndd.service_identity import ServiceIdentity
+from houndd.snapshot import DurableJournalQueryAdapter
 
 
 def _digest(value: str) -> str:
@@ -236,6 +239,100 @@ def test_hsp20_authorized_provenance_change_inside_cursor_hwm_invalidates_resume
     for context in (original_context, changed_context, arbitrary_context):
         with pytest.raises(CursorRejected):
             _page(snapshot, scope, changed, context, codec, cursor=first.next_cursor)
+
+
+def _ledger_event(sequence: int, *, when: str) -> dict[str, object]:
+    return make_journal_envelope(
+        sequence=sequence,
+        appended_at=when,
+        producer={"owner_id": "owner", "capability": "capture", "run_id": f"run-{sequence}"},
+        artifact={
+            "kind": "capture",
+            "schema": "houndd.capture.v1",
+            "record_id": f"record-{sequence}",
+            "hash": _digest(f"record-{sequence}"),
+            "authorized_uri": f"houndd://records/{sequence}",
+        },
+        lineage={"relation": "none", "record_id": f"lineage-{sequence}", "lead_id": "none"},
+        source={"provider": "provider", "native_id": f"native-{sequence}", "canonical_url": f"https://example.test/{sequence}"},
+        classification={"outcome": "completed", "evidence_status": "evidence"},
+        access="public",
+        policy_id="policy",
+        dedupe={"object_key": f"object-{sequence}", "content_sha256": _digest(f"content-{sequence}")},
+        usage={},
+    )
+
+
+def _ledger_authorized_scope(subject: str = "peer:reader") -> PrincipalScope:
+    return PrincipalScope(
+        AuthenticatedPrincipal(subject),
+        frozenset({"public"}),
+        (EventSelector("policy", ProducerSelector(owner_id="owner", capability="capture"), frozenset({"public"})),),
+    )
+
+
+def _ledger_empty_visible_scope(subject: str = "peer:reader") -> PrincipalScope:
+    """An authenticated principal whose current selectors authorize zero events."""
+    return PrincipalScope(AuthenticatedPrincipal(subject), frozenset({"public"}), ())
+
+
+def test_hsp20_execute_ledger_bounded_rejects_a_forged_cursor_even_when_the_authorized_scope_is_currently_empty(
+    tmp_path,
+) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_ledger_event(0, when="2026-07-31T00:00:00Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+    request = QueryRequest(parse_query_filter({}), limit=1, cursor="not-a-real-cursor-token", view="intake-ledger.v1")
+
+    with pytest.raises(CursorRejected, match="cursor rejected"):
+        adapter.execute_ledger_bounded(request, _ledger_empty_visible_scope(), lambda _page, _hwm: True)
+
+    identity.close()
+    journal.close()
+
+
+def test_hsp20_execute_ledger_bounded_rejects_a_stale_generation_cursor_replayed_after_restart_against_an_empty_scope(
+    tmp_path,
+) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_ledger_event(0, when="2026-07-31T00:00:00Z"))
+    journal.append(_ledger_event(1, when="2026-07-31T00:00:01Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+    request = QueryRequest(parse_query_filter({}), limit=1, view="intake-ledger.v1")
+    issued = adapter.execute_ledger_bounded(request, _ledger_authorized_scope(), lambda _page, _hwm: True)
+    assert issued is not None
+    issued_page, _issued_hwm = issued
+    assert issued_page.next_cursor is not None
+
+    identity.roll_generation()
+    resumed_request = QueryRequest(
+        parse_query_filter({}), limit=1, cursor=issued_page.next_cursor, view="intake-ledger.v1"
+    )
+
+    with pytest.raises(CursorRejected, match="cursor rejected"):
+        adapter.execute_ledger_bounded(resumed_request, _ledger_empty_visible_scope(), lambda _page, _hwm: True)
+
+    identity.close()
+    journal.close()
+
+
+def test_hsp20_execute_ledger_bounded_cursorless_empty_scope_still_returns_completed_empty(tmp_path) -> None:
+    journal = Journal(tmp_path / "store")
+    journal.append(_ledger_event(0, when="2026-07-31T00:00:00Z"))
+    identity = ServiceIdentity(tmp_path / "store", create=True)
+    adapter = DurableJournalQueryAdapter(journal, identity, nonce_source=lambda size: b"N" * size)
+    request = QueryRequest(parse_query_filter({}), limit=1, view="intake-ledger.v1")
+
+    result = adapter.execute_ledger_bounded(request, _ledger_empty_visible_scope(), lambda _page, _hwm: True)
+
+    assert result is not None
+    page, commitment = result
+    assert page is EMPTY_QUERY_PAGE
+    assert commitment
+    identity.close()
+    journal.close()
 
 
 def test_hsp20_key_overlap_recovers_same_generation_cursor_and_retirement_stays_generic() -> None:
