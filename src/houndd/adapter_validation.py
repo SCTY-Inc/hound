@@ -21,7 +21,9 @@ URL_RECORD_SCHEMA = "houndd.url-record.v1"
 QUARANTINE_SCHEMA = "houndd.quarantine-record.v1"
 MAX_CONTENT_BYTES = 16 * 1024 * 1024
 MAX_QUERY_CHARS = 1_024
-MAX_LEAD_ID_CHARS = 128
+# Providers use URLs as native lead IDs (Exa's providerId is the result URL),
+# so this bound must hold URL-scale identifiers, not short opaque tokens.
+MAX_LEAD_ID_CHARS = 2_048
 MAX_LEAD_TITLE_CHARS = 4_000
 _SHA256 = frozenset("0123456789abcdef")
 _NO_LINEAGE = {"relation": "none", "record_id": "none", "lead_id": "none"}

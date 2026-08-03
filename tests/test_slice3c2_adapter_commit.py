@@ -687,6 +687,49 @@ def test_slice3c2_shared_validator_closes_semantic_record_and_journal_fields(
         validate_adapter_outcome(malformed_record, malformed_event, record_id=record_id)
 
 
+def test_slice3c2_url_scale_lead_native_ids_survive_commit_and_verification(
+    tmp_path: Path,
+) -> None:
+    """Providers use URLs as native lead IDs; the bound must hold them.
+
+    The production journal already contains Exa leads whose native_id is a
+    133-character result URL — a short opaque-token cap would retroactively
+    invalidate durable truth and refuse startup recovery.
+    """
+
+    url_scale_id = "https://example.test/wp-content/uploads/2026/03/" + "a" * 1_400
+    leads = ({"url": "https://example.test/a", "title": "A", "native_id": url_scale_id},)
+    state = _state(tmp_path)
+    request, route = _request("ingest.search", key="url-scale-native-id")
+    runtime = CommitRuntime(state)
+    try:
+        def adapter(payload: Any) -> AdapterResult:
+            return AdapterResult("ingest.search", "completed", SEARCH_CONTENT, "application/json", "2026-08-03T00:00:00Z", 1, 0, leads)
+        response = runtime.execute_adapter(
+            request,
+            route,
+            principal=PRINCIPAL,
+            access="public",
+            adapter_host=AdapterHost({"ingest.search": adapter}),
+            scope=_scope(),
+        )
+        record_id = response["record_ids"][0]
+        record = runtime.records.read_json(record_id)  # type: ignore[union-attr]
+        event = runtime.journal.entries()[0]  # type: ignore[union-attr]
+    finally:
+        runtime.close()
+
+    outcome = validate_adapter_outcome(record, event, record_id=record_id)
+    assert outcome.staged is True
+    assert record["leads"][0]["native_id"] == url_scale_id
+    assert verify_store(state, projection=False)["valid"] is True
+
+    oversized = deepcopy(record)
+    oversized["leads"][0]["native_id"] = "x" * 2_049
+    with pytest.raises(AdapterOutcomeError):
+        validate_adapter_outcome(oversized, event, record_id=record_id)
+
+
 def test_no_test_constructs_a_live_provider_client_without_an_injected_transport() -> None:
     """Keep the focused and full suite offline even if a fixture is removed."""
 
