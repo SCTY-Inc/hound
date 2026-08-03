@@ -7,12 +7,10 @@ import hashlib
 import json
 import math
 import re
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from hound_cli.contracts import canonical_json
 from hound_research.evidence import EvidenceError, make_lead
 from hound_research.web import ADAPTER_SCHEMA, SEARCH_SCHEMA, validate_web_input
 
@@ -20,10 +18,6 @@ from ._http import AdapterError, Transport, json_object, request
 
 
 API_URL = "https://api.exa.ai/search"
-Sleep = Callable[[float], None]
-_RETRY_DELAYS = (0.25, 1.0)
-_RETRYABLE_STATUSES = {401, 408, 409, 425, 429}
-_EXCHANGES_MEDIA_TYPE = "application/vnd.hound.http-exchanges+json"
 _SEARCH_TYPES = {"auto", "fast"}
 _CATEGORIES = {
     "company",
@@ -130,36 +124,6 @@ def _options(search_input: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _exchange(status: int, body: bytes) -> dict[str, object]:
-    return {
-        "method": "POST",
-        "url": API_URL,
-        "status": status,
-        "body_base64": base64.b64encode(body).decode("ascii"),
-        "sha256": hashlib.sha256(body).hexdigest(),
-    }
-
-
-def _recorded_raw(
-    exchanges: list[dict[str, object]],
-    final_body: bytes,
-    *,
-    request_count: int,
-    single_media_type: str = "application/json",
-) -> tuple[bytes, str]:
-    if request_count == 1:
-        return final_body, single_media_type
-    return canonical_json({"exchanges": exchanges}).encode("utf-8"), _EXCHANGES_MEDIA_TYPE
-
-
-def _retryable(status: object) -> bool:
-    return (
-        isinstance(status, int)
-        and not isinstance(status, bool)
-        and (status in _RETRYABLE_STATUSES or 500 <= status <= 599)
-    )
-
-
 def _provider_error(
     message: str,
     raw: bytes,
@@ -180,7 +144,6 @@ def search(
     *,
     env: Mapping[str, str],
     transport: Transport = request,
-    sleep: Sleep = time.sleep,
     retrieved_at: str | None = None,
     timeout: float = 30,
 ) -> dict[str, Any]:
@@ -218,73 +181,27 @@ def search(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    exchanges: list[dict[str, object]] = []
-    request_count = 0
-    for attempt in range(len(_RETRY_DELAYS) + 1):
-        request_count += 1
-        try:
-            status, provider_raw = transport(
-                method="POST",
-                url=API_URL,
-                headers=headers,
-                body=request_body,
-                timeout=timeout,
-            )
-        except AdapterError as error:
-            if not error.retryable:
-                if request_count == 1:
-                    raise
-                recorded_raw, media_type = _recorded_raw(
-                    exchanges,
-                    error.raw,
-                    request_count=request_count,
-                )
-                raise AdapterError(
-                    str(error),
-                    raw=recorded_raw,
-                    media_type=media_type,
-                    requests=request_count,
-                ) from error
-            if attempt < len(_RETRY_DELAYS):
-                sleep(_RETRY_DELAYS[attempt])
-                continue
-            recorded_raw, media_type = _recorded_raw(
-                exchanges,
-                b"",
-                request_count=request_count,
-            )
-            raise AdapterError(
-                str(error),
-                raw=recorded_raw,
-                media_type=media_type,
-                requests=request_count,
-            ) from error
-        exchanges.append(_exchange(status, provider_raw))
-        try:
-            response = json_object(status, provider_raw, "Exa")
-        except AdapterError as error:
-            if _retryable(status) and attempt < len(_RETRY_DELAYS):
-                sleep(_RETRY_DELAYS[attempt])
-                continue
-            recorded_raw, media_type = _recorded_raw(
-                exchanges,
-                provider_raw,
-                request_count=request_count,
-                single_media_type=error.media_type,
-            )
-            raise AdapterError(
-                str(error),
-                raw=recorded_raw,
-                media_type=media_type,
-                requests=request_count,
-            ) from error
-        break
-
-    recorded_raw, media_type = _recorded_raw(
-        exchanges,
-        provider_raw,
-        request_count=request_count,
-    )
+    try:
+        status, provider_raw = transport(
+            method="POST",
+            url=API_URL,
+            headers=headers,
+            body=request_body,
+            timeout=timeout,
+        )
+    except AdapterError as error:
+        raise AdapterError(
+            str(error), raw=error.raw, media_type=error.media_type, requests=1
+        ) from error
+    try:
+        response = json_object(status, provider_raw, "Exa")
+    except AdapterError as error:
+        raise AdapterError(
+            str(error), raw=error.raw, media_type=error.media_type, requests=1
+        ) from error
+    recorded_raw = provider_raw
+    media_type = "application/json"
+    request_count = 1
     results = response.get("results")
     if not isinstance(results, list):
         raise _provider_error(

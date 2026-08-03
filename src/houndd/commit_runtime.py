@@ -28,6 +28,11 @@ from .adapter_host import (
     AdapterHostError,
     AdapterUnavailable,
 )
+from .adapter_validation import (
+    AdapterOutcomeError,
+    validate_adapter_outcome,
+    validate_adapter_record,
+)
 from .commit import (
     ADAPTER_OPERATIONS,
     SOURCE_OPERATIONS,
@@ -521,68 +526,33 @@ class CommitRuntime:
         content = marker["source"]
         record_id = marker["record_id"]
         payload = self._validate_adapter_payload(operation, marker["canonical_request"]["operation"]["payload"])
-        kind, schema = _ADAPTER_ARTIFACTS[operation]
-        outcome = body.get("outcome")
-        if outcome not in _EVIDENCE_STATUS or body.get("evidence_status") != _EVIDENCE_STATUS[outcome]:
-            raise CommitIntegrityError("adapter outcome plan is unsupported")
-        common = {"attempt_id": marker["attempt_id"], "request_hash": marker["request_hash"], "operation": operation, "lineage": lineage}
-        if {key: body.get(key) for key in common} != common:
-            raise CommitIntegrityError("adapter outcome plan is malformed")
-        staged = self._plan_requires_content(marker)
-        if body.get("schema_version") == QUARANTINE_SCHEMA:
-            quarantine = body.get("quarantine")
-            if (
-                outcome != "refused"
-                or set(body) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "quarantine", "lineage"}
-                or lineage != _NO_LINEAGE
-                or type(quarantine) is not dict
-                or set(quarantine) != {"content_sha256", "byte_length", "reason", "access"}
-                or _sha(quarantine.get("content_sha256"), "quarantine content_sha256") != content.get("sha256")
-                or quarantine.get("byte_length") != content.get("byte_length")
-                or type(content.get("byte_length")) is not int
-                or quarantine.get("reason") != "phi_suspected"
-                or quarantine.get("access") != marker.get("access")
-            ):
-                raise CommitIntegrityError("quarantine outcome plan is malformed")
-            schema = QUARANTINE_SCHEMA
-            canonical_url = "none"
-            dedupe = {"object_key": f"quarantine:{record_id}", "content_sha256": record_id}
-        else:
-            required = {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "reason", "provider", "retrieved_at", "content_sha256", "byte_length", "lineage"}
-            required |= {"query", "limit", "leads"} if operation == "ingest.search" else {"url"}
-            if (
-                set(body) != required
-                or body.get("schema_version") != schema
-                or body.get("provider") != _ADAPTER_PROVIDERS[operation]
-                or body.get("reason") not in _ADAPTER_REASONS
-                or (body.get("reason") == "none") is not staged
-                or type(body.get("retrieved_at")) is not str
-                or not body["retrieved_at"]
-            ):
-                raise CommitIntegrityError("adapter outcome plan is malformed")
-            if staged:
-                if body.get("content_sha256") != content.get("sha256") or body.get("byte_length") != content.get("byte_length") or type(content.get("byte_length")) is not int or content["byte_length"] <= 0:
-                    raise CommitIntegrityError("staged adapter plan does not bind its content")
-                dedupe = {"object_key": f"{kind}:{content['sha256']}", "content_sha256": content["sha256"]}
-            else:
-                if body.get("content_sha256") != _NO_CONTENT or body.get("byte_length") != 0 or content != _EMPTY_CONTENT:
-                    raise CommitIntegrityError("unstaged adapter plan claims content")
-                dedupe = {"object_key": f"{kind}-outcome:{record_id}", "content_sha256": record_id}
-            if operation == "ingest.search":
-                leads = body.get("leads")
-                if body.get("query") != payload["query"] or body.get("limit") != payload["limit"] or type(leads) is not list or (leads and not staged):
-                    raise CommitIntegrityError("search outcome plan is malformed")
-                for lead in leads:
-                    if type(lead) is not dict or set(lead) != {"url", "title", "native_id"} or any(type(value) is not str or not value for value in lead.values()):
-                        raise CommitIntegrityError("search outcome lead is malformed")
-                canonical_url = "none"
-            else:
-                if body.get("url") != payload["url"]:
-                    raise CommitIntegrityError("url outcome plan is malformed")
-                canonical_url = body["url"]
-        artifact = {"kind": kind, "schema": schema, "record_id": record_id, "hash": record_id, "authorized_uri": f"houndd://record/{record_id}"}
-        event_source = {"provider": _ADAPTER_PROVIDERS[operation], "native_id": record_id, "canonical_url": canonical_url}
-        return artifact, event_source, dedupe, [record_id]
+        try:
+            outcome = validate_adapter_record(
+                body,
+                record_id=record_id,
+                expected_operation=operation,
+                expected_attempt_id=marker["attempt_id"],
+                expected_request_hash=marker["request_hash"],
+                expected_payload=payload,
+                expected_lineage=lineage,
+                expected_access=marker["access"],
+                content_identity=content,
+            )
+        except AdapterOutcomeError as error:
+            raise CommitIntegrityError("adapter outcome plan is malformed") from error
+        artifact = {
+            "kind": outcome.kind,
+            "schema": outcome.schema,
+            "record_id": record_id,
+            "hash": record_id,
+            "authorized_uri": f"houndd://record/{record_id}",
+        }
+        event_source = {
+            "provider": outcome.provider,
+            "native_id": record_id,
+            "canonical_url": outcome.canonical_url,
+        }
+        return artifact, event_source, outcome.dedupe, [record_id]
 
     def _plan_template(self, marker: dict[str, Any]) -> dict[str, Any]:
         """Validate one private outcome/event plan and derive its response."""
@@ -616,9 +586,30 @@ class CommitRuntime:
         outcome = body.get("outcome")
         if operation in ADAPTER_OPERATIONS:
             artifact, event_source, dedupe, record_ids = self._adapter_plan(marker)
-            evidence_status = body["evidence_status"]
-            if usage["bytes"] != (source["byte_length"] if self._plan_requires_content(marker) else 0):
-                raise CommitIntegrityError("adapter plan usage does not bind its content")
+            try:
+                checked = validate_adapter_outcome(
+                    body,
+                    envelope,
+                    record_id=record_id,
+                    expected_operation=operation,
+                    expected_attempt_id=marker["attempt_id"],
+                    expected_request_hash=marker["request_hash"],
+                    expected_payload=self._validate_adapter_payload(operation, marker["canonical_request"]["operation"]["payload"]),
+                    expected_lineage=lineage,
+                    expected_access=marker["access"],
+                    content_identity=source,
+                )
+            except AdapterOutcomeError as error:
+                raise CommitIntegrityError("adapter outcome plan is malformed") from error
+            if (
+                artifact["kind"] != checked.kind
+                or artifact["schema"] != checked.schema
+                or event_source["provider"] != checked.provider
+                or event_source["canonical_url"] != checked.canonical_url
+                or dedupe != checked.dedupe
+            ):
+                raise CommitIntegrityError("adapter outcome plan is inconsistent")
+            evidence_status = checked.evidence_status
             return self._bind_plan_event(marker, record_id, body, envelope, artifact, event_source, dedupe, record_ids, usage, outcome, evidence_status, lineage)
         if outcome not in {"completed", "interrupted"}:
             raise CommitIntegrityError("outcome plan is unsupported")

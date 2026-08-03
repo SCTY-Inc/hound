@@ -31,6 +31,13 @@ HSP-01..22 acceptance table passes as one machine-verifiable command.
    static scanner passes with exclusions limited to the allowed set.
 5. `migration/acceptance.v1.json` claims all 22 HSP rows with named evidence,
    one-to-one traceability, and the full acceptance command green in CI.
+6. *(added 2026-08-03, Ali)* The GiveCare Chief-of-Staff thread
+   (`~/agents/config/chief-of-staff-thread`) and every GiveCare bb automation
+   (`pulse-daily`, `discovery-benefits`, `refresh-wiki`, `intel-refresh`,
+   `refresh-policy`, `radar-curation`, `signal-daily`, `loop-company`) complete
+   one full scheduled cycle with hound as the sole acquisition path: correct
+   terminal tokens reported, dependency rack green with no hound-caused
+   `unknown`, `owner_queue.py` deriving matching domain results.
 
 ## Inventory (canonical: migration/consumer-inventory.v1.json)
 
@@ -84,7 +91,7 @@ file.
 |---|---|---|---|
 | B1 | complete (2026-08-03) | Adapter host inside `houndd`: allowlisted exa/firecrawl/camofox execution moves in-daemon (credentials read only by the service); 7-step adapter commit ordering incl. post-acceptance PHI scan and bounded non-PHI quarantine manifest per VISION. | Fault-injecting fake adapter suite: 429/timeout/truncation/abstention/kill → one durable outcome + one event each; no credential in any record/log. |
 | B2 | complete (2026-08-03) | `ingest.search` via Exa adapter (strict `{query, limit 1..50}` payload; leads are candidates, not evidence). Depends B1. | Live-optional + faux tests; search record + journal event with lineage none. |
-| B3 | complete (2026-08-03) | `ingest.url` via Firecrawl (direct \| search lineage, `max_pages` 2..20, public-URL validator). Depends B1. | Faux extract with search-record parent binding; lineage graph resolves. |
+| B3 | complete (2026-08-03; contract narrowed in the 3C2 repair: one durable outcome binds exactly one provider exchange — adapter retries removed (callers own retry policy) and `max_pages` multi-page crawl abstains (`requests=0` refusal). Consumers already reject `max_pages` (Pulse article adapter, gc-benefits contract test), so nothing depended on it.) | `ingest.url` via Firecrawl (direct \| search lineage, single-page, public-URL validator). Depends B1. | Faux extract with search-record parent binding; lineage graph resolves. |
 | B4 | pending | `ingest.media` capture records (exact source hash/type/lineage). Depends B1. | Capture record + `houndd://record/<id>` URI verify. |
 | B5 | pending | `transcribe` bound to authorized capture ID; daemon-produced model/version/segment-hash provenance. Depends B4, D5. | Two-segment fixture: completed/partial/failed statuses stay explicit; no PHI in record. |
 | B6 | mostly complete (2026-08-03: Slice 3D `journal.get` + `record.get` live — authorized single-entry and exact-bytes record/content reads, client `journal get`/`record get`, clickable Intake record panel; VISION §Slice 3D). Remaining: `journal verify`/`rebuild-index` service routes (library-only today); latent journal.query error-ordering bug (corrupt snapshot maps to 400, should be 503 — flagged in Slice 3D dispatchers); interrupted-file `include_content` 503 edge. | `journal get`, `journal verify`, `journal rebuild-index` as service routes + client commands, plus the authorized record-read route. | Route contract tests; rebuild equality vs canonical journal; radar consumes a lead end-to-end. |
@@ -135,11 +142,17 @@ use, recovery drill, one full scheduled cycle, legacy paths absent.
 | E6 | pending | Full acceptance manifest: 22 ordered rows, one-to-one artifact traceability, CI runs the acceptance command (HSP-21). | Manifest checker + CI green. |
 | E7 | pending | Deletion: retire each lane's legacy paths only after its recovery drill + one full scheduled cycle; adapters' direct console/CLI entry points removed at final cutover. | `legacy_absent` evidence per lane; provider indicators scan clean outside houndd. |
 
+### Phase A — bb runtime acceptance (added 2026-08-03)
+
+| ID | Status | Contract | Proof |
+|---|---|---|---|
+| A1 | pending | One full scheduled bb cycle per acceptance criterion 6: every GiveCare lane automation acquires only through `houndd`, terminal tokens reach the Chief-of-Staff thread, `loop-company` reads lane artifacts via the dependency rack. Includes the known `refresh-wiki` REFRESH_FAILED contract gap (missing owner-declared gap signal, target, bounded query list — bb:thr_z9ha57v939) fixed under M3. Depends M2–M5. | Cycle transcript + token audit; credential-unset run shows zero direct provider calls. |
+
 ### Verify
 
 | ID | Status | Contract | Proof |
 |---|---|---|---|
-| V | pending | Run acceptance criteria 1–5. Blocked by all phases. | Full suite + acceptance command + inventory check green; criteria walked with evidence links. |
+| V | pending | Run acceptance criteria 1–6. Blocked by all phases. | Full suite + acceptance command + inventory check green; criteria walked with evidence links. |
 
 ## Refusals (unchanged from VISION.md)
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ast
 import os
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +24,7 @@ from houndd.adapter_host import (
     AdapterResult,
     AdapterUnavailable,
 )
+from houndd.adapter_validation import AdapterOutcomeError, validate_adapter_outcome
 from houndd.access import AuthenticatedPrincipal, EventSelector, PrincipalScope, ProducerSelector
 from houndd.commit import AVAILABLE_ROUTE_BINDINGS, CommitContractError, parse_commit_request, resolve_route
 from houndd.commit_runtime import CommitRefusal, CommitRuntime, CommitUnavailable
@@ -42,18 +45,6 @@ SEARCH_CONTENT = canonical_bytes({
 })
 URL_CONTENT = b"# Respite care\n\nEligibility details."
 LEADS = ({"url": "https://example.test/a", "title": "A", "native_id": "exa-1"},)
-
-
-class _NoNetwork:
-    """Stands in for the provider opener so no socket can be created."""
-
-    def open(self, *_args: object, **_kwargs: object) -> None:
-        raise ConnectionRefusedError("Slice 3C2 tests never open a provider connection")
-
-
-@pytest.fixture(autouse=True)
-def no_live_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("hound_web_adapters._http.build_opener", lambda *_args: _NoNetwork())
 
 
 def _policy() -> dict[str, object]:
@@ -123,7 +114,7 @@ def _request(operation: str, *, key: str, request_id: str = "one", payload: dict
 def _result(operation: str, *, outcome: str = "completed", content: bytes | None = None) -> AdapterResult:
     if operation == "ingest.search":
         return AdapterResult("ingest.search", outcome, content or SEARCH_CONTENT, "application/json", "2026-08-03T00:00:00Z", 1, 0, LEADS)
-    return AdapterResult("ingest.url", outcome, content or URL_CONTENT, "text/markdown", "2026-08-03T00:00:00Z", 2, 0)
+    return AdapterResult("ingest.url", outcome, content or URL_CONTENT, "text/markdown", "2026-08-03T00:00:00Z", 1, 0)
 
 
 class _FauxHost(AdapterHost):
@@ -160,7 +151,7 @@ def test_slice3c2_completed_commit_publishes_one_record_one_event_and_replays(tm
         assert response["ok"] is True and response["outcome"] == "completed"
         assert len(response["record_ids"]) == 1 and len(response["entry_ids"]) == 1
         content = SEARCH_CONTENT if operation == "ingest.search" else URL_CONTENT
-        assert response["usage"] == {"requests": 1 if operation == "ingest.search" else 2, "bytes": len(content), "cost": 0}
+        assert response["usage"] == {"requests": 1, "bytes": len(content), "cost": 0}
 
         record = runtime.records.read_json(response["record_ids"][0])  # type: ignore[union-attr]
         assert record["schema_version"] == ("houndd.search-record.v1" if operation == "ingest.search" else "houndd.url-record.v1")
@@ -195,7 +186,7 @@ def test_slice3c2_completed_commit_publishes_one_record_one_event_and_replays(tm
 @pytest.mark.parametrize(
     ("error", "outcome", "reason"),
     (
-        (AdapterFailed("provider exchange failed", requests=3), "failed", "provider_failed"),
+        (AdapterFailed("provider exchange failed", requests=1), "failed", "provider_failed"),
         (AdapterFailed("provider timed out", requests=1), "failed", "provider_failed"),
         (AdapterFailed("provider result is invalid", requests=1), "failed", "provider_failed"),
         (AdapterAbstained("provider abstained", requests=1), "refused", "provider_abstained"),
@@ -471,9 +462,12 @@ def test_slice3c2_request_identity_excludes_only_request_and_key_ids() -> None:
 
 
 def test_slice3c2_host_binds_only_provisioned_credentials_and_refuses_selection() -> None:
-    assert AdapterHost.from_env({}).operations == frozenset()
-    assert AdapterHost.from_env({"EXA_API_KEY": "k"}).operations == frozenset({"ingest.search"})
-    assert AdapterHost.from_env({"FIRECRAWL_API_KEY": "k"}).operations == frozenset({"ingest.url"})
+    def transport(**_call: object) -> tuple[int, bytes]:
+        pytest.fail("adapter-host binding tests must not open a provider connection")
+
+    assert AdapterHost.from_env({}, transport=transport).operations == frozenset()
+    assert AdapterHost.from_env({"EXA_API_KEY": "k"}, transport=transport).operations == frozenset({"ingest.search"})
+    assert AdapterHost.from_env({"FIRECRAWL_API_KEY": "k"}, transport=transport).operations == frozenset({"ingest.url"})
     assert ADAPTER_ENV_KEYS == ("EXA_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_ENDPOINT")
     with pytest.raises(AdapterHostError):
         AdapterHost({"ingest.file": lambda _payload: _result("ingest.search")})
@@ -483,15 +477,24 @@ def test_slice3c2_host_binds_only_provisioned_credentials_and_refuses_selection(
         AdapterHost({"ingest.url": lambda _payload: _result("ingest.search")}).invoke("ingest.url", {"url": "https://example.test/a"})
 
 
-def test_slice3c2_production_transport_failure_is_one_failed_outcome(tmp_path: Path) -> None:
-    """The real Exa adapter maps an unreachable transport to durable failure."""
+def test_slice3c2_injected_exa_transport_failure_is_one_failed_outcome(tmp_path: Path) -> None:
+    """A fake transport proves the production Exa binding cannot use the internet."""
 
     state = _state(tmp_path)
     request, route = _request("ingest.search", key="transport")
+    calls: list[dict[str, object]] = []
+
+    def transport(**call: object) -> tuple[int, bytes]:
+        calls.append(call)
+        return 503, b'{"error":"unavailable"}'
+
     runtime = CommitRuntime(state)
     try:
-        response = runtime.execute_adapter(request, route, principal=PRINCIPAL, access="public", adapter_host=AdapterHost.from_env({"EXA_API_KEY": "test-key"}), scope=_scope())
+        host = AdapterHost.from_env({"EXA_API_KEY": "test-key"}, transport=transport)
+        response = runtime.execute_adapter(request, route, principal=PRINCIPAL, access="public", adapter_host=host, scope=_scope())
         assert response["ok"] is False and response["outcome"] == "failed"
+        assert response["usage"]["requests"] == 1
+        assert len(calls) == 1
         assert runtime.records.read_json(response["record_ids"][0])["reason"] == "provider_failed"  # type: ignore[union-attr]
         assert verify_store(state, projection=False)["valid"] is True
     finally:
@@ -591,6 +594,153 @@ runtime.execute_adapter(request, route, principal=PRINCIPAL, access="public", ad
         assert verify_store(state, projection=False)["valid"] is True
     finally:
         recovered.close()
+
+
+def test_slice3c2_verifier_rejects_semantically_malformed_adapter_outcome(tmp_path: Path) -> None:
+    """The journal can be byte-valid while an adapter record is not meaningful."""
+
+    state = _state(tmp_path)
+    runtime = CommitRuntime(state)
+    try:
+        record = {
+            "schema_version": "houndd.search-record.v1",
+            "attempt_id": "a" * 64,
+            "request_hash": "b" * 64,
+            "operation": "ingest.search",
+            "outcome": "failed",
+            "evidence_status": "failure",
+            "reason": "not-an-allowed-reason",
+            "provider": "exa",
+            "retrieved_at": "",
+            "query": 7,
+            "limit": -1,
+            "leads": [],
+            "content_sha256": "none",
+            "byte_length": 0,
+            "lineage": {"relation": "none", "record_id": "none", "lead_id": "none"},
+        }
+        stored = runtime.records.put_json(record)  # type: ignore[union-attr]
+        runtime.journal.append(  # type: ignore[union-attr]
+            make_journal_envelope(
+                sequence=0,
+                appended_at="2026-08-03T00:00:00Z",
+                producer={"owner_id": "writer", "capability": "ingest.search", "run_id": "run"},
+                artifact={"kind": "search", "schema": "houndd.search-record.v1", "record_id": stored.record_id, "hash": stored.record_id, "authorized_uri": f"houndd://record/{stored.record_id}"},
+                lineage=record["lineage"],
+                source={"provider": "exa", "native_id": stored.record_id, "canonical_url": "none"},
+                classification={"outcome": "failed", "evidence_status": "failure"},
+                access="public",
+                policy_id="write-policy",
+                dedupe={"object_key": f"search-outcome:{stored.record_id}", "content_sha256": stored.record_id},
+                usage={"requests": 1, "bytes": 0, "cost": 0},
+            )
+        )
+    finally:
+        runtime.close()
+
+    assert verify_store(state, projection=False)["valid"] is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda record, _event: record.update({"reason": "provider_failed"}),
+        lambda record, _event: record.update({"retrieved_at": "not-a-timestamp"}),
+        lambda record, _event: record.update({"query": 7}),
+        lambda record, _event: record.update({"limit": True}),
+        lambda record, _event: record["leads"][0].update({"unexpected": "field"}),
+        lambda record, _event: record.update({"document": {}}),
+        lambda record, _event: record.update({"content_sha256": "A" * 64}),
+        lambda _record, event: event["usage"].update({"requests": True}),
+        lambda _record, event: event["source"].update({"provider": "other"}),
+    ),
+)
+def test_slice3c2_shared_validator_closes_semantic_record_and_journal_fields(
+    tmp_path: Path,
+    mutate: Any,
+) -> None:
+    """Commit and verify use the same closed validator for every durable field."""
+
+    state = _state(tmp_path)
+    request, route = _request("ingest.search", key="strict-fields")
+    runtime = CommitRuntime(state)
+    try:
+        response = runtime.execute_adapter(
+            request,
+            route,
+            principal=PRINCIPAL,
+            access="public",
+            adapter_host=_faux("ingest.search"),
+            scope=_scope(),
+        )
+        record_id = response["record_ids"][0]
+        record = runtime.records.read_json(record_id)  # type: ignore[union-attr]
+        event = runtime.journal.entries()[0]  # type: ignore[union-attr]
+    finally:
+        runtime.close()
+
+    validate_adapter_outcome(record, event, record_id=record_id)
+    malformed_record = deepcopy(record)
+    malformed_event = deepcopy(event)
+    mutate(malformed_record, malformed_event)
+    with pytest.raises(AdapterOutcomeError):
+        validate_adapter_outcome(malformed_record, malformed_event, record_id=record_id)
+
+
+def test_no_test_constructs_a_live_provider_client_without_an_injected_transport() -> None:
+    """Keep the focused and full suite offline even if a fixture is removed."""
+
+    provider_calls = {
+        "hound_web_adapters.exa.search",
+        "hound_web_adapters.firecrawl.extract",
+        "hound_web_adapters.camofox.interact",
+    }
+
+    def name(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = name(node.value)
+            return f"{parent}.{node.attr}" if parent is not None else None
+        return None
+
+    def imported_names(tree: ast.Module) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname is not None:
+                        aliases[alias.asname] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    aliases[local] = f"{node.module}.{alias.name}"
+        return aliases
+
+    violations: list[str] = []
+    for path in Path(__file__).parent.rglob("test_*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        aliases = imported_names(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = name(node.func)
+            if function is None:
+                continue
+            head, *tail = function.split(".", 1)
+            function = ".".join((aliases.get(head, head), *tail))
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg is not None}
+            if function in provider_calls:
+                transport = keywords.get("transport")
+                transport_name = name(transport) if transport is not None else None
+                if transport is None or transport_name in {"request", "_http.request", "hound_web_adapters._http.request"}:
+                    violations.append(f"{path.name}:{node.lineno} {function}")
+            if function == "houndd.adapter_host.AdapterHost.from_env":
+                transport = keywords.get("transport")
+                transport_name = name(transport) if transport is not None else None
+                if transport is None or transport_name in {"request", "_http.request", "hound_web_adapters._http.request"}:
+                    violations.append(f"{path.name}:{node.lineno} {function}")
+    assert violations == []
 
 
 @pytest.mark.parametrize("operation", ("ingest.search", "ingest.url"))

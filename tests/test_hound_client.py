@@ -115,9 +115,9 @@ def _read_response(
         "request_id": request_id,
         "ok": ok,
         "outcome": outcome,
-        "record_ids": [],
+        "record_ids": [row["record_id"] for row in result] if result is not None else [],
         "entry_ids": [],
-        "usage": {"requests": 1, "bytes": 0, "cost": 0},
+        "usage": {"requests": 0, "bytes": 0, "cost": 0},
     }
     if result is not None:
         body["result"] = result
@@ -128,11 +128,11 @@ def _read_response(
     return {"wire_version": "houndd.uds.v1", "status": status, "body": body}
 
 
-def _record_row(record: dict[str, Any], content: bytes | None = None) -> dict[str, Any]:
+def _record_row(record: dict[str, Any], content: bytes | None = None, *, record_id: str = "rec-1") -> dict[str, Any]:
     encoded = houndd_canonical_bytes(record)
     row: dict[str, Any] = {
         "schema": "hound.source.search-record.v2",
-        "record_id": "rec-1",
+        "record_id": record_id,
         "body_base64": base64.b64encode(encoded).decode("ascii"),
         "byte_length": len(encoded),
     }
@@ -148,7 +148,7 @@ def _record_row(record: dict[str, Any], content: bytes | None = None) -> dict[st
 
 def test_commit_sends_exact_request_frame_and_returns_first_record(tmp_path: Path) -> None:
     socket_path = tmp_path / "houndd.sock"
-    stub = StubHoundd(socket_path, _framed(_commit_response(request_id="req-1", record_ids=["rec-1", "rec-2"])))
+    stub = StubHoundd(socket_path, _framed(_commit_response(request_id="req-1", record_ids=["rec-1"])))
 
     record_id = _client(socket_path).commit(
         path="/v1/ingest/search",
@@ -187,7 +187,6 @@ def test_commit_non_completed_outcome_carries_the_daemon_message(tmp_path: Path)
                 ok=False,
                 outcome="failed",
                 record_ids=["rec-1"],
-                error={"code": "provider_failed", "retryable": True, "message": "provider refused the query"},
             )
         ),
     )
@@ -203,7 +202,7 @@ def test_commit_non_completed_outcome_carries_the_daemon_message(tmp_path: Path)
         )
     stub.join()
 
-    assert str(caught.value) == "ingest.search did not complete: provider refused the query"
+    assert str(caught.value) == "ingest.search did not complete: failed"
 
 
 def test_commit_non_200_status_does_not_invent_a_record(tmp_path: Path) -> None:
@@ -216,12 +215,12 @@ def test_commit_non_200_status_does_not_invent_a_record(tmp_path: Path) -> None:
                 ok=False,
                 outcome="unavailable",
                 status=503,
-                error={"code": "service_unavailable", "retryable": True, "message": "daemon is draining"},
+                error={"code": "unavailable", "retryable": True, "message": "service unavailable"},
             )
         ),
     )
 
-    with pytest.raises(HounddClientError, match="did not complete: daemon is draining"):
+    with pytest.raises(HounddClientError, match="did not complete: service unavailable"):
         _client(socket_path).commit(
             path="/v1/ingest/url",
             capability="ingest.url",
@@ -237,7 +236,7 @@ def test_commit_completed_without_record_ids_is_an_error(tmp_path: Path) -> None
     socket_path = tmp_path / "houndd.sock"
     stub = StubHoundd(socket_path, _framed(_commit_response(request_id="req-1", record_ids=[])))
 
-    with pytest.raises(HounddClientError, match="ingest.search returned no record ID"):
+    with pytest.raises(HounddClientError, match="completed commit response is invalid"):
         _client(socket_path).commit(
             path="/v1/ingest/search",
             capability="ingest.search",
@@ -246,6 +245,49 @@ def test_commit_completed_without_record_ids_is_an_error(tmp_path: Path) -> None
             request_id="req-1",
             run_id="run-1",
         )
+    stub.join()
+
+
+def test_commit_rejects_record_counts_that_do_not_bind_its_operation(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    response = _commit_response(request_id="req-1", record_ids=["rec-1", "rec-2"])
+    stub = StubHoundd(socket_path, _framed(response))
+
+    with pytest.raises(HounddClientError, match="completed commit response is invalid"):
+        _commit(_client(socket_path))
+    stub.join()
+
+
+def test_commit_rejects_the_reviewer_forged_incomplete_completed_response_and_trailing_bytes(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    forged = _commit_response(request_id="req-1", record_ids=["forged-record"])
+    forged["body"]["entry_ids"] = []
+    stub = StubHoundd(socket_path, _framed(forged) + b"trailing")
+
+    with pytest.raises(HounddClientError):
+        _commit(_client(socket_path))
+    stub.join()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda response: response["body"].update({"schema_version": "houndd.read-response.v1"}),
+        lambda response: response["body"].update({"ok": False}),
+        lambda response: response["body"].update({"usage": {"requests": "1", "bytes": 0, "cost": 0}}),
+    ),
+)
+def test_commit_rejects_canonical_but_wrong_operation_response_shape(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, Any]], None],
+) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    response = _commit_response(request_id="req-1", record_ids=["rec-1"])
+    mutation(response)
+    stub = StubHoundd(socket_path, _framed(response))
+
+    with pytest.raises(HounddClientError):
+        _commit(_client(socket_path))
     stub.join()
 
 
@@ -270,6 +312,18 @@ def test_non_canonical_response_frame_is_rejected(tmp_path: Path) -> None:
     stub = StubHoundd(socket_path, len(encoded).to_bytes(4, "big") + encoded)
 
     with pytest.raises(HounddClientError, match="houndd response is not canonical"):
+        _commit(_client(socket_path))
+    stub.join()
+
+
+def test_duplicate_response_keys_are_rejected_before_schema_validation(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    response = _commit_response(request_id="req-1", record_ids=["rec-1"])
+    body = houndd_canonical_bytes(response["body"])
+    raw = b'{"body":' + body + b',"body":' + body + b',"status":200,"wire_version":"houndd.uds.v1"}'
+    stub = StubHoundd(socket_path, len(raw).to_bytes(4, "big") + raw)
+
+    with pytest.raises(HounddClientError, match="has duplicate JSON keys"):
         _commit(_client(socket_path))
     stub.join()
 
@@ -327,6 +381,13 @@ def test_absent_socket_reports_the_daemon_as_unavailable(tmp_path: Path) -> None
         _commit(_client(tmp_path / "missing.sock"))
 
 
+def test_client_refuses_relative_and_unsafe_socket_paths() -> None:
+    with pytest.raises(HounddClientError):
+        HounddClient(Path("relative.sock"), owner_id="lane-owner", policy_id="policy-1")
+    with pytest.raises(HounddClientError):
+        HounddClient(Path("/tmp/../socket.sock"), owner_id="lane-owner", policy_id="policy-1")
+
+
 # --- record.get -------------------------------------------------------------
 
 
@@ -335,7 +396,7 @@ def test_record_get_decodes_the_body_and_derives_its_request_id(tmp_path: Path) 
     record = {"schema_version": "hound.source.search-record.v2", "provider": "exa", "leads": []}
     stub = StubHoundd(
         socket_path,
-        lambda frame: _framed(_read_response(request_id=frame["body"]["request_id"], result=[_record_row(record)])),
+        lambda frame: _framed(_read_response(request_id=frame["body"]["request_id"], result=[_record_row(record, record_id="rec-abcdef")])),
     )
 
     body, content = _client(socket_path).record_get("rec-abcdef", run_id="run-1")
@@ -412,13 +473,15 @@ def test_record_get_rejects_content_that_is_not_base64(tmp_path: Path) -> None:
 def test_record_get_rejects_a_body_that_is_not_a_json_object(tmp_path: Path) -> None:
     socket_path = tmp_path / "houndd.sock"
     row = _record_row({"url": "https://example.org/"})
-    row["body_base64"] = base64.b64encode(b'["not an object"]').decode("ascii")
+    invalid_body = b'["not an object"]'
+    row["body_base64"] = base64.b64encode(invalid_body).decode("ascii")
+    row["byte_length"] = len(invalid_body)
     stub = StubHoundd(
         socket_path,
         lambda frame: _framed(_read_response(request_id=frame["body"]["request_id"], result=[row])),
     )
 
-    with pytest.raises(HounddClientError, match="body is not an object"):
+    with pytest.raises(HounddClientError, match="body is not canonical"):
         _client(socket_path).record_get("rec-1", run_id="run-1")
     stub.join()
 
@@ -430,7 +493,7 @@ def test_record_get_rejects_a_missing_result(tmp_path: Path) -> None:
         lambda frame: _framed(_read_response(request_id=frame["body"]["request_id"], result=[])),
     )
 
-    with pytest.raises(HounddClientError, match="record.get rec-1 returned no record"):
+    with pytest.raises(HounddClientError, match="record response is invalid"):
         _client(socket_path).record_get("rec-1", run_id="run-1")
     stub.join()
 
@@ -489,12 +552,12 @@ def test_ready_rejects_a_degraded_daemon(tmp_path: Path) -> None:
                 status=503,
                 ok=False,
                 outcome="unavailable",
-                error={"code": "service_unavailable", "retryable": True, "message": "store is recovering"},
+                error={"code": "service_unavailable", "retryable": True, "message": "service is not ready"},
             )
         ),
     )
 
-    with pytest.raises(HounddClientError, match="houndd is not ready: store is recovering"):
+    with pytest.raises(HounddClientError, match="houndd is not ready: service is not ready"):
         _client(socket_path).ready()
     stub.join()
 
@@ -503,7 +566,7 @@ def test_ready_on_a_200_that_is_not_ok_is_rejected(tmp_path: Path) -> None:
     socket_path = tmp_path / "houndd.sock"
     stub = StubHoundd(socket_path, _framed(_read_response(request_id="ready-probe", ok=False, outcome="degraded")))
 
-    with pytest.raises(HounddClientError, match="houndd is not ready: degraded"):
+    with pytest.raises(HounddClientError, match="ready response is invalid"):
         _client(socket_path).ready()
     stub.join()
 

@@ -8,10 +8,13 @@ uses comes from one frozen environment captured at service startup.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import math
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from .contracts import canonical_bytes
+from hound_web_adapters._http import Transport, request
 
 
 ADAPTER_OPERATIONS: frozenset[str] = frozenset({"ingest.search", "ingest.url"})
@@ -28,7 +31,7 @@ class AdapterHostError(RuntimeError):
 
     def __init__(self, message: str, *, requests: int = 0) -> None:
         super().__init__(message)
-        if type(requests) is not int or requests < 0:
+        if type(requests) is not int or requests not in {0, 1}:
             raise TypeError("adapter request count is invalid")
         self.requests = requests
 
@@ -69,9 +72,15 @@ class AdapterResult:
             raise TypeError("adapter result media type is unsupported")
         if type(self.retrieved_at) is not str or not self.retrieved_at:
             raise TypeError("adapter result retrieved_at is invalid")
-        if type(self.requests) is not int or not 1 <= self.requests <= 64:
+        try:
+            parsed = datetime.fromisoformat(self.retrieved_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise TypeError("adapter result retrieved_at is invalid") from error
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise TypeError("adapter result retrieved_at is invalid")
+        if type(self.requests) is not int or self.requests != 1:
             raise TypeError("adapter result request count is invalid")
-        if type(self.cost) not in {int, float} or type(self.cost) is bool or self.cost < 0:
+        if type(self.cost) not in {int, float} or type(self.cost) is bool or not math.isfinite(self.cost) or self.cost < 0:
             raise TypeError("adapter result cost is invalid")
         if type(self.leads) is not tuple or (self.leads and self.operation != "ingest.search"):
             raise TypeError("adapter result leads are invalid")
@@ -99,14 +108,23 @@ def _lead(value: Any) -> dict[str, str]:
     }
 
 
-def _exa_search(payload: Mapping[str, Any], env: Mapping[str, str]) -> AdapterResult:
+def _exa_search(
+    payload: Mapping[str, Any],
+    env: Mapping[str, str],
+    *,
+    transport: Transport,
+) -> AdapterResult:
     from hound_web_adapters._http import AdapterError
     from hound_web_adapters.exa import search
 
     try:
-        data = search({"query": payload["query"], "limit": payload["limit"]}, env=env)
+        data = search(
+            {"query": payload["query"], "limit": payload["limit"]},
+            env=env,
+            transport=transport,
+        )
     except AdapterError as error:
-        raise AdapterFailed("provider exchange failed", requests=max(error.requests, 1)) from error
+        raise AdapterFailed("provider exchange failed", requests=1) from error
     except ValueError as error:
         raise AdapterFailed("provider result is invalid", requests=1) from error
     try:
@@ -124,7 +142,12 @@ def _exa_search(payload: Mapping[str, Any], env: Mapping[str, str]) -> AdapterRe
         raise AdapterFailed("provider result is invalid", requests=1) from error
 
 
-def _firecrawl_extract(payload: Mapping[str, Any], env: Mapping[str, str]) -> AdapterResult:
+def _firecrawl_extract(
+    payload: Mapping[str, Any],
+    env: Mapping[str, str],
+    *,
+    transport: Transport,
+) -> AdapterResult:
     from hound_web_adapters._http import AdapterError
     from hound_web_adapters.firecrawl import extract
 
@@ -134,9 +157,11 @@ def _firecrawl_extract(payload: Mapping[str, Any], env: Mapping[str, str]) -> Ad
     if "max_pages" in payload:
         request["max_pages"] = payload["max_pages"]
     try:
-        data = extract(request, env=env)
+        data = extract(request, env=env, transport=transport)
     except AdapterError as error:
-        raise AdapterFailed("provider exchange failed", requests=max(error.requests, 1)) from error
+        if error.requests == 0:
+            raise AdapterAbstained("provider request is unsupported", requests=0) from error
+        raise AdapterFailed("provider exchange failed", requests=1) from error
     except ValueError as error:
         raise AdapterFailed("provider result is invalid", requests=1) from error
     try:
@@ -161,17 +186,24 @@ class AdapterHost:
         self._adapters = MappingProxyType(dict(adapters))
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "AdapterHost":
+    def from_env(
+        cls,
+        env: Mapping[str, str],
+        *,
+        transport: Transport = request,
+    ) -> "AdapterHost":
         """Bind a production adapter only when its credential is provisioned."""
 
         if not isinstance(env, Mapping) or any(type(key) is not str or type(value) is not str for key, value in env.items()):
             raise AdapterHostError("adapter host environment is invalid")
         frozen = MappingProxyType({key: env[key] for key in ADAPTER_ENV_KEYS if key in env})
         adapters: dict[str, Callable[[Mapping[str, Any]], AdapterResult]] = {}
+        if not callable(transport):
+            raise AdapterHostError("adapter host transport is invalid")
         if frozen.get("EXA_API_KEY"):
-            adapters["ingest.search"] = lambda payload: _exa_search(payload, frozen)
+            adapters["ingest.search"] = lambda payload: _exa_search(payload, frozen, transport=transport)
         if frozen.get("FIRECRAWL_API_KEY"):
-            adapters["ingest.url"] = lambda payload: _firecrawl_extract(payload, frozen)
+            adapters["ingest.url"] = lambda payload: _firecrawl_extract(payload, frozen, transport=transport)
         return cls(adapters)
 
     @property
@@ -187,7 +219,7 @@ class AdapterHost:
         if adapter is None:
             raise AdapterUnavailable("no adapter is bound to the operation")
         result = adapter(payload)
-        if type(result) is not AdapterResult or result.operation != operation:
+        if type(result) is not AdapterResult or result.operation != operation or result.requests != 1:
             raise AdapterFailed("adapter result does not bind its operation", requests=1)
         return result
 

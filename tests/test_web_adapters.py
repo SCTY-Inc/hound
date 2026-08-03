@@ -160,135 +160,23 @@ def test_exa_structural_failure_retains_exact_provider_bytes() -> None:
     assert caught.value.requests == 1
 
 
-def test_exa_retries_transient_auth_failure_and_preserves_each_exchange() -> None:
-    unauthorized = (
-        b'{"requestId":"transient-auth","error":"Invalid API key",'
-        b'"tag":"INVALID_API_KEY"}'
-    )
-    success = (
-        b'{"results":[{"url":"https://example.test/care-policy",'
-        b'"title":"Care policy"}]}'
-    )
-    responses = iter([(401, unauthorized), (200, success)])
-    calls: list[dict[str, object]] = []
-    delays: list[float] = []
-
-    def transport(**call: object) -> tuple[int, bytes]:
-        calls.append(call)
-        return next(responses)
-
-    data = exa.search(
-        {"query": "care policy"},
-        env={"EXA_API_KEY": "known-good-key"},
-        transport=transport,
-        sleep=delays.append,
-    )
-
-    assert len(calls) == 2
-    assert delays == [0.25]
-    assert data["usage"]["requests"] == 2
-    assert data["raw"]["media_type"] == "application/vnd.hound.http-exchanges+json"
-    raw = base64.b64decode(data["raw"]["body_base64"])
-    assert data["usage"]["bytes"] == len(raw)
-    exchanges = json.loads(raw)["exchanges"]
-    assert [exchange["status"] for exchange in exchanges] == [401, 200]
-    for exchange, expected_body in zip(exchanges, (unauthorized, success), strict=True):
-        assert base64.b64decode(exchange["body_base64"]) == expected_body
-        assert exchange["sha256"] == hashlib.sha256(expected_body).hexdigest()
-
-
-def test_exa_retries_transport_failure_and_counts_the_attempt_without_a_response() -> None:
-    responses: list[AdapterError | tuple[int, bytes]] = [
+@pytest.mark.parametrize(
+    "response",
+    (
+        (503, b'{"requestId":"unavailable","error":"Unavailable"}'),
         AdapterError("provider transport failed", requests=1, retryable=True),
-        (
-            200,
-            b'{"results":[{"url":"https://example.test/care-policy",'
-            b'"title":"Care policy"}]}',
-        ),
-    ]
+    ),
+)
+def test_exa_uses_exactly_one_transport_exchange_for_every_accepted_search(
+    response: tuple[int, bytes] | AdapterError,
+) -> None:
     calls: list[dict[str, object]] = []
-    delays: list[float] = []
 
     def transport(**call: object) -> tuple[int, bytes]:
         calls.append(call)
-        response = responses.pop(0)
         if isinstance(response, AdapterError):
             raise response
         return response
-
-    data = exa.search(
-        {"query": "care policy"},
-        env={"EXA_API_KEY": "known-good-key"},
-        transport=transport,
-        sleep=delays.append,
-    )
-
-    assert len(calls) == 2
-    assert delays == [0.25]
-    assert data["usage"]["requests"] == 2
-    assert data["raw"]["media_type"] == "application/vnd.hound.http-exchanges+json"
-    raw = base64.b64decode(data["raw"]["body_base64"])
-    exchanges = json.loads(raw)["exchanges"]
-    assert len(exchanges) == 1
-    assert set(exchanges[0]) == {"method", "url", "status", "body_base64", "sha256"}
-    assert exchanges[0]["status"] == 200
-
-
-def test_exa_transport_retry_exhaustion_counts_attempts_without_fabricating_responses() -> None:
-    calls: list[dict[str, object]] = []
-    delays: list[float] = []
-
-    def transport(**call: object) -> tuple[int, bytes]:
-        calls.append(call)
-        raise AdapterError("provider transport failed", requests=1, retryable=True)
-
-    with pytest.raises(AdapterError, match="provider transport failed") as caught:
-        exa.search(
-            {"query": "care policy"},
-            env={"EXA_API_KEY": "known-good-key"},
-            transport=transport,
-            sleep=delays.append,
-        )
-
-    assert len(calls) == 3
-    assert delays == [0.25, 1.0]
-    assert caught.value.requests == 3
-    assert caught.value.media_type == "application/vnd.hound.http-exchanges+json"
-    assert json.loads(caught.value.raw) == {"exchanges": []}
-
-
-def test_exa_mixed_retry_path_preserves_responses_before_terminal_transport_error() -> None:
-    responses: list[tuple[int, bytes] | AdapterError] = [
-        (503, b'{"requestId":"unavailable-1","error":"Unavailable"}'),
-        AdapterError("provider response exceeded the byte ceiling", requests=1),
-    ]
-
-    def transport(**_: object) -> tuple[int, bytes]:
-        response = responses.pop(0)
-        if isinstance(response, AdapterError):
-            raise response
-        return response
-
-    with pytest.raises(AdapterError, match="byte ceiling") as caught:
-        exa.search(
-            {"query": "care policy"},
-            env={"EXA_API_KEY": "known-good-key"},
-            transport=transport,
-            sleep=lambda _: None,
-        )
-
-    assert caught.value.requests == 2
-    assert caught.value.media_type == "application/vnd.hound.http-exchanges+json"
-    assert [
-        exchange["status"] for exchange in json.loads(caught.value.raw)["exchanges"]
-    ] == [503]
-
-
-def test_exa_one_shot_nonretryable_transport_error_is_unchanged() -> None:
-    failure = AdapterError("provider response exceeded the byte ceiling", requests=1)
-
-    def transport(**_: object) -> tuple[int, bytes]:
-        raise failure
 
     with pytest.raises(AdapterError) as caught:
         exa.search(
@@ -297,39 +185,8 @@ def test_exa_one_shot_nonretryable_transport_error_is_unchanged() -> None:
             transport=transport,
         )
 
-    assert caught.value is failure
-
-
-def test_exa_retry_exhaustion_preserves_every_failure() -> None:
-    calls: list[dict[str, object]] = []
-    delays: list[float] = []
-
-    def transport(**call: object) -> tuple[int, bytes]:
-        calls.append(call)
-        request_number = len(calls)
-        return (
-            503,
-            json.dumps(
-                {"requestId": f"unavailable-{request_number}", "error": "Unavailable"},
-                separators=(",", ":"),
-            ).encode(),
-        )
-
-    with pytest.raises(AdapterError, match="HTTP status 503") as caught:
-        exa.search(
-            {"query": "care policy"},
-            env={"EXA_API_KEY": "known-good-key"},
-            transport=transport,
-            sleep=delays.append,
-        )
-
-    assert len(calls) == 3
-    assert delays == [0.25, 1.0]
-    assert caught.value.requests == 3
-    assert caught.value.media_type == "application/vnd.hound.http-exchanges+json"
-    assert [
-        exchange["status"] for exchange in json.loads(caught.value.raw)["exchanges"]
-    ] == [503, 503, 503]
+    assert len(calls) == 1
+    assert caught.value.requests == 1
 
 
 @pytest.mark.parametrize("status", [400, 402, 403, 404, 422])
@@ -346,7 +203,6 @@ def test_exa_deterministic_client_failure_is_not_retried(status: int) -> None:
             {"query": "care policy"},
             env={"EXA_API_KEY": "known-good-key"},
             transport=transport,
-            sleep=lambda _: pytest.fail("deterministic failure must not sleep"),
         )
 
     assert len(calls) == 1
@@ -402,59 +258,26 @@ def test_firecrawl_single_url_scrape_is_the_default() -> None:
     assert data["output"]["evidence_class"] == "provider-derived"
 
 
-def test_firecrawl_crawl_requires_and_forwards_the_explicit_page_cap() -> None:
+def test_firecrawl_refuses_multi_page_requests_without_a_provider_exchange() -> None:
     calls: list[dict[str, object]] = []
-    responses = iter(
-        [
-            (200, b'{"success":true,"id":"crawl-1"}'),
-            (200, b'{"status":"scraping","completed":0,"total":2}'),
-            (
-                200,
-                json.dumps(
-                    {
-                        "status": "completed",
-                        "data": [
-                            {
-                                "markdown": "# Inventory",
-                                "links": ["https://dealer.example.test/gx-460"],
-                                "metadata": {"sourceURL": "https://dealer.example.test/inventory"},
-                            },
-                            {
-                                "markdown": "# GX 460",
-                                "links": [],
-                                "metadata": {"sourceURL": "https://dealer.example.test/gx-460"},
-                            },
-                        ],
-                    },
-                    separators=(",", ":"),
-                ).encode(),
-            ),
-        ]
-    )
 
     def transport(**call: object) -> tuple[int, bytes]:
         calls.append(call)
-        return next(responses)
+        pytest.fail("an unsupported multi-page request must not call Firecrawl")
 
-    data = firecrawl.extract(
-        {
-            "url": "https://dealer.example.test/inventory",
-            "lineage": {"kind": "direct"},
-            "max_pages": 2,
-        },
-        env={"FIRECRAWL_API_KEY": "firecrawl-secret"},
-        transport=transport,
-        sleep=lambda _: None,
-    )
+    with pytest.raises(AdapterError, match="multi-page") as caught:
+        firecrawl.extract(
+            {
+                "url": "https://dealer.example.test/inventory",
+                "lineage": {"kind": "direct"},
+                "max_pages": 2,
+            },
+            env={"FIRECRAWL_API_KEY": "firecrawl-secret"},
+            transport=transport,
+        )
 
-    assert calls[0]["url"] == "https://api.firecrawl.dev/v2/crawl"
-    assert json.loads(calls[0]["body"])["limit"] == 2
-    assert calls[1]["method"] == "GET"
-    assert calls[1]["url"] == "https://api.firecrawl.dev/v2/crawl/crawl-1"
-    assert len(data["output"]["documents"]) == 2
-    assert data["usage"]["requests"] == 3
-    raw = json.loads(base64.b64decode(data["raw"]["body_base64"]))
-    assert len(raw["exchanges"]) == 3
+    assert calls == []
+    assert caught.value.requests == 0
 
 
 def test_camofox_open_uses_an_isolated_anonymous_session() -> None:

@@ -106,7 +106,7 @@ def _state(tmp_path: Path, digests: tuple[str, ...]) -> Path:
 def _host() -> AdapterHost:
     return AdapterHost({
         "ingest.search": lambda _payload: AdapterResult("ingest.search", "completed", SEARCH_CONTENT, "application/json", "2026-08-03T00:00:00Z", 1, 0, LEADS),
-        "ingest.url": lambda _payload: AdapterResult("ingest.url", "completed", URL_CONTENT, "text/markdown", "2026-08-03T00:00:00Z", 2, 0),
+        "ingest.url": lambda _payload: AdapterResult("ingest.url", "completed", URL_CONTENT, "text/markdown", "2026-08-03T00:00:00Z", 1, 0),
     })
 
 
