@@ -879,7 +879,7 @@ coordination and recovery metadata; it is not an additional canonical
 journal-envelope field or a pure-read field. The same key with the same
 canonical request returns the same identity and result and does not append a
 second outcome; reuse of that key with a different canonical request fails as
-an invalid collision. For Slice 3C1, an authorized read-only completed-
+an invalid collision. For Slice 3C1, an authorized read-only finalized-
 reservation probe uses the declared normalized-request identity before any
 source I/O: an exact match returns the stored response, while any changed bound
 field is the `400` collision and cannot create another attempt. Incomplete or
