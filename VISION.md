@@ -1013,32 +1013,16 @@ consumer-held cursors.
 
 ## Audited migration inventory and ownership
 
-The complete in-scope migration inventory is below. The named lane owner keeps
-intent, cadence, curation, classification, and downstream meaning; `houndd`
-owns only the adapter, acquisition, journal, access, and evidence mechanics.
-The cadence-authority/category is an inventory classification, not a mutable
-timer source: exact timer values remain canonical in each lane automation
-contract, and Hound has no scheduler.
-
-| Lane | Lane owner / truth owner | Cadence authority / category | Hound boundary and consumer |
-| --- | --- | --- | --- |
-| Pulse | `gc-web` / `givecare/pulse-daily` | daily | `houndd` acquisition and journal; Pulse remains the consumer/curator |
-| Benefits radar | `gc-benefits` / `givecare/discovery-benefits` | daily | `houndd` acquisition and journal; Benefits owns candidate meaning |
-| Benefits legacy | `gc-benefits` / `givecare/discovery-benefits` | on-demand/manual | `houndd` adapters replace each external read; Benefits owns finalization |
-| Wiki refresh | `gc-wiki` / `givecare/refresh-wiki` | weekly | `houndd` external reads; Wiki owns refresh truth |
-| Intel refresh | `gc-intel` / `givecare/intel-refresh` | daily | `houndd` external reads; Intel owns interpretation |
-| Civic policy radar | `scty-civic` / `givecare/refresh-policy` | weekly | `houndd` external reads; Civic owns policy meaning |
-| Weekly radar curation | `GiveCare root` / `givecare/radar-curation` | weekly | `houndd` supplies evidence; curation remains an owner job |
-| Gmail/newsletters/attachments | mailbox/router owner | event-driven | `houndd` intake and journal; authorized consumers interpret |
-| Manual web | research operator | on-demand | `houndd` is the sole search/extract/capture boundary |
-| X | research operator | on-demand | `houndd` adapter and journal; no direct social client in consumers |
-| YouTube/transcription | research operator | on-demand | `houndd` media intake/transcription and provenance |
-| Atelier entity discovery | Atelier | event-driven | `houndd` external reads; Atelier owns entities |
-| Helm external ingestion | Helm | event-driven/mixed | `houndd` external reads; Helm remains the truth surface |
-| Signal daily | `GiveCare root` / `givecare/signal-daily` | daily | `houndd` acquisition/journal; Signal keeps cadence and meaning |
-
-`gc-gtm`/CRM remains a consumer of authorized records. It is not an
-acquisition owner and Hound performs no CRM write.
+The machine-readable [consumer inventory](migration/consumer-inventory.v1.json)
+is the canonical HSP-13 lane/consumer ownership, cadence category, bounded
+path, target-operation, and freeze-order contract. The read-only baseline audit
+is `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy`.
+It makes no cutover, recovery, parity, or completion claim. The named lane owner
+keeps intent, cadence, curation, classification, and downstream meaning;
+`houndd` owns only adapter, acquisition, journal, access, and evidence
+mechanics. Exact timer values remain in each lane automation contract; Hound
+has no scheduler. `gc-gtm`/CRM remains a consumer of authorized records and
+Hound performs no CRM write.
 
 Explicitly out of scope are: `gc-sms` local/runtime retrieval; local wiki/site search;
 Benefits registry query/normalization/dedupe; bench/evals; health/deploy smoke;
@@ -1046,18 +1030,9 @@ social publishing; CRM writes; and internal BB, Git, Discord, or calendar events
 
 ## Exact staged order, migration, and deletion
 
-The migration order is fixed:
-
-1. Freeze contracts.
-2. Import/mirror existing repo-local records without rewriting IDs or bytes.
-3. Shadow Pulse and Benefits.
-4. Cut over Pulse, then Benefits.
-5. Cut over wiki/intel/Civic.
-6. Cut over radar/Gmail/manual web/X/YouTube.
-7. Cut over Atelier and Helm external reads.
-8. Enable no-bypass enforcement.
-9. Delete old paths only after a successful recovery drill and at least one
-   full scheduled cycle per lane.
+The machine-readable inventory's `stage_order` and per-row wave are the
+baseline freeze-order only; its checker makes no HSP-15 completion, evidence,
+cutover, or deletion claim.
 
 Signal daily follows the same owner-controlled scheduled-cycle gate in the
 radar wave. “Cut over” means provider credentials are absent from the
@@ -1109,7 +1084,7 @@ must pass.
 | HSP-10 | Workpad remains the human-readable proposal/review surface; `plus`/`amplify` is only an immutable preference/ranking annotation; Ali makes the exact decision; `decisions.jsonl` is audit only; the native owner gate alone applies; receipt and outcome remain distinct. | Fixture: immutable records/proposal, plus annotation, exact Ali approve and decline decisions, tampered decision-log copy. Test/command: approval-binding integration test. Assert: annotation cannot fan out/approve/apply/publish/contact/execute/queue, decisions log cannot gate, exact hashes are validated by the native gate, and receipt differs from outcome. Retain: proposal, decision, gate receipt, outcome, and audit JSONL. |
 | HSP-11 | Observability exposes provider errors, spend, freshness, capture completeness, dedupe rate, consumer lag, unprocessed demand, and journal/index/recovery health without protected data. | Fixture: successful, failed, partial, stale, duplicate, lagging, and unprocessed jobs. Test/command: telemetry contract test. Assert: each signal is present, numerically consistent with the fixture, access-filtered, and free of credentials/PHI/snippets. Retain: redacted metrics snapshot and consistency report. |
 | HSP-12 | Failure/recovery acceptance covers concurrent same-content captures, crash after fetch/before commit, 429s, timeouts, truncated bytes, transcript failures, outage abstention, cursor replay, ACL non-leakage, backup restore, exact-hash approval binding, 0/1/16 MiB source limits, base64 wire overhead, digest mismatch, held-FD nofollow regular-file TOCTOU checks, the Slice 3C1 local clear-manifest PHI gate and pre-acceptance refusal, unsupported-media/encoding invalidation before scanner evaluation, future-slice bounded non-PHI quarantine, and ambiguous record/event/lineage recovery. | Fixture: the complete fault matrix and portable backup. Test/command: `PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider` plus recovery/fault integration suite. Assert: no loss, no unauthorized disclosure, no `SOURCE` path/base64/kind persistence, no downstream duplicate effect, preserved IDs/lineage after restore, supported-but-unattested source is `400`/`source_refused`, scanner/manifest error is `503`, no raw bytes on 3C1 refusal, and approval rejection on any hash drift. Retain: full pytest log, fault matrix, restored-store verification, and approval failure report. |
-| HSP-13 | The complete audited migration inventory is present with each lane’s explicit owner and cadence-authority/category: Pulse: `gc-web` / `givecare/pulse-daily`, daily. Benefits radar: `gc-benefits` / `givecare/discovery-benefits`, daily. Benefits legacy: `gc-benefits` / `givecare/discovery-benefits`, on-demand/manual. Wiki refresh: `gc-wiki` / `givecare/refresh-wiki`, weekly. Intel refresh: `gc-intel` / `givecare/intel-refresh`, daily. Civic policy radar: `scty-civic` / `givecare/refresh-policy`, weekly. Weekly radar curation: `GiveCare root` / `givecare/radar-curation`, weekly. Gmail/newsletters/attachments: mailbox/router owner, event-driven. Manual web, X, YouTube/transcription: research operator, on-demand. Atelier entity discovery: Atelier, event-driven. Helm external ingestion: Helm, event-driven/mixed. Signal daily: `GiveCare root` / `givecare/signal-daily`, daily. Exact timer values remain canonical only in each lane automation contract, not this inventory or Hound. `gc-gtm`/CRM remains a consumer only. | Fixture: checked-in inventory manifest mirroring the table and lane automation contracts. Test/command: inventory completeness checker. Assert: every required lane has one explicit owner, one cadence category, one consumer/boundary, and one migration stage; timer truth is absent from Hound; `gc-gtm`/CRM is consumer-only; and the explicit out-of-scope list is absent from the inventory. Retain: inventory report, owner attestations, and timer-authority references. |
+| HSP-13 | The complete audited migration inventory is canonical in `migration/consumer-inventory.v1.json`; it records every required lane and the two non-acquisition consumers with explicit owner, cadence authority/category, boundary, and stage. Exact timer values remain in lane automation contracts, not Hound. | Fixture: checked-in inventory manifest and lane automation contracts. Test/command: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy`. Assert: exact required ID set, one owner/cadence/boundary/stage per entry, timer truth absent from Hound, `gc-gtm`/CRM consumer-only, and out-of-scope entries absent. Retain: inventory report, owner attestations, and timer-authority references. |
 | HSP-14 | Existing repo-local records are imported/mirrored through `import.record` without rewriting caller-supplied IDs or exact bytes; authorized lineage and hashes survive, absent lineage uses the explicit no-lineage value, ambiguous lineage fails closed, and the separate import-outcome record/event preserves operation metadata; SQLite is disposable and rebuilds from journal/records; portability has no absolute-path dependency. | Fixture: legacy records with nontrivial bytes, IDs, lineage, a matching clear-manifest entry, and a copied store on a second path. Test/command: create-only `import.record`, delete-index, rebuild-index, and portable restore test. Assert: byte-for-byte/hash-for-hash identity, unchanged IDs/lineage where present, exact raw-object ID preservation, ID/byte conflicts reject without overwrite, ambiguous lineage rejects before acceptance, rebuilt projection equality, and successful verification at the second path. Retain: before/after manifests, restore log, and projection diff. |
 | HSP-15 | Migration follows the exact staged order: freeze contracts; import/mirror; shadow Pulse and Benefits; cut over Pulse then Benefits; wiki/intel/Civic; radar/Gmail/manual web/X/YouTube; Atelier and Helm external reads; enable no-bypass; delete only after recovery drill and one full scheduled cycle per lane. | Fixture: stage ledger with one lane per gate and scheduled-cycle evidence. Test/command: migration-order checker. Assert: no stage can be skipped/reordered, no deletion occurs before both gates, and Signal daily uses the scheduled-cycle gate. Retain: signed stage ledger, recovery-drill report, and per-lane cycle receipts. |
 | HSP-16 | Pulse shadow parity requires the same query set/windows/caps, explained eligible lead differences, same capture lineage/evidence bundle, freshness/lane/quality gates, no-edition/recovery behavior, downstream input hash or adjudicated semantic equivalence, no publish during shadow, and cutover with provider credentials absent from Pulse. | Fixture: frozen Pulse shadow window with identical queries, caps, provider response variants, recovery, and publish sink. Test/command: Pulse parity comparator. Assert: every parity clause, explicit differences, equal/equivalent downstream input, zero publish, and credential-free cutover. Retain: parity report, evidence-bundle hashes, and no-publish audit. |

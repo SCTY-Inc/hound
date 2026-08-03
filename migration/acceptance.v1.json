@@ -1,0 +1,17 @@
+{
+  "schema_version": "hound.migration.acceptance.v1",
+  "status": "partial_hsp_coverage",
+  "partial_hsps": ["HSP-13"],
+  "no_new_claim_hsps": ["HSP-15"],
+  "regression_only_hsps": ["HSP-18"],
+  "hsp18_mode": "baseline_only_regression",
+  "claims": {
+    "HSP-13": "inventory schema, exact audited IDs, ownership, paths, targets, and baseline report",
+    "HSP-18": "catalog/checker regression for baseline attribution and forbidden-indicator detection only; no no-bypass completion is claimed"
+  },
+  "completion": {
+    "migration_inventory": "migration/consumer-inventory.v1.json",
+    "provider_indicator_catalog": "migration/provider-indicators.v1.json",
+    "checker": "migration/check_consumer_inventory.py"
+  }
+}
