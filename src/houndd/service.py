@@ -29,6 +29,7 @@ from . import HounddStore
 from ._safety import AnchoredRoot
 from .journal import JournalError
 from .store import StoreError
+from .verify import verify_store
 
 
 WIRE_VERSION = "houndd.uds.v1"
@@ -239,6 +240,18 @@ def _assert_frozen(policy: FrozenPolicy, state_root: Path) -> None:
         raise PolicyError("policy changed after service startup")
 
 
+def _phi_fingerprint(path: Path) -> tuple[int, int, int, int, int, int, int]:
+    """Bind write readiness to the exact operator-provisioned manifest leaf."""
+
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise PhiManifestError("clear manifest is unavailable") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise PhiManifestError("clear manifest is unsafe")
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns)
+
+
 def _read_exact(connection: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -432,6 +445,7 @@ class HounddService:
         self.identity: ServiceIdentity | None = None
         self.policy: FrozenPolicy | None = None
         self.phi_scanner: PhiScanner | None = None
+        self._phi_fingerprint: tuple[int, int, int, int, int, int, int] | None = None
         self.commit_runtime: CommitRuntime | None = None
         self._socket_identity: tuple[int, int] | None = None
         self._runtime_root: AnchoredRoot | None = None
@@ -441,19 +455,21 @@ class HounddService:
             if not self.store.verify()["valid"]:
                 raise ServiceError("startup recovery verification failed")
             self.policy = load_frozen_policy(self.state_root)
-            self.identity = ServiceIdentity(self.state_root, create=True)
             # Slice 3B reads remain available without a 3C1 scanner.  The
             # scanner is nevertheless frozen at startup when provisioned, and
             # commits fail unavailable rather than loading it lazily.
             try:
                 self.phi_scanner = PhiScanner.from_path(phi_manifest_path(self.state_root))
+                self._phi_fingerprint = _phi_fingerprint(phi_manifest_path(self.state_root))
             except PhiManifestError:
                 self.phi_scanner = None
-            # Durable POST publication remains unavailable until the accepted
-            # startup-recovery contract can certify every crash state.  The
-            # strict parser/client/framing boundary is still active and fails
-            # closed with the commit response schema.
-            self.commit_runtime = None
+                self._phi_fingerprint = None
+            self.commit_runtime = CommitRuntime(self.state_root)
+            self.commit_runtime.reconcile()
+            self.store.rebuild_index()
+            if not verify_store(self.state_root)["valid"]:
+                raise ServiceError("commit recovery verification failed")
+            self.identity = ServiceIdentity(self.state_root, create=True)
             self._bind()
         except Exception:
             self.close()
@@ -561,6 +577,20 @@ class HounddService:
         ):
             raise ServiceError("service socket binding changed")
 
+    def _assert_frozen_phi(self) -> None:
+        """Reject any manifest replacement before caller source normalization."""
+
+        scanner = self.phi_scanner
+        fingerprint = self._phi_fingerprint
+        if scanner is None or fingerprint is None:
+            raise PhiManifestError("clear manifest is unavailable")
+        path = phi_manifest_path(self.state_root)
+        if _phi_fingerprint(path) != fingerprint:
+            raise PhiManifestError("clear manifest changed after service startup")
+        current = PhiScanner.from_path(path)
+        if current.manifest_entries != scanner.manifest_entries or _phi_fingerprint(path) != fingerprint:
+            raise PhiManifestError("clear manifest changed after service startup")
+
     def _dispatch_commit(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the two 3C1 routes after peer/policy authorization."""
 
@@ -568,6 +598,8 @@ class HounddService:
         if request_id is None:
             raise RequestError("commit request ID is invalid")
         try:
+            if self._owner_pid != os.getpid():
+                raise CommitUnavailable("service cannot dispatch commits after fork")
             route = resolve_route(frame["method"], frame["path"], require_available=True)
             request = parse_commit_request(frame["body"], route)
             assert self.policy is not None
@@ -577,6 +609,7 @@ class HounddService:
                 return _commit_response(request.request_id, 404, ok=False, outcome="invalid")
             if self.phi_scanner is None or self.commit_runtime is None:
                 return _commit_response(request.request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
+            self._assert_frozen_phi()
             access, lineage_scope = authorized
             replay = self.commit_runtime.probe(request, route, principal=principal.subject)
             if replay.response_template is not None:
@@ -598,9 +631,11 @@ class HounddService:
             )
         except CommitCollision:
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="request_conflict")
+        except PhiManifestError:
+            return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
         except (CommitContractError, SourceError, PhiInputError, ValueError):
             return _commit_response(request_id, 400, ok=False, outcome="invalid", error_code="invalid_request")
-        except (CommitIntegrityError, CommitUnavailable, CommitRuntimeError, PhiManifestError, StoreError, JournalError, OSError):
+        except (CommitIntegrityError, CommitUnavailable, CommitRuntimeError, StoreError, JournalError, OSError):
             return _commit_response(request_id, 503, ok=False, outcome="unavailable", error_code="unavailable")
 
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:

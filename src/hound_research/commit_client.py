@@ -1,9 +1,4 @@
-"""Strict socket-only client for private Slice 3C1 commit tests.
-
-The public ``hound-research`` ingest CLI remains deliberately deferred.  This
-module is a small transport seam for integration consumers and cannot import
-the legacy adapter stack.
-"""
+"""Strict socket-only client for the two public Slice 3C1 commit commands."""
 
 from __future__ import annotations
 
@@ -71,12 +66,12 @@ def strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
         else:
             raise CommitClientError("houndd response violates the commit contract")
     elif status == 400:
-        if body["ok"] is not False or body["outcome"] != "invalid" or "error" not in body:
+        if body["ok"] is not False or body["outcome"] != "invalid" or body["record_ids"] or body["entry_ids"] or "error" not in body:
             raise CommitClientError("houndd response violates the commit contract")
     elif status == 404:
-        if body["ok"] is not False or body["record_ids"] or body["entry_ids"] or "error" in body:
+        if body["ok"] is not False or body["outcome"] != "invalid" or body["record_ids"] or body["entry_ids"] or "error" in body:
             raise CommitClientError("houndd response violates the commit contract")
-    elif body["ok"] is not False or body["outcome"] != "unavailable" or "error" not in body:
+    elif body["ok"] is not False or body["outcome"] != "unavailable" or body["record_ids"] or body["entry_ids"] or "error" not in body:
         raise CommitClientError("houndd response violates the commit contract")
     return frame
 

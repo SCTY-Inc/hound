@@ -12,9 +12,10 @@ from hound_cli.cli import _HoundArgumentParser, _emit, _exit_for_result, _input_
 from hound_cli.contracts import ContractError
 from hound_cli.orchestrator import HoundError
 from hound_cli.runtime import RuntimeErrorHound
-from houndd.contracts import canonical_bytes
+from houndd.commit import CommitContractError, parse_commit_request, resolve_route
 from houndd.query_contracts import parse_query_request
 from houndd.service import WIRE_VERSION
+from .commit_client import CommitClientError, exchange as commit_exchange, exit_code as commit_exit_code
 from .journal_client import JournalClientError, exchange
 
 
@@ -110,7 +111,31 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--cursor")
     query.add_argument("--request-id", default="hound-research-query")
     query.set_defaults(handler=_handle_journal_query)
+
+    ingest = top.add_parser("ingest", help="Submit one source declaration to local houndd")
+    ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
+    file_commit = ingest_sub.add_parser("file", help="Commit one certified local file through houndd")
+    _commit_arguments(file_commit)
+    file_commit.set_defaults(handler=_handle_ingest_file)
+
+    import_record = top.add_parser("import-record", help="Mirror one legacy record through local houndd")
+    _commit_arguments(import_record)
+    import_record.add_argument("--record-id", required=True)
+    import_record.set_defaults(handler=_handle_import_record)
     return parser
+
+
+def _commit_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--socket", required=True)
+    parser.add_argument("--owner-id", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--policy-id", required=True)
+    parser.add_argument("--requested-access", choices=("public", "workspace", "restricted"), default="restricted")
+    parser.add_argument("--idempotency-key", required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--sha256", required=True)
+    parser.add_argument("--byte-length", type=int, required=True)
 
 
 def _handle_verify(args: argparse.Namespace) -> dict[str, Any]:
@@ -209,12 +234,65 @@ def _handle_journal_query(args: argparse.Namespace) -> dict[str, Any]:
     raise HoundError(json.dumps(response["body"], sort_keys=True, separators=(",", ":")), exit_code={400: 2, 404: 3, 503: 5}[status])
 
 
+def _commit_request(args: argparse.Namespace, operation: str) -> tuple[Path, dict[str, Any]]:
+    socket_path = Path(args.socket)
+    if not socket_path.is_absolute():
+        raise HoundError("--socket must be an absolute path", exit_code=2)
+    source = {
+        "kind": "path",
+        "path": args.path,
+        "sha256": args.sha256,
+        "byte_length": args.byte_length,
+    }
+    payload: dict[str, Any] = {"source": source}
+    path = "/v1/ingest/file"
+    if operation == "ingest.file":
+        payload["media_type"] = "application/octet-stream"
+    else:
+        path = "/v1/import-record"
+        payload["record_id"] = args.record_id
+    body = {
+        "schema_version": "houndd.commit-request.v1",
+        "request_id": args.request_id,
+        "idempotency_key": args.idempotency_key,
+        "producer": {"owner_id": args.owner_id, "capability": operation, "run_id": args.run_id},
+        "requested_access": args.requested_access,
+        "policy_id": args.policy_id,
+        "operation": {"name": operation, "payload": payload},
+    }
+    try:
+        request = parse_commit_request(body, resolve_route("POST", path, require_available=True))
+    except (CommitContractError, TypeError, ValueError) as error:
+        raise HoundError("commit request is invalid", exit_code=2) from error
+    return socket_path, {"wire_version": WIRE_VERSION, "method": "POST", "path": path, "body": request.to_wire_dict()}
+
+
+def _handle_commit(args: argparse.Namespace, operation: str) -> dict[str, Any]:
+    socket_path, request = _commit_request(args, operation)
+    try:
+        response = commit_exchange(socket_path, request)
+    except CommitClientError as error:
+        raise HoundError(str(error), exit_code=5) from error
+    args._commit_exit_code = commit_exit_code(response)
+    return response["body"]
+
+
+def _handle_ingest_file(args: argparse.Namespace) -> dict[str, Any]:
+    return _handle_commit(args, "ingest.file")
+
+
+def _handle_import_record(args: argparse.Namespace) -> dict[str, Any]:
+    return _handle_commit(args, "import.record")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
         result = args.handler(args)
         _emit(result)
+        if hasattr(args, "_commit_exit_code"):
+            return args._commit_exit_code
         return _exit_for_result(result)
     except HoundError as exc:
         _emit({"schema_version": "hound.error.v1", "error": str(exc)}, stream=sys.stderr)

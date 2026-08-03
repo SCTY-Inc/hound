@@ -381,6 +381,11 @@ class CommitRuntime:
         if checked_event != envelope:
             raise CommitIntegrityError("open marker journal event changed during validation")
         artifact = envelope["artifact"]
+        expected_dedupe = (
+            {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}
+            if capability == "import.record" and body.get("outcome") == "interrupted"
+            else None
+        )
         if (
             artifact["record_id"] != record_id
             or artifact["hash"] != record_id
@@ -388,7 +393,7 @@ class CommitRuntime:
             or envelope["policy_id"] != canonical["policy_id"]
             or envelope["access"] != marker["access"]
             or envelope["lineage"] != lineage
-            or envelope["dedupe"]["content_sha256"] != source["sha256"]
+            or (envelope["dedupe"] != expected_dedupe if expected_dedupe is not None else envelope["dedupe"]["content_sha256"] != source["sha256"])
         ):
             raise CommitIntegrityError("open marker journal binding disagrees")
         self._template(reservation.get("response"))
@@ -559,7 +564,7 @@ class CommitRuntime:
         if type(entry_id) is not str or self.journal.get(entry_id) != envelope:
             raise CommitIntegrityError("completed journal event changed")
         source = marker.get("source")
-        if type(source) is not dict or envelope.get("dedupe", {}).get("content_sha256") != source.get("sha256"):
+        if type(source) is not dict:
             raise CommitIntegrityError("completed event/source binding disagrees")
         operation = marker.get("operation")
         if (
@@ -579,8 +584,21 @@ class CommitRuntime:
                 or legacy.get("byte_length") != source.get("byte_length")
             ):
                 raise CommitIntegrityError("completed legacy import changed")
-            self._verify_legacy_binding(legacy["record_id"], legacy["sha256"], legacy["byte_length"])
-            expected_records = [legacy["record_id"], record_id]
+            if body.get("outcome") == "completed":
+                if envelope.get("dedupe") != {"object_key": f"legacy:{legacy['record_id']}", "content_sha256": source["sha256"]}:
+                    raise CommitIntegrityError("completed event/source binding disagrees")
+                self._verify_legacy_binding(legacy["record_id"], legacy["sha256"], legacy["byte_length"])
+                expected_records = [legacy["record_id"], record_id]
+            elif body.get("outcome") == "interrupted":
+                # Open/no-stage recovery has only declared attempt metadata.
+                # It must never turn that metadata into a raw legacy-object
+                # lookup, claim, or dedupe identity.
+                if envelope.get("dedupe") != {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}:
+                    raise CommitIntegrityError("interrupted import dedupe binding disagrees")
+            else:
+                raise CommitIntegrityError("completed import outcome is invalid")
+        elif envelope.get("dedupe", {}).get("content_sha256") != source.get("sha256"):
+            raise CommitIntegrityError("completed event/source binding disagrees")
         if response["outcome"] not in {"completed", "interrupted"} or response["record_ids"] != expected_records or response["entry_ids"] != [entry_id]:
             raise CommitIntegrityError("completed response does not bind durable truth")
         return response
@@ -676,24 +694,25 @@ class CommitRuntime:
                     operation = marker.get("operation")
                     if operation not in {"ingest.file", "import.record"}:
                         raise CommitIntegrityError("open commit operation is malformed")
-                    if operation == "import.record":
-                        raise CommitIntegrityError("open import recovery requires an accepted contract")
                     request_hash = _sha(marker.get("request_hash"), "request_hash")
                     source_record = {"sha256": source.get("sha256"), "byte_length": source.get("byte_length"), "media_type": "application/octet-stream", "encoding": "identity"}
                     if operation == "ingest.file":
                         body = {"schema_version": "houndd.file-record.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": operation, "outcome": "interrupted", "evidence_status": "interrupted", "source": source_record, "lineage": lineage}
-                        artifact_kind, schema, native_id, object_key, ids = "file", "houndd.file-record.v1", source.get("sha256"), f"file:{source.get('sha256')}", None
+                        artifact_kind, schema, native_id, object_key, content_sha256 = "file", "houndd.file-record.v1", source.get("sha256"), f"file:{source.get('sha256')}", source_record["sha256"]
                     else:
                         payload = canonical.get("operation", {}).get("payload") if type(canonical.get("operation")) is dict else None
                         legacy_id = payload.get("record_id") if type(payload) is dict else None
                         if type(legacy_id) is not str:
                             raise CommitIntegrityError("open import metadata is malformed")
                         body = {"schema_version": "houndd.import-outcome.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": operation, "outcome": "interrupted", "evidence_status": "interrupted", "legacy": {"record_id": legacy_id, **source_record}, "lineage": lineage}
-                        artifact_kind, schema, native_id, object_key, ids = "import", "houndd.import-outcome.v1", legacy_id, f"legacy:{legacy_id}", legacy_id
+                        artifact_kind, schema, native_id = "import", "houndd.import-outcome.v1", legacy_id
                     try:
                         result = self.records.put_json(body)
                     except StoreError as error:
                         raise CommitIntegrityError("interrupted outcome cannot be recorded") from error
+                    if operation == "import.record":
+                        object_key = f"import-outcome:{result.record_id}"
+                        content_sha256 = result.content_sha256
                     access = marker.get("access")
                     policy_id = marker.get("policy_id")
                     if type(access) is not str or type(policy_id) is not str:
@@ -708,15 +727,14 @@ class CommitRuntime:
                         classification={"outcome": "interrupted", "evidence_status": "interrupted"},
                         access=access,
                         policy_id=policy_id,
-                        dedupe={"object_key": object_key, "content_sha256": source_record["sha256"]},
+                        dedupe={"object_key": object_key, "content_sha256": content_sha256},
                         usage={"requests": 0, "bytes": source_record["byte_length"], "cost": 0},
                     )
                     try:
                         self.journal.append(envelope)
                     except JournalError as error:
                         raise CommitIntegrityError("interrupted event cannot be recorded") from error
-                    record_ids = [result.record_id] if ids is None else [ids, result.record_id]
-                    reservation["response"] = {"ok": False, "outcome": "interrupted", "record_ids": record_ids, "entry_ids": [envelope["entry_id"]], "usage": {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}}
+                    reservation["response"] = {"ok": False, "outcome": "interrupted", "record_ids": [result.record_id], "entry_ids": [envelope["entry_id"]], "usage": {"requests": 0, "bytes": source_record["byte_length"], "cost": 0}}
                     marker["record_id"] = result.record_id
                     marker["record_body"] = body
                     marker["envelope"] = envelope

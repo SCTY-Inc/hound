@@ -200,21 +200,48 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                             type(legacy_id) is not str
                             or type(legacy_digest) is not str
                             or type(legacy_length) is not int
-                            or legacy_digest != digest
                             or legacy.get("media_type") != "application/octet-stream"
                             or legacy.get("encoding") != "identity"
                             or event.get("source", {}).get("provider") != "legacy"
                             or event.get("source", {}).get("native_id") != legacy_id
                         ):
                             raise ValueError("import outcome does not bind the journal event")
-                        referenced_records.add(legacy_id)
-                        raw = records.read(legacy_id)
+                        if outcome.get("outcome") == "completed":
+                            if (
+                                event.get("classification") != {"outcome": "completed", "evidence_status": "clear"}
+                                or legacy_digest != digest
+                                or dedupe != {"object_key": f"legacy:{legacy_id}", "content_sha256": legacy_digest}
+                            ):
+                                raise ValueError("completed import event does not bind legacy truth")
+                            referenced_records.add(legacy_id)
+                            raw = records.read(legacy_id)
+                            if (
+                                legacy_id not in legacy_manifest_ids
+                                or len(raw) != legacy_length
+                                or not records.verify_record(legacy_id, legacy_digest)
+                            ):
+                                raise ValueError("legacy import bytes do not verify")
+                        elif outcome.get("outcome") == "interrupted":
+                            if (
+                                event.get("classification") != {"outcome": "interrupted", "evidence_status": "interrupted"}
+                                or dedupe != {"object_key": f"import-outcome:{record_id}", "content_sha256": record_id}
+                            ):
+                                raise ValueError("interrupted import claims raw legacy truth")
+                        else:
+                            raise ValueError("import outcome is unsupported")
+                    elif artifact.get("schema") == "houndd.file-record.v1":
+                        file_outcome = records.read_json(record_id)
                         if (
-                            legacy_id not in legacy_manifest_ids
-                            or len(raw) != legacy_length
-                            or not records.verify_record(legacy_id, legacy_digest)
+                            type(file_outcome) is not dict
+                            or file_outcome.get("schema_version") != "houndd.file-record.v1"
+                            or file_outcome.get("operation") != "ingest.file"
                         ):
-                            raise ValueError("legacy import bytes do not verify")
+                            raise ValueError("file outcome record is malformed")
+                        if file_outcome.get("outcome") == "completed":
+                            referenced_blobs.add(digest)
+                            records.blobs.get(digest)
+                        elif file_outcome.get("outcome") != "interrupted":
+                            raise ValueError("file outcome is unsupported")
                     else:
                         referenced_blobs.add(digest)
                         blob = records.blobs.get(digest)

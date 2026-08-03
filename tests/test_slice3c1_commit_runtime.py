@@ -10,18 +10,21 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
 from houndd import HounddStore
-from houndd.contracts import canonical_bytes, canonical_hash
+from houndd.contracts import canonical_bytes, canonical_hash, make_journal_envelope
 from houndd.service import HounddService
 from houndd.access import AuthenticatedPrincipal
 from houndd.commit import make_commit_response, parse_commit_request, resolve_route, normalize_source
 from houndd.commit_runtime import CommitRuntime, CommitCollision, CommitIntegrityError
 from houndd.verify import verify_store
+from hound_research import cli as research_cli
 from hound_research.commit_client import CommitClientError, exchange, exit_code, strict_response
 
 
@@ -124,8 +127,8 @@ def test_slice3c1_refusal_and_reserved_route_do_not_create_state(tmp_path: Path)
     principal = AuthenticatedPrincipal(f"linux-uid:{os.getuid()}")
     try:
         refusal = service._dispatch(principal, _frame(operation="ingest.file", data=data, key="refused", request_id="one"))
-        assert refusal["status"] == 503
-        assert refusal["body"]["error"]["code"] == "unavailable"
+        assert refusal["status"] == 400
+        assert refusal["body"]["error"]["code"] == "source_refused"
         reserved = _frame(operation="ingest.file", data=data, key="reserved", request_id="two")
         reserved["path"] = "/v1/ingest/search"
         reserved["body"]["operation"]["name"] = "ingest.search"  # type: ignore[index]
@@ -133,16 +136,18 @@ def test_slice3c1_refusal_and_reserved_route_do_not_create_state(tmp_path: Path)
         denied = service._dispatch(principal, reserved)
         assert denied["status"] == 400
         assert not service.store.journal.entries()  # type: ignore[union-attr]
-        assert not (state / "commit3c1").exists()
+        assert not list((state / "commit3c1" / "reservations").iterdir())
+        assert not list((state / "commit3c1" / "open").iterdir())
     finally:
         service.close()
 
 
-def test_slice3c1_prepared_record_recovers_once_and_collision_never_reads_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("operation", "legacy_id"), (("ingest.file", None), ("import.record", "recovery-legacy")))
+def test_slice3c1_prepared_record_recovers_once_and_collision_never_reads_source(tmp_path: Path, operation: str, legacy_id: str | None) -> None:
     data = b"certified recovery input"
     state = _state(tmp_path, data)
-    route = resolve_route("POST", "/v1/ingest/file", require_available=True)
-    wire = _frame(operation="ingest.file", data=data, key="recovery-key", request_id="one")
+    route = resolve_route("POST", "/v1/import-record" if operation == "import.record" else "/v1/ingest/file", require_available=True)
+    wire = _frame(operation=operation, data=data, key="recovery-key", request_id="one", legacy_id=legacy_id)
     request = parse_commit_request(wire["body"], route)
     source = normalize_source(request.source.to_wire())
 
@@ -161,7 +166,7 @@ def test_slice3c1_prepared_record_recovers_once_and_collision_never_reads_source
         assert recovered.reconcile() and recovered.journal.high_watermark() == 0
         replay = recovered.probe(request, route, principal=f"linux-uid:{os.getuid()}")
         assert replay.response_template is not None
-        changed = _frame(operation="ingest.file", data=data, key="recovery-key", request_id="two")
+        changed = _frame(operation=operation, data=data, key="recovery-key", request_id="two", legacy_id=legacy_id)
         changed["body"]["requested_access"] = "workspace"  # type: ignore[index]
         changed_request = parse_commit_request(changed["body"], route)
         with pytest.raises(CommitCollision):
@@ -185,12 +190,94 @@ def test_slice3c1_real_uds_post_and_strict_client_exit_mapping(tmp_path: Path) -
                 break
             time.sleep(0.01)
         response = exchange(path, _frame(operation="ingest.file", data=data, key="socket-key", request_id="socket-request"))
-        assert response["status"] == 503
+        assert response["status"] == 200
         assert response["body"]["schema_version"] == "houndd.commit-response.v1"
-        assert exit_code(response) == 5
+        assert response["body"]["outcome"] == "completed"
+        assert len(response["body"]["record_ids"]) == len(response["body"]["entry_ids"]) == 1
+        assert exit_code(response) == 0
     finally:
         service.close()
         thread.join(timeout=2)
+
+
+def test_slice3c1_real_subprocess_uds_commits_exact_journal_and_projection_rows(tmp_path: Path) -> None:
+    data = b"subprocess certified source"
+    state = _state(tmp_path, data)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    path = runtime / "houndd.sock"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "houndd.cli", "serve", "--state", os.fspath(state), "--socket", os.fspath(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert process.poll() is None, process.stderr.read()
+        file_response = exchange(path, _frame(operation="ingest.file", data=data, key="subprocess-file", request_id="file"))
+        import_response = exchange(path, _frame(operation="import.record", data=data, key="subprocess-import", request_id="import", legacy_id="legacy-subprocess"))
+        assert (file_response["status"], import_response["status"]) == (200, 200)
+        assert len(file_response["body"]["record_ids"]) == 1
+        assert import_response["body"]["record_ids"][0] == "legacy-subprocess"
+        assert len(import_response["body"]["record_ids"]) == 2
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    with HounddStore(state) as store:
+        store.rebuild_index()
+        events = store.journal.entries()
+        rows = store.projection.rows()
+    assert [event["artifact"]["schema"] for event in events] == ["houndd.file-record.v1", "houndd.import-outcome.v1"]
+    assert [row["record_id"] for row in rows] == [file_response["body"]["record_ids"][0], import_response["body"]["record_ids"][1]]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected_exit"),
+    (
+        (200, {"ok": False, "outcome": "interrupted", "record_ids": ["outcome"], "entry_ids": ["entry"], "error": {"code": "operation_failed", "retryable": False, "message": "operation failed"}}, 4),
+        (400, {"ok": False, "outcome": "invalid", "record_ids": [], "entry_ids": [], "error": {"code": "invalid_request", "retryable": False, "message": "invalid request"}}, 2),
+        (404, {"ok": False, "outcome": "invalid", "record_ids": [], "entry_ids": []}, 3),
+        (503, {"ok": False, "outcome": "unavailable", "record_ids": [], "entry_ids": [], "error": {"code": "unavailable", "retryable": True, "message": "service unavailable"}}, 5),
+    ),
+)
+def test_slice3c1_fake_server_validates_responses_and_cli_exit_matrix(tmp_path: Path, capsys: pytest.CaptureFixture[str], status: int, body: dict[str, object], expected_exit: int) -> None:
+    socket_path = tmp_path / f"fake-{status}.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(os.fspath(socket_path))
+    server.listen(1)
+    response = make_commit_response(
+        "fake-request",
+        ok=body["ok"],  # type: ignore[arg-type]
+        outcome=body["outcome"],  # type: ignore[arg-type]
+        record_ids=body["record_ids"],  # type: ignore[arg-type]
+        entry_ids=body["entry_ids"],  # type: ignore[arg-type]
+        usage={"requests": 0, "bytes": 0, "cost": 0},
+        error=body.get("error"),  # type: ignore[arg-type]
+    )
+    raw = canonical_bytes({"wire_version": "houndd.uds.v1", "status": status, "body": response})
+
+    def fake_server() -> None:
+        connection, _ = server.accept()
+        with connection:
+            while connection.recv(4096):
+                pass
+            connection.sendall(len(raw).to_bytes(4, "big") + raw)
+        server.close()
+
+    thread = threading.Thread(target=fake_server)
+    thread.start()
+    source = tmp_path / "declared-source"
+    code = research_cli.main([
+        "ingest", "file", "--socket", os.fspath(socket_path), "--owner-id", "writer", "--run-id", "run", "--policy-id", "write-policy",
+        "--idempotency-key", f"fake-{status}", "--request-id", "fake-request", "--path", os.fspath(source), "--sha256", "0" * 64, "--byte-length", "0",
+    ])
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert code == expected_exit
+    assert json.loads(capsys.readouterr().out)["schema_version"] == "houndd.commit-response.v1"
 
 
 def test_slice3c1_client_accepts_every_durable_noncompleted_outcome() -> None:
@@ -412,3 +499,265 @@ def test_slice3c1_client_requires_one_entry_and_nonempty_records_for_durable_200
                     canonical_bytes({"wire_version": "houndd.uds.v1", "status": 200, "body": body}),
                     request_id="request",
                 )
+
+
+def test_slice3c1_open_import_recovery_is_outcome_only_and_replays_without_raw_object(tmp_path: Path) -> None:
+    data = b"interrupted import source"
+    state = _state(tmp_path, data)
+    route = resolve_route("POST", "/v1/import-record", require_available=True)
+    request = parse_commit_request(
+        _frame(operation="import.record", data=data, key="interrupted-import", request_id="one", legacy_id="legacy-interrupted")["body"],
+        route,
+    )
+    source = normalize_source(request.source.to_wire())
+
+    def crash(phase: str) -> None:
+        if phase == "after_open":
+            raise RuntimeError("simulated process death")
+
+    runtime = CommitRuntime(state, fault_hook=crash)
+    try:
+        with pytest.raises(RuntimeError):
+            runtime.execute(request, route, principal=f"linux-uid:{os.getuid()}", access="public", source=source, scanner_clear=True)
+    finally:
+        runtime.close()
+
+    recovered = CommitRuntime(state)
+    try:
+        assert recovered.reconcile() == [{"attempt_id": recovered._pair(request, route, f"linux-uid:{os.getuid()}")[1], "outcome": "interrupted"}]
+        replay = recovered.probe(request, route, principal=f"linux-uid:{os.getuid()}")
+        assert replay.response_template is not None
+        assert replay.response_template["outcome"] == "interrupted"
+        assert len(replay.response_template["record_ids"]) == len(replay.response_template["entry_ids"]) == 1
+        assert not recovered.records.has("legacy-interrupted")  # type: ignore[union-attr]
+        assert verify_store(state, projection=False)["valid"] is True
+    finally:
+        recovered.close()
+
+
+def test_slice3c1_open_file_recovery_has_one_interrupted_outcome_and_no_blob(tmp_path: Path) -> None:
+    data = b"interrupted file source"
+    state = _state(tmp_path, data)
+    route = resolve_route("POST", "/v1/ingest/file", require_available=True)
+    request = parse_commit_request(_frame(operation="ingest.file", data=data, key="interrupted-file", request_id="one")["body"], route)
+    source = normalize_source(request.source.to_wire())
+
+    def crash(phase: str) -> None:
+        if phase == "after_open":
+            raise RuntimeError("simulated process death")
+
+    runtime = CommitRuntime(state, fault_hook=crash)
+    try:
+        with pytest.raises(RuntimeError):
+            runtime.execute(request, route, principal=f"linux-uid:{os.getuid()}", access="public", source=source, scanner_clear=True)
+    finally:
+        runtime.close()
+
+    recovered = CommitRuntime(state)
+    try:
+        assert recovered.reconcile()
+        replay = recovered.probe(request, route, principal=f"linux-uid:{os.getuid()}")
+        assert replay.response_template is not None
+        assert replay.response_template["outcome"] == "interrupted"
+        assert len(replay.response_template["record_ids"]) == len(replay.response_template["entry_ids"]) == 1
+        assert not list((state / "blobs").iterdir())
+        assert verify_store(state, projection=False)["valid"] is True
+    finally:
+        recovered.close()
+
+
+def test_slice3c1_service_replays_before_source_and_rejects_changed_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import houndd.service as service_module
+
+    data = b"replay before source"
+    state = _state(tmp_path, data)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    principal = AuthenticatedPrincipal(f"linux-uid:{os.getuid()}")
+    first = _frame(operation="ingest.file", data=data, key="same-key", request_id="one")
+    try:
+        completed = service._dispatch(principal, first)
+        assert completed["status"] == 200
+        monkeypatch.setattr(service_module, "normalize_source", lambda _value: (_ for _ in ()).throw(AssertionError("source reread")))
+        replay = _frame(operation="ingest.file", data=data, key="same-key", request_id="two")
+        repeated = service._dispatch(principal, replay)
+        assert repeated["status"] == 200
+        assert repeated["body"]["record_ids"] == completed["body"]["record_ids"]
+        changed = _frame(operation="ingest.file", data=data, key="same-key", request_id="three")
+        changed["body"]["operation"]["payload"]["source"]["sha256"] = "0" * 64  # type: ignore[index]
+        collision = service._dispatch(principal, changed)
+        assert collision["status"] == 400
+        assert collision["body"]["error"]["code"] == "request_conflict"
+        assert len(service.store.journal.entries()) == 1  # type: ignore[union-attr]
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("state_change", ("absent", "unsafe"))
+def test_slice3c1_unavailable_phi_manifest_never_reads_source_or_creates_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_change: str) -> None:
+    import houndd.service as service_module
+
+    data = b"manifest boundary"
+    state = _state(tmp_path, data)
+    manifest = state / "service" / "phi-clear.json"
+    if state_change == "absent":
+        manifest.unlink()
+    else:
+        manifest.chmod(0o644)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    principal = AuthenticatedPrincipal(f"linux-uid:{os.getuid()}")
+    monkeypatch.setattr(service_module, "normalize_source", lambda _value: (_ for _ in ()).throw(AssertionError("source read")))
+    try:
+        response = service._dispatch(principal, _frame(operation="ingest.file", data=data, key=f"manifest-{state_change}", request_id="one"))
+        assert response["status"] == 503
+        assert not list((state / "commit3c1" / "reservations").iterdir())
+    finally:
+        service.close()
+
+
+def test_slice3c1_replaced_phi_manifest_and_forked_service_fail_before_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import houndd.service as service_module
+
+    data = b"frozen manifest boundary"
+    state = _state(tmp_path, data)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    principal = AuthenticatedPrincipal(f"linux-uid:{os.getuid()}")
+    manifest = state / "service" / "phi-clear.json"
+    replacement = state / "service" / "replacement.json"
+    replacement.write_bytes(manifest.read_bytes())
+    replacement.chmod(0o600)
+    os.replace(replacement, manifest)
+    monkeypatch.setattr(service_module, "normalize_source", lambda _value: (_ for _ in ()).throw(AssertionError("source read")))
+    try:
+        replaced = service._dispatch(principal, _frame(operation="ingest.file", data=data, key="replaced", request_id="one"))
+        assert replaced["status"] == 503
+        service._owner_pid = -1
+        forked = service._dispatch(principal, _frame(operation="ingest.file", data=data, key="forked", request_id="two"))
+        assert forked["status"] == 503
+        assert not list((state / "commit3c1" / "reservations").iterdir())
+    finally:
+        service.close()
+
+
+def test_slice3c1_authorization_denial_never_reads_source_or_creates_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import houndd.service as service_module
+
+    data = b"authorization boundary"
+    state = _state(tmp_path, data)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    service = HounddService(state_root=state, socket_path=runtime / "houndd.sock")
+    monkeypatch.setattr(service_module, "normalize_source", lambda _value: (_ for _ in ()).throw(AssertionError("source read")))
+    try:
+        response = service._dispatch(AuthenticatedPrincipal("linux-uid:999999"), _frame(operation="ingest.file", data=data, key="denied", request_id="one"))
+        assert response["status"] == 404
+        assert response["body"]["record_ids"] == response["body"]["entry_ids"] == []
+        assert not list((state / "commit3c1" / "reservations").iterdir())
+    finally:
+        service.close()
+
+
+def test_slice3c1_recovery_rejects_partial_pair_and_event_without_record(tmp_path: Path) -> None:
+    data = b"recovery integrity"
+    route = resolve_route("POST", "/v1/ingest/file", require_available=True)
+    principal = f"linux-uid:{os.getuid()}"
+
+    partial_root = tmp_path / "partial"
+    partial_root.mkdir()
+    partial_state = _state(partial_root, data)
+    partial_request = parse_commit_request(_frame(operation="ingest.file", data=data, key="partial", request_id="one")["body"], route)
+    partial_runtime = CommitRuntime(partial_state, fault_hook=lambda phase: (_ for _ in ()).throw(RuntimeError("stop")) if phase == "after_open" else None)
+    try:
+        with pytest.raises(RuntimeError):
+            partial_runtime.execute(partial_request, route, principal=principal, access="public", source=normalize_source(partial_request.source.to_wire()), scanner_clear=True)
+    finally:
+        partial_runtime.close()
+    next((partial_state / "commit3c1" / "open").iterdir()).unlink()
+    with pytest.raises(CommitIntegrityError):
+        CommitRuntime(partial_state)
+
+    event_root = tmp_path / "event"
+    event_root.mkdir()
+    event_state = _state(event_root, data)
+    event_request = parse_commit_request(_frame(operation="ingest.file", data=data, key="event", request_id="two")["body"], route)
+    event_runtime = CommitRuntime(event_state, fault_hook=lambda phase: (_ for _ in ()).throw(RuntimeError("stop")) if phase == "after_journal" else None)
+    try:
+        with pytest.raises(RuntimeError):
+            event_runtime.execute(event_request, route, principal=principal, access="public", source=normalize_source(event_request.source.to_wire()), scanner_clear=True)
+    finally:
+        event_runtime.close()
+    marker = json.loads(next((event_state / "commit3c1" / "open").iterdir()).read_bytes())
+    (event_state / "records" / f"{marker['record_id']}.bin").unlink()
+    recovered = CommitRuntime(event_state)
+    try:
+        with pytest.raises(CommitIntegrityError):
+            recovered.reconcile()
+    finally:
+        recovered.close()
+
+
+def test_slice3c1_ambiguous_authorized_import_lineage_rejects_before_reservation(tmp_path: Path) -> None:
+    data = b"ambiguous lineage"
+    state = _state(tmp_path, data)
+    runtime = CommitRuntime(state)
+    route = resolve_route("POST", "/v1/import-record", require_available=True)
+    request = parse_commit_request(_frame(operation="import.record", data=data, key="ambiguous", request_id="one", legacy_id="legacy-ambiguous")["body"], route)
+    try:
+        for sequence, lineage in enumerate((
+            {"relation": "none", "record_id": "legacy-ambiguous", "lead_id": "none"},
+            {"relation": "derived_from", "record_id": "other", "lead_id": "lead"},
+        )):
+            runtime.journal.append(make_journal_envelope(
+                sequence=sequence,
+                appended_at=f"2026-08-03T00:00:0{sequence}Z",
+                producer={"owner_id": "writer", "capability": "import.record", "run_id": "prior"},
+                artifact={"kind": "import", "schema": "legacy.record.v1", "record_id": f"prior-{sequence}", "hash": "a" * 64, "authorized_uri": f"houndd://record/prior-{sequence}"},
+                lineage=lineage,
+                source={"provider": "legacy", "native_id": "legacy-ambiguous", "canonical_url": "none"},
+                classification={"outcome": "completed", "evidence_status": "clear"},
+                access="public",
+                policy_id="write-policy",
+                dedupe={"object_key": f"prior-{sequence}", "content_sha256": "a" * 64},
+                usage={"requests": 0, "bytes": 0, "cost": 0},
+            ))
+        with pytest.raises(CommitIntegrityError):
+            runtime.execute(request, route, principal=f"linux-uid:{os.getuid()}", access="public", source=normalize_source(request.source.to_wire()), scanner_clear=True)
+        assert not list((state / "commit3c1" / "reservations").iterdir())
+    finally:
+        runtime.close()
+
+
+def test_slice3c1_public_cli_is_socket_only_and_maps_commit_exits(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    data = b"cli certified source"
+    state = _state(tmp_path, data)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    socket_path = runtime / "houndd.sock"
+    source_path = tmp_path / "source.bin"
+    source_path.write_bytes(data)
+    service = HounddService(state_root=state, socket_path=socket_path)
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    try:
+        common = [
+            "--socket", os.fspath(socket_path),
+            "--owner-id", "writer", "--run-id", "run", "--policy-id", "write-policy",
+            "--requested-access", "public",
+        ]
+        source = [
+            "--path", os.fspath(source_path), "--sha256", hashlib.sha256(data).hexdigest(), "--byte-length", str(len(data)),
+        ]
+        assert research_cli.main(["ingest", "file", *common, "--idempotency-key", "cli-key", "--request-id", "cli-request", *source]) == 0
+        completed = json.loads(capsys.readouterr().out)
+        assert completed["outcome"] == "completed"
+        assert research_cli.main(["import-record", *common, "--record-id", "legacy-cli", "--idempotency-key", "cli-import", "--request-id", "cli-import-request", *source]) == 0
+        imported = json.loads(capsys.readouterr().out)
+        assert len(imported["record_ids"]) == 2 and len(imported["entry_ids"]) == 1
+    finally:
+        service.close()
+        thread.join(timeout=2)
