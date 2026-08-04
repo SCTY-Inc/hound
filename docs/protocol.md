@@ -216,17 +216,16 @@ appear in any response or diagnostic.
   attached. Search input may include a bounded adapter-owned `options` object.
   Exa accepts `auto` or `fast` search, a known category, ISO publication-date
   bounds, include/exclude domains, and a two-letter country location. Deep or
-  synthesized search modes are refused. Exa retries 401, 408, 409, 425, 429,
-  and 5xx statuses at most twice with short backoffs. A single response remains
-  the exact raw body; any retry path retains every exact response in the
-  canonical HTTP-exchanges envelope, including provider cost estimates.
-  Transport attempts that receive no HTTP response count toward usage without
-  fabricating an exchange.
+  synthesized search modes are refused. One durable outcome binds exactly one
+  provider exchange: adapters do not retry, and the recorded raw is always the
+  exact single response body. Retry policy belongs to callers, against new
+  attempts with new records.
 - `hound.web.extract.v1` contains known-URL documents with markdown, markdown
   digest, public links, metadata, and `evidence_class: "provider-derived"`.
   Input lineage is mandatory: either an explicit direct root or an exact search
-  record and lead ID whose URL Hound verifies. One URL is normal. A bounded set
-  is valid only when the input declares `max_pages`; Hound's ceiling is 20.
+  record and lead ID whose URL Hound verifies. Extraction is single-page:
+  `max_pages` multi-page crawling is refused as a zero-exchange abstention
+  (one outcome, one exchange).
 - `hound.web.interact.v1` contains one explicit browser action and its resulting
   session/tab references or bounded snapshot. It declares
   `evidence_class: "provider-derived"`. The initial protocol permits only
