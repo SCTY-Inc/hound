@@ -266,13 +266,11 @@
       "owner": "research operator",
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
-      "contract_ref": "repos/givecare/.agents/radar-curation.md",
+      "contract_ref": "repos/hound/docs/how-to-consume.md",
       "scan_roots": [
-        "repos/givecare/.agents/radar-curation.md"
+        "repos/hound/docs/how-to-consume.md"
       ],
-      "legacy_paths": [
-        "repos/givecare/.agents/radar-curation.md"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
@@ -301,13 +299,11 @@
       "owner": "research operator",
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
-      "contract_ref": "repos/givecare/.agents/radar-curation.md",
+      "contract_ref": "repos/hound/docs/how-to-consume.md",
       "scan_roots": [
-        "repos/givecare/.agents/radar-curation.md"
+        "repos/hound/docs/how-to-consume.md"
       ],
-      "legacy_paths": [
-        "repos/givecare/.agents/radar-curation.md"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.url"
       ],
@@ -401,7 +397,7 @@
     },
     {
       "id": "signal-daily",
-      "kind": "acquisition",
+      "kind": "consumer_only",
       "owner": "GiveCare root",
       "cadence_category": "daily",
       "cadence_authority": "givecare/signal-daily",
@@ -418,7 +414,7 @@
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "status": "baseline",
       "credential_boundary": "no_provider_credentials_or_bypass",
       "evidence": {
         "baseline_scan": null,
@@ -439,17 +435,11 @@
       "owner": "Workpad",
       "cadence_category": "on-demand",
       "cadence_authority": "Workpad",
-      "contract_ref": "houndd.read-response.v1",
+      "contract_ref": "repos/workpad/README.md",
       "scan_roots": [
-        "repos/givecare/gc-bench/scripts/workpad/README.md",
-        "repos/givecare/gc-bench/scripts/workpad/src/server.ts",
-        "repos/givecare/gc-bench/scripts/workpad/src/client.ts"
+        "repos/workpad/src"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-bench/scripts/workpad/README.md",
-        "repos/givecare/gc-bench/scripts/workpad/src/server.ts",
-        "repos/givecare/gc-bench/scripts/workpad/src/client.ts"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "journal.query"
       ],
