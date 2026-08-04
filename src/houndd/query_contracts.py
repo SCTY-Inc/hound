@@ -15,8 +15,10 @@ class QueryContractError(ValueError):
     """A journal-query value does not satisfy the strict request contract."""
 
 
-_REQUEST_FIELDS = frozenset({"filter", "limit", "cursor", "view"})
+_REQUEST_FIELDS = frozenset({"filter", "limit", "cursor", "view", "order"})
 _INTAKE_LEDGER_VIEW = "intake-ledger.v1"
+_ORDERS = frozenset({"ascending", "descending"})
+_DEFAULT_ORDER = "ascending"
 _FILTER_FIELDS = frozenset(
     {
         "time_range",
@@ -315,6 +317,7 @@ class QueryRequest:
     limit: int = 50
     cursor: str | None = None
     view: str | None = None
+    order: str = _DEFAULT_ORDER
 
     def __post_init__(self) -> None:
         # Direct model construction remains deliberately permissive enough for
@@ -329,16 +332,31 @@ class QueryRequest:
             _text(self.cursor, "cursor")
         if self.view is not None and (type(self.view) is not str or self.view != _INTAKE_LEDGER_VIEW):
             raise QueryContractError("view must be exactly intake-ledger.v1")
+        if type(self.order) is not str or self.order not in _ORDERS:
+            raise QueryContractError("order must be exactly ascending or descending")
+
+    @property
+    def descending(self) -> bool:
+        return self.order == "descending"
 
     @property
     def filter_hash(self) -> str:
-        # Preserve the long-lived no-view cursor domain byte-for-byte.  The
-        # ledger discriminator belongs to the same canonical binding only when
-        # it is explicitly selected.
-        if self.view is None:
+        # Preserve the long-lived default cursor domain byte-for-byte.  A
+        # discriminator joins this canonical binding only when it is explicitly
+        # selected, so a no-view ascending request hashes exactly as it did
+        # before either discriminator existed.  Because the binding feeds the
+        # cursor's filter-hash commitment, two requests that differ in view or
+        # order can never share a cursor domain: replaying one order's cursor
+        # under the other fails authentication rather than being reinterpreted.
+        discriminators: dict[str, str] = {}
+        if self.view is not None:
+            discriminators["view"] = self.view
+        if self.order != _DEFAULT_ORDER:
+            discriminators["order"] = self.order
+        if not discriminators:
             return self.filter.filter_hash
         encoded = json.dumps(
-            {"filter": self.filter.canonical, "view": self.view},
+            {"filter": self.filter.canonical, **discriminators},
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
@@ -353,6 +371,8 @@ class QueryRequest:
             value["cursor"] = self.cursor
         if self.view is not None:
             value["view"] = self.view
+        if self.order != _DEFAULT_ORDER:
+            value["order"] = self.order
         return value
 
 
@@ -436,7 +456,16 @@ def parse_query_request(value: Any) -> QueryRequest:
     view = request.get("view")
     if "view" in request and (type(view) is not str or view != _INTAKE_LEDGER_VIEW):
         raise QueryContractError("query request.view must be exactly intake-ledger.v1")
-    return QueryRequest(filter=parse_query_filter(request["filter"]), limit=limit, cursor=cursor, view=view)
+    order = request.get("order", _DEFAULT_ORDER)
+    if "order" in request and (type(order) is not str or order not in _ORDERS):
+        raise QueryContractError("query request.order must be exactly ascending or descending")
+    return QueryRequest(
+        filter=parse_query_filter(request["filter"]),
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        order=order,
+    )
 
 
 __all__ = [

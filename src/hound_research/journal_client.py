@@ -194,6 +194,9 @@ def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = REA
     view = payload.get("view") if type(payload) is dict else None
     if view is not None and view != "intake-ledger.v1":
         raise JournalClientError("journal view is invalid")
+    order = payload.get("order") if type(payload) is dict else None
+    if order is not None and order not in {"ascending", "descending"}:
+        raise JournalClientError("journal order is invalid")
     return _connect(socket_path, request, timeout, lambda raw: strict_response(raw, request_id=request_id, view=view))
 
 

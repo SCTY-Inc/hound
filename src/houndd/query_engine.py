@@ -423,11 +423,12 @@ class JournalQueryEngine:
             scope.principal.subject,
             context_hash,
         )
-        resume_after: tuple[datetime, int, str] | None = None
+        descending = request.descending
+        resume_from: tuple[datetime, int, str] | None = None
         high_watermark = snapshot.head
         if request.cursor is not None:
             recovery = cursor_codec.recover(request.cursor, bindings, snapshot.cursor_recovery_snapshot)
-            resume_after = recovery.resume_after
+            resume_from = recovery.resume_after
             high_watermark = recovery.high_watermark
         if high_watermark is None:
             return EMPTY_QUERY_PAGE
@@ -435,7 +436,10 @@ class JournalQueryEngine:
         # Journal verification/recovery and canonical/provenance filtering are
         # intentionally O(N): the append-only journal is Slice 3B truth.
         # Retain only one page plus its continuation witness; QueryItem's
-        # defensive clone is reserved for returned items.
+        # defensive clone is reserved for returned items.  ``retained`` always
+        # holds the window in ascending chronological order; a descending
+        # request keeps the newest end of that window instead of the oldest and
+        # presents it reversed, so both orders share one selection invariant.
         retained: list[tuple[tuple[datetime, int, str], Mapping[str, object], JournalCursorCandidate, EventProvenance]] = []
         capacity = request.limit + 1
         for event, candidate in zip(snapshot.events, snapshot.cursor_recovery_snapshot.candidates, strict=True):
@@ -445,20 +449,27 @@ class JournalQueryEngine:
                 continue
             if candidate.sequence > high_watermark.sequence:
                 continue
-            if resume_after is not None and candidate.chronological_order <= resume_after:
-                continue
+            if resume_from is not None:
+                # A cursor always resumes strictly past its own last result, in
+                # whichever direction its order walks.
+                order = candidate.chronological_order
+                if order >= resume_from if descending else order <= resume_from:
+                    continue
             if not _matches_canonical(request, event, candidate):
                 continue
             item_provenance = provenance.project(scope, event)
             if not _matches_provenance(request, item_provenance):
                 continue
             value = (candidate.chronological_order, event, candidate, item_provenance)
-            if len(retained) < capacity or value[0] < retained[-1][0]:
+            if len(retained) < capacity or (
+                retained[0][0] < value[0] if descending else value[0] < retained[-1][0]
+            ):
                 position = bisect_left([item[0] for item in retained], value[0])
                 retained.insert(position, value)
                 if len(retained) > capacity:
-                    retained.pop()
-        selected = retained[: request.limit]
+                    retained.pop(0 if descending else -1)
+        ordered = retained[::-1] if descending else retained
+        selected = ordered[: request.limit]
         if not selected:
             return EMPTY_QUERY_PAGE
         next_cursor = None

@@ -667,17 +667,23 @@ class HounddClient:
         query_filter: dict[str, Any] | None = None,
         cursor: str | None = None,
         limit: int = 50,
+        order: str = "ascending",
         run_id: str,
         request_id: str,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Read one page of journal entries. Returns ``(entries, next_cursor)``.
 
-        ``next_cursor`` is ``None`` once the page has drained everything
-        visible at the query's high-watermark; the caller resnapshots with
-        ``cursor=None`` to pick up a fresh watermark and continue. Raises
-        ``HounddJournalCursorRejectedError`` when a supplied ``cursor`` can no
-        longer be recovered, and ``HounddJournalFilterUnavailableError`` when
-        ``query_filter`` selects outside this caller's authorized scope.
+        ``order`` walks the journal oldest-first (``"ascending"``, the default)
+        or newest-first (``"descending"``); either way the chain pins to the
+        high-watermark the first page saw, so entries appended mid-chain are
+        never spliced in. ``next_cursor`` is ``None`` once the page has drained
+        everything visible at that high-watermark; the caller resnapshots with
+        ``cursor=None`` to pick up a fresh watermark and continue. A cursor
+        belongs to the order that issued it and cannot be replayed under the
+        other one. Raises ``HounddJournalCursorRejectedError`` when a supplied
+        ``cursor`` can no longer be recovered, and
+        ``HounddJournalFilterUnavailableError`` when ``query_filter`` selects
+        outside this caller's authorized scope.
         """
 
         if query_filter is None:
@@ -686,7 +692,11 @@ class HounddClient:
             raise HounddClientError("houndd journal filter is invalid")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise HounddClientError("houndd journal limit is invalid")
+        if type(order) is not str or order not in {"ascending", "descending"}:
+            raise HounddClientError("houndd journal order is invalid")
         payload: dict[str, Any] = {"filter": query_filter, "limit": limit}
+        if order != "ascending":
+            payload["order"] = order
         if cursor is not None:
             payload["cursor"] = _text(cursor, "journal cursor")
         request = {

@@ -84,6 +84,8 @@ def _trusted_request(value: object) -> QueryRequest:
         raise QueryEngineError("query request cursor is invalid")
     if value.view is not None and (type(value.view) is not str or value.view != "intake-ledger.v1"):
         raise QueryEngineError("query request view is invalid")
+    if type(value.order) is not str or value.order not in {"ascending", "descending"}:
+        raise QueryEngineError("query request order is invalid")
 
     time_range = query_filter.time_range
     if time_range is not None:
@@ -141,7 +143,7 @@ def _trusted_request(value: object) -> QueryRequest:
             classification=classification,
             access=_exact_text_tuple(query_filter.access, "access"),
         )
-        return QueryRequest(trusted_filter, value.limit, value.cursor, value.view)
+        return QueryRequest(trusted_filter, value.limit, value.cursor, value.view, value.order)
     except (TypeError, ValueError) as error:
         if isinstance(error, QueryEngineError):
             raise
@@ -479,7 +481,7 @@ class DurableJournalQueryAdapter:
 
             def page(limit: int) -> QueryPage:
                 return self._engine.execute(
-                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view),
+                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view, trusted_request.order),
                     trusted_scope,
                     snapshot,
                     provenance,
@@ -562,7 +564,7 @@ class DurableJournalQueryAdapter:
 
             def page(limit: int) -> QueryPage:
                 return self._engine.execute(
-                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view),
+                    QueryRequest(trusted_request.filter, limit, trusted_request.cursor, trusted_request.view, trusted_request.order),
                     trusted_scope,
                     snapshot,
                     provenance,
