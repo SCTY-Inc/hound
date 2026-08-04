@@ -93,7 +93,7 @@ file.
 | B2 | complete (2026-08-03) | `ingest.search` via Exa adapter (strict `{query, limit 1..50}` payload; leads are candidates, not evidence). Depends B1. | Live-optional + faux tests; search record + journal event with lineage none. |
 | B3 | complete (2026-08-03; contract narrowed in the 3C2 repair: one durable outcome binds exactly one provider exchange — adapter retries removed (callers own retry policy) and `max_pages` multi-page crawl abstains (`requests=0` refusal). Consumers already reject `max_pages` (Pulse article adapter, gc-benefits contract test), so nothing depended on it.) | `ingest.url` via Firecrawl (direct \| search lineage, single-page, public-URL validator). Depends B1. | Faux extract with search-record parent binding; lineage graph resolves. |
 | B4 | pending | `ingest.media` capture records (exact source hash/type/lineage). Depends B1. | Capture record + `houndd://record/<id>` URI verify. |
-| B5 | pending | `transcribe` bound to authorized capture ID; daemon-produced model/version/segment-hash provenance. Depends B4, D5. | Two-segment fixture: completed/partial/failed statuses stay explicit; no PHI in record. |
+| B5 | pending | `transcribe` bound to authorized capture ID; daemon-produced model/version/segment-hash provenance. Provider: OpenAI Whisper API (D5, 2026-08-04). Depends B4. | Two-segment fixture: completed/partial/failed statuses stay explicit; no PHI in record. |
 | B6 | complete (2026-08-04: `journal.verify` + `journal.rebuild-index` GET routes + client commands; verdict-only `{schema_version, valid}` reports; error-ordering fixed — integrity failures now 503 before the 400 shape clause, and an uncaught `JournalError` no longer kills the serving thread; interrupted-file `include_content` fixed via outcome-gated `_staged_blob`. Decisions recorded in VISION §Slice 3D.) | `journal get`, `journal verify`, `journal rebuild-index` as service routes + client commands, plus the authorized record-read route. | Route contract tests; rebuild equality vs canonical journal; radar consumes a lead end-to-end. |
 | B7 | pending | Observability (HSP-11): provider errors, spend, freshness, capture completeness, dedupe rate, consumer lag, unprocessed demand, journal/index/recovery health; policy-filtered. | Telemetry contract test per fixture class; redacted snapshot retained. |
 | B8 | complete (2026-08-04: always-on hardened unit under `ops/systemd/` + migration how-to. Socket activation rejected on evidence: houndd's `RENAME_NOREPLACE` self-bind is incompatible with fd-passing, and the trigger-only approximation drops the first cold-start connection — a false lane failure under the no-blind-retry consumer contract, for ~14M idle RSS saved. True activation = `sd_listen_fds()` support in houndd, only if ever needed.) | Unit under `ops/systemd/`; query round-trip. | `systemd-analyze verify` clean; live round-trip proven on an isolated copy. |
@@ -110,11 +110,11 @@ file.
 
 | ID | Status | Decision |
 |---|---|---|
-| D1 | pending | benefits-legacy: specify the Agent/SAM missing-adapter contract, or drop the lane from scope. |
-| D2 | pending | civic-policy-radar: specify target ops (currently empty) for the civic.ts path. |
-| D3 | pending | gmail-newsletters-attachments: attachment adapter contract for `ingest.file` intake. |
-| D4 | pending | helm-external-ingestion: provider contracts for Helm's external sources. |
-| D5 | pending | signal-daily consumer cycle gate; plus transcription provider/model choice for B5. |
+| D1 | decided 2026-08-04 (Ali) | benefits-legacy: **dropped from scope.** The radar lane covers benefits discovery; no adapter contract will be specified. Lane removed from the inventory closure. |
+| D2 | decided 2026-08-04 (Ali) | civic-policy-radar: target ops `ingest.search` + `ingest.url`, benefits-radar-shaped bounded query rotation over the existing civic sources. Lane unblocked. |
+| D3 | decided 2026-08-04 (Ali) | gmail-newsletters-attachments: **deferred** — no `ingest.file` attachment adapter until something demonstrably needs newsletter attachments as evidence. Lane removed from the inventory closure; re-entry is a new owner decision. |
+| D4 | decided 2026-08-04 (Ali) | helm-external-ingestion: **deferred** — decide with real usage data if/when Wave 5 revives it. Lane removed from the inventory closure; re-entry is a new owner decision. |
+| D5 | decided 2026-08-04 (Ali) | signal-daily: eligibility gate = Pulse's verified terminal token (the dependency rack's existing edge). Transcription for B5 = OpenAI Whisper API. Lane unblocked. |
 
 ### Phase M — lane migration (stage order: import_mirror → shadow → migrated → retired)
 
@@ -126,10 +126,10 @@ use, recovery drill, one full scheduled cycle, legacy paths absent.
 | ID | Status | Contract | Proof |
 |---|---|---|---|
 | M1 | pending | Import/mirror existing repo-local records for Pulse/Benefits/wiki via `import.record` (IDs and bytes preserved). Depends W2. | HSP-14 portability checks against the real imported corpus; before/after manifests. |
-| M2 | in progress (benefits-radar SHADOW live since 2026-08-03: hound-radar-shadow.timer, daily 06:30 UTC, 8-query rotation into the ledger; cutover blocked on B6 + Ali approval) | Wave 2: Pulse shadow parity (HSP-16 comparator) then cutover; benefits-radar (HSP-17 8-query parity) then cutover; benefits-legacy after D1. Depends B2, B3, M1. | Parity reports, no-publish audit, credential-free cutover runs, Ali approvals recorded. |
-| M3 | pending | Wave 3: wiki-refresh, intel-refresh, civic-policy-radar (after D2). Depends M2. | Same per-lane evidence set; stage ledger rows. |
-| M4 | pending | Wave 4: radar-curation, gmail (after D3), manual-web, manual-x, youtube-transcription (needs B4/B5), signal-daily (after D5), workpad-intake-ledger + gc-gtm-crm read baselines. Depends M2. | Same per-lane evidence set; consumer-only lanes prove zero acquisition capability. |
-| M5 | pending | Wave 5: atelier-entity-discovery; helm-external-ingestion (after D4). Depends M2. | Same per-lane evidence set. |
+| M2 | in progress (benefits-radar SHADOW live since 2026-08-03: hound-radar-shadow.timer, daily 06:30 UTC, 8-query rotation into the ledger; B6 landed 2026-08-04 — cutover now blocked only on parity evidence + Ali approval; benefits-legacy dropped per D1) | Wave 2: Pulse shadow parity (HSP-16 comparator) then cutover; benefits-radar (HSP-17 8-query parity) then cutover. Depends B2, B3, M1. | Parity reports, no-publish audit, credential-free cutover runs, Ali approvals recorded. |
+| M3 | pending | Wave 3: wiki-refresh, intel-refresh, civic-policy-radar (D2 decided: search+url rotation). Depends M2. | Same per-lane evidence set; stage ledger rows. |
+| M4 | pending | Wave 4: radar-curation, manual-web, manual-x, youtube-transcription (needs B4/B5), signal-daily (D5 decided: Pulse-token gate), workpad-intake-ledger + gc-gtm-crm read baselines. gmail dropped per D3. Depends M2. | Same per-lane evidence set; consumer-only lanes prove zero acquisition capability. |
+| M5 | pending | Wave 5: atelier-entity-discovery. helm-external-ingestion deferred per D4 — re-enters only by new owner decision. Depends M2. | Same per-lane evidence set. |
 
 ### Phase E — enforcement and closure
 

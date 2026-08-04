@@ -85,7 +85,7 @@ MATCH_FIELDS = frozenset({"kind", "value"})
 MATCH_KINDS = frozenset({"literal", "token"})
 MAX_SCAN_BYTES = 1_048_576
 MAX_LINE_BYTES = 16_384
-CANONICAL_ROW_DIGEST = "367acd7979ff4017eda66303243da7d9cee6927aa73911fb9be6a32723e26dcc"
+CANONICAL_ROW_DIGEST = "1689334bc28095df87a6094089b2d71328244c5af1f00f69c57d7f131831cfb0"
 CANONICAL_CATALOG_DIGEST = "c319e49bae8dc4450a904e44fe08b397a93be1778cd0fbde6ef85b66323b6ca4"
 MAX_CATALOG_BYTES = 65_536
 MAX_INVENTORY_BYTES = 1_048_576
@@ -295,10 +295,13 @@ def validate_inventory(inventory: object, *, require_paths: bool = False, worksp
     consumers = inventory["consumers"]
     if not collections["consumers"]:
         return errors
+    # Owner decisions 2026-08-04 (GOALIE D1/D3/D4): benefits-legacy dropped
+    # from scope; gmail-newsletters-attachments and helm-external-ingestion
+    # deferred — re-entry is a new owner decision, not an edit here.
     expected_ids = {
-        "pulse", "benefits-radar", "benefits-legacy", "wiki-refresh", "intel-refresh", "civic-policy-radar",
-        "radar-curation", "gmail-newsletters-attachments", "manual-web", "manual-x", "youtube-transcription",
-        "atelier-entity-discovery", "helm-external-ingestion", "signal-daily", "workpad-intake-ledger", "gc-gtm-crm",
+        "pulse", "benefits-radar", "wiki-refresh", "intel-refresh", "civic-policy-radar",
+        "radar-curation", "manual-web", "manual-x", "youtube-transcription",
+        "atelier-entity-discovery", "signal-daily", "workpad-intake-ledger", "gc-gtm-crm",
     }
     seen: set[str] = set()
     stage_status = {
@@ -424,14 +427,14 @@ def validate_inventory(inventory: object, *, require_paths: bool = False, worksp
     if extra:
         errors.append(f"consumer ID set has unexpected IDs: {', '.join(sorted(extra))}")
     if len(consumers) != len(expected_ids):
-        errors.append("consumer ID set must contain exactly 16 entries")
+        errors.append(f"consumer ID set must contain exactly {len(expected_ids)} entries")
     if _exact_json_graph(consumers):
         closure = [item for item in consumers if type(item) is dict]
         digest = hashlib.sha256(json.dumps(closure, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if digest != CANONICAL_ROW_DIGEST:
-            errors.append("consumer rows must match the exact 16-row canonical closure")
+            errors.append("consumer rows must match the exact canonical closure")
     else:
-        errors.append("consumer rows must match the exact 16-row canonical closure")
+        errors.append("consumer rows must match the exact canonical closure")
     for item, stage_index in staged_items:
         if stage_index <= 0:
             continue

@@ -238,9 +238,6 @@ def test_non_acquisition_rows_are_restricted() -> None:
     assert all(not op.startswith("ingest.") for op in rows["gc-gtm-crm"]["target_ops"])
     assert "repos/givecare/gc-gtm/gmail_adapter.py" in rows["gc-gtm-crm"]["legacy_paths"]
     assert "repos/givecare/gc-gtm/gmail_adapter.py" not in rows["gc-gtm-crm"]["scan_roots"]
-    gmail = rows["gmail-newsletters-attachments"]
-    assert "agents/helm/ingest.py" in gmail["legacy_paths"]
-    assert "agents/helm/ingest.py" not in gmail["scan_roots"]
     mutated = _manifest()
     mutated["consumers"][-1]["target_ops"] = ["journal.get"]
     assert any("restricted journal-only CRM" in error for error in validate_inventory(mutated))
@@ -268,7 +265,7 @@ def test_scanner_reports_known_baseline_and_rejects_unclassified(tmp_path: Path)
     for other in manifest["consumers"][1:]:
         other["scan_roots"] = []
         other["legacy_paths"] = []
-    assert any("exact 16-row" in error for error in validate_inventory(manifest))
+    assert any("exact canonical" in error for error in validate_inventory(manifest))
     result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
     assert result.failures == []
     assert {finding["category"] for finding in result.baseline_findings} >= {"sdk_import", "credential_name"}
@@ -823,12 +820,12 @@ def test_every_authoritative_row_field_has_exact_canonical_closure(field: str) -
 
     errors = validate_inventory(manifest)
 
-    assert "consumer rows must match the exact 16-row canonical closure" in errors
+    assert "consumer rows must match the exact canonical closure" in errors
 
 
 def test_checked_in_rows_are_all_null_baseline_freeze_contracts() -> None:
     rows = _manifest()["consumers"]
-    assert len(rows) == 16
+    assert len(rows) == 13
     assert all(row["stage"] == "freeze_contracts" and row["approval_ref"] is None for row in rows)
     assert all(all(value is None for value in row["evidence"].values()) for row in rows)
 
@@ -1377,7 +1374,7 @@ def test_invalid_nested_container_never_reaches_canonical_digest() -> None:
     errors = validate_inventory(inventory)
 
     assert "consumers[0].scan_roots must be exact builtin type list" in errors
-    assert "consumer rows must match the exact 16-row canonical closure" in errors
+    assert "consumer rows must match the exact canonical closure" in errors
     assert _RaisingIterList.hooks == 0
 
 

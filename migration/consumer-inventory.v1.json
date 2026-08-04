@@ -1,10 +1,39 @@
 {
   "schema_version": "hound.migration.consumer-inventory.v1",
-  "stage_order": ["freeze_contracts", "import_mirror", "shadow", "migrated", "retired"],
-  "allowed_kinds": ["acquisition", "partial_read_client", "consumer_only"],
-  "allowed_statuses": ["legacy_path_active", "blocked_contract", "baseline", "shadow", "migrated", "retired"],
-  "allowed_exclusions": ["tests", "history", "local_retrieval", "health", "deploy", "publish"],
-  "adapter_allowlist": ["repos/hound/src/hound_web_adapters/exa.py", "repos/hound/src/hound_web_adapters/firecrawl.py", "repos/hound/src/hound_web_adapters/camofox.py", "repos/hound/src/hound_web_adapters/_http.py"],
+  "stage_order": [
+    "freeze_contracts",
+    "import_mirror",
+    "shadow",
+    "migrated",
+    "retired"
+  ],
+  "allowed_kinds": [
+    "acquisition",
+    "partial_read_client",
+    "consumer_only"
+  ],
+  "allowed_statuses": [
+    "legacy_path_active",
+    "blocked_contract",
+    "baseline",
+    "shadow",
+    "migrated",
+    "retired"
+  ],
+  "allowed_exclusions": [
+    "tests",
+    "history",
+    "local_retrieval",
+    "health",
+    "deploy",
+    "publish"
+  ],
+  "adapter_allowlist": [
+    "repos/hound/src/hound_web_adapters/exa.py",
+    "repos/hound/src/hound_web_adapters/firecrawl.py",
+    "repos/hound/src/hound_web_adapters/camofox.py",
+    "repos/hound/src/hound_web_adapters/_http.py"
+  ],
   "consumers": [
     {
       "id": "pulse",
@@ -13,15 +42,36 @@
       "cadence_category": "daily",
       "cadence_authority": "givecare/pulse-daily",
       "contract_ref": "repos/givecare/gc-web/research/hound-driver.json",
-      "scan_roots": ["repos/givecare/gc-web/scripts/pulse-lane.sh", "repos/givecare/gc-web/research/hound-driver.json", "repos/givecare/gc-web/research/article-extract-adapter.py"],
-      "legacy_paths": ["repos/givecare/gc-web/scripts/pulse-lane.sh", "repos/givecare/gc-web/research/hound-driver.json", "repos/givecare/gc-web/research/article-extract-adapter.py"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "repos/givecare/gc-web/scripts/pulse-lane.sh",
+        "repos/givecare/gc-web/research/hound-driver.json",
+        "repos/givecare/gc-web/research/article-extract-adapter.py"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-web/scripts/pulse-lane.sh",
+        "repos/givecare/gc-web/research/hound-driver.json",
+        "repos/givecare/gc-web/research/article-extract-adapter.py"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 2,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -31,33 +81,36 @@
       "cadence_category": "daily",
       "cadence_authority": "givecare/discovery-benefits",
       "contract_ref": "repos/givecare/gc-benefits/hound-driver.json",
-      "scan_roots": ["repos/givecare/gc-benefits/AUTOMATION.md", "repos/givecare/gc-benefits/scripts/daily_hound_radar.py", "repos/givecare/gc-benefits/hound-driver.json"],
-      "legacy_paths": ["repos/givecare/gc-benefits/AUTOMATION.md", "repos/givecare/gc-benefits/scripts/daily_hound_radar.py", "repos/givecare/gc-benefits/hound-driver.json"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "repos/givecare/gc-benefits/AUTOMATION.md",
+        "repos/givecare/gc-benefits/scripts/daily_hound_radar.py",
+        "repos/givecare/gc-benefits/hound-driver.json"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-benefits/AUTOMATION.md",
+        "repos/givecare/gc-benefits/scripts/daily_hound_radar.py",
+        "repos/givecare/gc-benefits/hound-driver.json"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 2,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
-      "approval_ref": null
-    },
-    {
-      "id": "benefits-legacy",
-      "kind": "acquisition",
-      "owner": "gc-benefits",
-      "cadence_category": "on-demand/manual",
-      "cadence_authority": "givecare/discovery-benefits",
-      "contract_ref": "repos/givecare/gc-benefits/AUTOMATION.md",
-      "scan_roots": ["repos/givecare/gc-benefits/scripts/enrich_programs.py", "repos/givecare/gc-benefits/scripts/ingest_batch.py"],
-      "legacy_paths": ["repos/givecare/gc-benefits/scripts/enrich_programs.py", "repos/givecare/gc-benefits/scripts/ingest_batch.py"],
-      "target_ops": ["ingest.url"],
-      "blocked_reason": "Agent/SAM missing-adapter contract",
-      "wave": 2,
-      "stage": "freeze_contracts",
-      "status": "blocked_contract",
-      "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -67,15 +120,34 @@
       "cadence_category": "weekly",
       "cadence_authority": "givecare/refresh-wiki",
       "contract_ref": "repos/givecare/gc-wiki/AUTOMATION.md",
-      "scan_roots": ["repos/givecare/gc-wiki/AUTOMATION.md", "repos/givecare/gc-wiki/research/hound-driver.json"],
-      "legacy_paths": ["repos/givecare/gc-wiki/AUTOMATION.md", "repos/givecare/gc-wiki/research/hound-driver.json"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "repos/givecare/gc-wiki/AUTOMATION.md",
+        "repos/givecare/gc-wiki/research/hound-driver.json"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-wiki/AUTOMATION.md",
+        "repos/givecare/gc-wiki/research/hound-driver.json"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 3,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -85,15 +157,34 @@
       "cadence_category": "daily",
       "cadence_authority": "givecare/intel-refresh",
       "contract_ref": "repos/givecare/gc-intel/AUTOMATION.md",
-      "scan_roots": ["repos/givecare/gc-intel/AUTOMATION.md", "repos/givecare/gc-intel/hound-driver.json"],
-      "legacy_paths": ["repos/givecare/gc-intel/AUTOMATION.md", "repos/givecare/gc-intel/hound-driver.json"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "repos/givecare/gc-intel/AUTOMATION.md",
+        "repos/givecare/gc-intel/hound-driver.json"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-intel/AUTOMATION.md",
+        "repos/givecare/gc-intel/hound-driver.json"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 3,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -103,15 +194,34 @@
       "cadence_category": "weekly",
       "cadence_authority": "givecare/refresh-policy",
       "contract_ref": "repos/givecare/gc-web/AUTOMATION.md",
-      "scan_roots": ["repos/givecare/gc-web/research/policy/civic.ts", "repos/givecare/gc-web/AUTOMATION.md"],
-      "legacy_paths": ["repos/givecare/gc-web/research/policy/civic.ts", "repos/givecare/gc-web/AUTOMATION.md"],
-      "target_ops": [],
-      "blocked_reason": "target search/url adapter contract unspecified",
+      "scan_roots": [
+        "repos/givecare/gc-web/research/policy/civic.ts",
+        "repos/givecare/gc-web/AUTOMATION.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-web/research/policy/civic.ts",
+        "repos/givecare/gc-web/AUTOMATION.md"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
+      "blocked_reason": null,
       "wave": 3,
       "stage": "freeze_contracts",
-      "status": "blocked_contract",
+      "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -121,33 +231,33 @@
       "cadence_category": "weekly",
       "cadence_authority": "givecare/radar-curation",
       "contract_ref": "repos/givecare/.agents/radar-curation.md",
-      "scan_roots": ["repos/givecare/.agents/radar-curation.md"],
-      "legacy_paths": ["repos/givecare/.agents/radar-curation.md"],
-      "target_ops": ["ingest.url", "ingest.media", "transcribe"],
+      "scan_roots": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "target_ops": [
+        "ingest.url",
+        "ingest.media",
+        "transcribe"
+      ],
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
-      "approval_ref": null
-    },
-    {
-      "id": "gmail-newsletters-attachments",
-      "kind": "acquisition",
-      "owner": "mailbox/router owner",
-      "cadence_category": "event-driven",
-      "cadence_authority": "mailbox/router owner",
-      "contract_ref": "agents/helm/README.md",
-      "scan_roots": ["agents/scripts/givecare_email_router.py", "agents/scripts/givecare_newsletter_ingest.py"],
-      "legacy_paths": ["agents/scripts/givecare_email_router.py", "agents/scripts/givecare_newsletter_ingest.py", "agents/helm/ingest.py", "agents/helm/README.md"],
-      "target_ops": ["ingest.file"],
-      "blocked_reason": "attachment adapter contract missing",
-      "wave": 4,
-      "stage": "freeze_contracts",
-      "status": "blocked_contract",
-      "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -157,15 +267,32 @@
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
       "contract_ref": "repos/givecare/.agents/radar-curation.md",
-      "scan_roots": ["repos/givecare/.agents/radar-curation.md"],
-      "legacy_paths": ["repos/givecare/.agents/radar-curation.md"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -175,15 +302,31 @@
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
       "contract_ref": "repos/givecare/.agents/radar-curation.md",
-      "scan_roots": ["repos/givecare/.agents/radar-curation.md"],
-      "legacy_paths": ["repos/givecare/.agents/radar-curation.md"],
-      "target_ops": ["ingest.url"],
+      "scan_roots": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "target_ops": [
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -193,15 +336,32 @@
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
       "contract_ref": "repos/givecare/.agents/radar-curation.md",
-      "scan_roots": ["repos/givecare/.agents/radar-curation.md"],
-      "legacy_paths": ["repos/givecare/.agents/radar-curation.md"],
-      "target_ops": ["ingest.media", "transcribe"],
+      "scan_roots": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/.agents/radar-curation.md"
+      ],
+      "target_ops": [
+        "ingest.media",
+        "transcribe"
+      ],
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -211,33 +371,32 @@
       "cadence_category": "event-driven",
       "cadence_authority": "Atelier",
       "contract_ref": "agents/brands/givecare/atelier/pulse-influencer-discovery.md",
-      "scan_roots": ["agents/brands/givecare/atelier/pulse-influencer-discovery.md"],
-      "legacy_paths": ["agents/brands/givecare/atelier/pulse-influencer-discovery.md"],
-      "target_ops": ["ingest.search", "ingest.url"],
+      "scan_roots": [
+        "agents/brands/givecare/atelier/pulse-influencer-discovery.md"
+      ],
+      "legacy_paths": [
+        "agents/brands/givecare/atelier/pulse-influencer-discovery.md"
+      ],
+      "target_ops": [
+        "ingest.search",
+        "ingest.url"
+      ],
       "blocked_reason": null,
       "wave": 5,
       "stage": "freeze_contracts",
       "status": "legacy_path_active",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
-      "approval_ref": null
-    },
-    {
-      "id": "helm-external-ingestion",
-      "kind": "acquisition",
-      "owner": "Helm",
-      "cadence_category": "event-driven/mixed",
-      "cadence_authority": "Helm",
-      "contract_ref": "agents/helm/README.md",
-      "scan_roots": ["agents/helm/ingest.py", "agents/helm/README.md"],
-      "legacy_paths": ["agents/helm/ingest.py", "agents/helm/README.md"],
-      "target_ops": ["ingest.file", "import.record"],
-      "blocked_reason": "provider contracts missing for external sources",
-      "wave": 5,
-      "stage": "freeze_contracts",
-      "status": "blocked_contract",
-      "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -247,15 +406,31 @@
       "cadence_category": "daily",
       "cadence_authority": "givecare/signal-daily",
       "contract_ref": "repos/givecare/.agents/signal-daily.md",
-      "scan_roots": ["repos/givecare/.agents/signal-daily.md"],
-      "legacy_paths": ["repos/givecare/.agents/signal-daily.md"],
-      "target_ops": ["journal.query"],
-      "blocked_reason": "consumer cycle gate; no acquisition adapter identified",
+      "scan_roots": [
+        "repos/givecare/.agents/signal-daily.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/.agents/signal-daily.md"
+      ],
+      "target_ops": [
+        "journal.query"
+      ],
+      "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
-      "status": "blocked_contract",
+      "status": "legacy_path_active",
       "credential_boundary": "no_provider_credentials_or_bypass",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -265,15 +440,35 @@
       "cadence_category": "on-demand",
       "cadence_authority": "Workpad",
       "contract_ref": "houndd.read-response.v1",
-      "scan_roots": ["repos/givecare/gc-bench/scripts/workpad/README.md", "repos/givecare/gc-bench/scripts/workpad/src/server.ts", "repos/givecare/gc-bench/scripts/workpad/src/client.ts"],
-      "legacy_paths": ["repos/givecare/gc-bench/scripts/workpad/README.md", "repos/givecare/gc-bench/scripts/workpad/src/server.ts", "repos/givecare/gc-bench/scripts/workpad/src/client.ts"],
-      "target_ops": ["journal.query"],
+      "scan_roots": [
+        "repos/givecare/gc-bench/scripts/workpad/README.md",
+        "repos/givecare/gc-bench/scripts/workpad/src/server.ts",
+        "repos/givecare/gc-bench/scripts/workpad/src/client.ts"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-bench/scripts/workpad/README.md",
+        "repos/givecare/gc-bench/scripts/workpad/src/server.ts",
+        "repos/givecare/gc-bench/scripts/workpad/src/client.ts"
+      ],
+      "target_ops": [
+        "journal.query"
+      ],
       "blocked_reason": null,
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "baseline",
       "credential_boundary": "no_provider_credentials_or_bypass",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     },
     {
@@ -283,15 +478,32 @@
       "cadence_category": "on-demand",
       "cadence_authority": "gc-gtm",
       "contract_ref": "repos/givecare/gc-gtm/CLAUDE.md",
-      "scan_roots": ["repos/givecare/gc-gtm/CLAUDE.md"],
-      "legacy_paths": ["repos/givecare/gc-gtm/CLAUDE.md", "repos/givecare/gc-gtm/gmail_adapter.py"],
-      "target_ops": ["journal.query"],
+      "scan_roots": [
+        "repos/givecare/gc-gtm/CLAUDE.md"
+      ],
+      "legacy_paths": [
+        "repos/givecare/gc-gtm/CLAUDE.md",
+        "repos/givecare/gc-gtm/gmail_adapter.py"
+      ],
+      "target_ops": [
+        "journal.query"
+      ],
       "blocked_reason": "consumer-only; exclude Gmail executor and outbound CRM writes",
       "wave": 4,
       "stage": "freeze_contracts",
       "status": "baseline",
       "credential_boundary": "no_provider_credentials_or_bypass",
-      "evidence": {"baseline_scan": null, "stage_ledger": null, "parity": null, "static_no_direct_provider": null, "credential_unset": null, "unix_socket": null, "recovery_drill": null, "full_cycle": null, "legacy_absent": null},
+      "evidence": {
+        "baseline_scan": null,
+        "stage_ledger": null,
+        "parity": null,
+        "static_no_direct_provider": null,
+        "credential_unset": null,
+        "unix_socket": null,
+        "recovery_drill": null,
+        "full_cycle": null,
+        "legacy_absent": null
+      },
       "approval_ref": null
     }
   ]
