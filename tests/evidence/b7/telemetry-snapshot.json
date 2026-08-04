@@ -1,0 +1,92 @@
+{
+  "policy-a": {
+    "capture_completeness": {
+      "count": 3,
+      "rate": 0.75
+    },
+    "consumer_lag": {
+      "index_current": true,
+      "unindexed_events": 0
+    },
+    "dedupe": {
+      "distinct_content": 3,
+      "duplicate_events": 1,
+      "rate": 0.25
+    },
+    "freshness": {
+      "freshest_capture_at": "2026-08-04T12:56:05.423811Z"
+    },
+    "generated_at": "2026-08-04T12:56:05.739830Z",
+    "outcomes": {
+      "completed": 3,
+      "degraded": 0,
+      "failed": 1,
+      "interrupted": 0,
+      "partial": 0,
+      "refused": 0
+    },
+    "provider_errors": {
+      "count": 1,
+      "rate": 0.25
+    },
+    "recovery": {
+      "journal_valid": true
+    },
+    "schema_version": "houndd.telemetry-snapshot.v1",
+    "spend": {
+      "bytes": 340,
+      "cost": 0,
+      "requests": 2
+    },
+    "total_events": 4,
+    "unprocessed_demand": {
+      "count": 0,
+      "rate": 0.0
+    }
+  },
+  "policy-b": {
+    "capture_completeness": {
+      "count": 1,
+      "rate": 0.3333333333333333
+    },
+    "consumer_lag": {
+      "index_current": true,
+      "unindexed_events": 0
+    },
+    "dedupe": {
+      "distinct_content": 3,
+      "duplicate_events": 0,
+      "rate": 0.0
+    },
+    "freshness": {
+      "freshest_capture_at": "2026-08-04T12:56:05.631999Z"
+    },
+    "generated_at": "2026-08-04T12:56:05.802546Z",
+    "outcomes": {
+      "completed": 1,
+      "degraded": 1,
+      "failed": 0,
+      "interrupted": 0,
+      "partial": 0,
+      "refused": 1
+    },
+    "provider_errors": {
+      "count": 1,
+      "rate": 0.3333333333333333
+    },
+    "recovery": {
+      "journal_valid": true
+    },
+    "schema_version": "houndd.telemetry-snapshot.v1",
+    "spend": {
+      "bytes": 240,
+      "cost": 0,
+      "requests": 2
+    },
+    "total_events": 3,
+    "unprocessed_demand": {
+      "count": 1,
+      "rate": 0.3333333333333333
+    }
+  }
+}

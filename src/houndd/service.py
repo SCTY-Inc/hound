@@ -28,6 +28,7 @@ from .reads import ReadContractError, parse_entry_request, parse_maintenance_req
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
 from .intake_projection import IntakeProjectionError, project_intake_ledger_page
 from .service_identity import ServiceIdentity, ServiceIdentityError
+from .telemetry import compute_snapshot, parse_telemetry_request
 from . import HounddStore
 from ._safety import AnchoredRoot
 from .journal import JournalError
@@ -48,7 +49,7 @@ _REQUEST_FIELDS = frozenset({"schema_version", "request_id", "producer", "reques
 _RESPONSE_REQUIRED = frozenset({"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"})
 _RESPONSE_OPTIONAL = frozenset({"result", "cursor", "projection", "error"})
 _FRAME_FIELDS = frozenset({"wire_version", "method", "path", "body"})
-_READ_OPERATIONS = frozenset({"service.health", "service.ready", "journal.query", "journal.get", "record.get", "journal.verify", "journal.rebuild-index"})
+_READ_OPERATIONS = frozenset({"service.health", "service.ready", "service.telemetry", "journal.query", "journal.get", "record.get", "journal.verify", "journal.rebuild-index"})
 _ACCESS_CEILINGS = {
     "public": frozenset({"public"}),
     "workspace": frozenset({"public", "workspace"}),
@@ -811,6 +812,43 @@ class HounddService:
         except (ReadContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
 
+    def _dispatch_telemetry(self, principal: AuthenticatedPrincipal, request: ReadRequest) -> dict[str, Any]:
+        """Report HSP-11 operational telemetry over exactly the caller's authorized events.
+
+        VISION names the observability surface only as an exposed capability,
+        not a wire route (see "Observability, recovery, and portability"); this
+        implements it as the minimal closed-shape read the B6 maintenance
+        routes already established -- an empty-object payload, a policy-gated
+        404 for no resolvable scope, and one snapshot result carrying no
+        cursor, no ``result``-derived IDs, and nothing partition-identifying
+        beyond what the caller's own scope already authorizes.
+
+        Unlike ``journal.verify``, this is not a diagnostic that must always
+        answer: it aggregates real event data over the same verified snapshot
+        ``journal.query``/``journal.get``/``record.get`` require, so a journal
+        too broken to snapshot is unavailable here exactly as it is for those
+        routes. Only the embedded ``recovery.journal_valid`` field reuses
+        ``verify_store``'s own more tolerant verdict, and only once a snapshot
+        has already been produced.
+        """
+
+        try:
+            assert self.policy is not None and self.store is not None
+            _assert_frozen(self.policy, self.state_root)
+            scope = self._scope(principal, request)
+            if scope is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            parse_telemetry_request(request.payload)
+            events = verified_events(self.store.journal)
+            snapshot = compute_snapshot(self.store, scope, state_root=self.state_root, events=events)
+            return _response(request.request_id, 200, outcome="completed", result=[snapshot], entry_ids=[], record_ids=[])
+        except ResponseTooLarge:
+            return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
+        except (PolicyError, QuerySnapshotError, StoreError, JournalError, OSError):
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        except (ReadContractError, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         if frame["method"] == "POST":
             return self._dispatch_commit(principal, frame)
@@ -818,7 +856,7 @@ class HounddService:
             raise RequestError("method is invalid")
         request = parse_read_request(frame["body"])
         path = frame["path"]
-        if path not in {"/v1/journal", "/v1/journal/entry", "/v1/journal/verify", "/v1/journal/rebuild-index", "/v1/record", "/v1/health", "/v1/ready"}:
+        if path not in {"/v1/journal", "/v1/journal/entry", "/v1/journal/verify", "/v1/journal/rebuild-index", "/v1/record", "/v1/health", "/v1/ready", "/v1/telemetry"}:
             raise RequestError("path is invalid")
         if path == "/v1/health":
             if request.operation != "service.health" or request.claim.capability != "service.health":
@@ -845,6 +883,10 @@ class HounddService:
             if request.operation != "journal.rebuild-index" or request.claim.capability != "journal.rebuild-index":
                 raise RequestError("journal rebuild-index route operation binding is invalid")
             return self._dispatch_rebuild_index(principal, request)
+        if path == "/v1/telemetry":
+            if request.operation != "service.telemetry" or request.claim.capability != "service.telemetry":
+                raise RequestError("telemetry route operation binding is invalid")
+            return self._dispatch_telemetry(principal, request)
         if path == "/v1/record":
             if request.operation != "record.get" or request.claim.capability != "record.get":
                 raise RequestError("record route operation binding is invalid")
