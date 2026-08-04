@@ -1,0 +1,102 @@
+{
+ "schema_version": "houndd.slice3c1.acceptance.v1",
+ "slice": "3C1",
+ "status": "partial_hsp_coverage",
+ "provisional": true,
+ "partial_hsps": [
+  "HSP-05",
+  "HSP-06",
+  "HSP-09",
+  "HSP-21"
+ ],
+ "no_new_claim_hsps": [
+  "HSP-01",
+  "HSP-02",
+  "HSP-03",
+  "HSP-04",
+  "HSP-07",
+  "HSP-08",
+  "HSP-10",
+  "HSP-11",
+  "HSP-12",
+  "HSP-13",
+  "HSP-14",
+  "HSP-15",
+  "HSP-16",
+  "HSP-17",
+  "HSP-18",
+  "HSP-19",
+  "HSP-20",
+  "HSP-22"
+ ],
+ "notes": "Slice 3C1 partial HSP coverage: commit atomicity (HSP-05), source/PHI-scanner contract (HSP-06), lineage-ceiling authorization (HSP-09), and the evidence-sealing machinery itself (HSP-21). The sealed bundle under tests/evidence/slice3c1/ binds this manifest, the generator/verifier, and every source dependency to one commit; sealing is two-phase \u2014 these files land first, then the generator runs against that commit.",
+ "artifacts": {
+  "tests/test_slice3c1_service_authz.py": "HSP-09",
+  "tests/test_slice3c1_commit_runtime.py": "HSP-05",
+  "tests/test_slice3c1_contract_source_phi.py": "HSP-06",
+  "tests/test_slice3c1_observations.py": "HSP-21",
+  "tests/test_slice3c1_evidence.py": "HSP-21",
+  "tests/generate_slice3c1_evidence.py": "HSP-21",
+  "tests/verify_slice3c1_evidence.py": "HSP-21",
+  "tests/acceptance_slice3c1.json": "HSP-21"
+ },
+ "coverage": {
+  "HSP-05": {
+   "status": "partial",
+   "tests": [
+    "tests/test_slice3c1_commit_runtime.py"
+   ],
+   "command": "PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider tests/test_slice3c1_commit_runtime.py",
+   "assertions": [
+    "idempotency replay returns the original response without new source I/O or state",
+    "changed bound request fields are 400 collisions",
+    "incomplete/tampered reservation state is 503",
+    "accepted attempts produce exactly one attempt, one outcome record, and one journal event"
+   ],
+   "retained_artifacts": []
+  },
+  "HSP-06": {
+   "status": "partial",
+   "tests": [
+    "tests/test_slice3c1_contract_source_phi.py"
+   ],
+   "assertions": [
+    "ingest.file and import.record strict source/PHI-scanner contract validation",
+    "clear-manifest digest match is the only clear outcome",
+    "suspected/error scanner outcomes refuse pre-acceptance with no durable attempt"
+   ],
+   "retained_artifacts": []
+  },
+  "HSP-09": {
+   "status": "partial",
+   "tests": [
+    "tests/test_slice3c1_service_authz.py"
+   ],
+   "assertions": [
+    "lineage-scope ceiling intersection on the commit path",
+    "PolicyError/ServiceError map to logical 503",
+    "filter_not_available wire error code",
+    "unsigned SO_PEERCRED uid decoding"
+   ],
+   "retained_artifacts": []
+  },
+  "HSP-21": {
+   "status": "authored_unsealed",
+   "tests": [
+    "tests/test_slice3c1_observations.py",
+    "tests/test_slice3c1_evidence.py"
+   ],
+   "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src PYTHONHASHSEED=0 .venv/bin/python -m pytest -p no:cacheprovider -p tests.test_slice3c1_observations tests/test_slice3c1_service_authz.py tests/test_slice3c1_commit_runtime.py tests/test_slice3c1_contract_source_phi.py tests/test_slice3c1_observations.py tests/test_slice3c1_evidence.py",
+   "assertions": [
+    "generator/verifier bind an isolated Git checkout, exact argv, exact source-file blob/sha256 bindings, canonical JSON with no duplicate keys or nonfinite numbers, exact JUnit counters and node IDs, and a uniquely bound live-observation producer",
+    "forged argv/node/source/observation/run/thread/interpreter/git bindings are rejected",
+    "an omitted required source-file binding is rejected",
+    "a non-exact evidence-directory inventory (extra/nested/symlinked entries) is rejected",
+    "ambient PATH-supplied git is never trusted",
+    "a dirty worktree outside the bound commit never executes"
+   ],
+   "retained_artifacts": [],
+   "note": "106/106 tests pass locally against synthetic fixtures and the real (currently uncommitted) source; no sealed tests/evidence/slice3c1/ bundle exists yet because that requires this file and its four sibling files to be committed first (see top-level notes)."
+  }
+ }
+}
