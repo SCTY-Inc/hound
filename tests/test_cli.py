@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import version as distribution_version
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -60,6 +63,29 @@ def test_help_exposes_primitives_not_owner_domain_names(capsys) -> None:
         "run",
     ):
         assert f"  {removed}" not in output
+
+
+def test_version_uses_distribution_metadata(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--version"])
+
+    assert error.value.code == 0
+    assert capsys.readouterr().out == f"hound {distribution_version('evidence-hound')}\n"
+
+
+def test_bare_source_import_uses_the_build_version() -> None:
+    source_root = Path(__file__).parents[1] / "src"
+    environment = {"PYTHONPATH": str(source_root)}
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", "import hound_cli; print(hound_cli.__version__)"],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{distribution_version('evidence-hound')}\n"
 
 
 def test_invoke_runs_an_arbitrary_declared_read_capability(

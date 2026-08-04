@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from importlib.metadata import version as distribution_version
 import json
 from pathlib import Path
 import shutil
@@ -45,7 +46,7 @@ def test_plan_is_deterministic_and_bound_to_repo(driver_repo: tuple[Path, Path])
     assert not {"driver_plan", "driver_outcome", "planning_response", "expected_writes"} & set(
         first
     )
-    assert first["kernel"]["version"] == "0.4.0"
+    assert first["kernel"]["version"] == distribution_version("evidence-hound")
     assert first["kernel"]["dependencies"] == {}
     assert len(first["kernel"]["sha256"]) == 64
 
@@ -182,6 +183,7 @@ def test_kernel_identity_binds_core_but_not_provider_implementations() -> None:
     assert {path.name for path in source_paths} == {
         "__init__.py",
         "_supervisor.py",
+        "_version.py",
         "cli.py",
         "contracts.py",
         "orchestrator.py",
@@ -693,7 +695,7 @@ def test_kernel_drift_invalidates_plan(
     monkeypatch.setattr(
         orchestrator,
         "_kernel_identity",
-        lambda: {"version": "0.4.0", "sha256": "0" * 64},
+        lambda: {"version": distribution_version("evidence-hound"), "sha256": "0" * 64},
     )
 
     with pytest.raises(HoundError, match="kernel"):
