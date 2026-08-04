@@ -468,7 +468,10 @@ def test_slice3c2_host_binds_only_provisioned_credentials_and_refuses_selection(
     assert AdapterHost.from_env({}, transport=transport).operations == frozenset()
     assert AdapterHost.from_env({"EXA_API_KEY": "k"}, transport=transport).operations == frozenset({"ingest.search"})
     assert AdapterHost.from_env({"FIRECRAWL_API_KEY": "k"}, transport=transport).operations == frozenset({"ingest.url"})
-    assert ADAPTER_ENV_KEYS == ("EXA_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_ENDPOINT")
+    # B5 added the transcription credential; each key still binds exactly its
+    # own operation and nothing else.
+    assert AdapterHost.from_env({"OPENAI_API_KEY": "k"}, transport=transport).operations == frozenset({"transcribe"})
+    assert ADAPTER_ENV_KEYS == ("EXA_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_ENDPOINT", "OPENAI_API_KEY")
     with pytest.raises(AdapterHostError):
         AdapterHost({"ingest.file": lambda _payload: _result("ingest.search")})
     with pytest.raises(AdapterUnavailable):
@@ -737,6 +740,7 @@ def test_no_test_constructs_a_live_provider_client_without_an_injected_transport
         "hound_web_adapters.exa.search",
         "hound_web_adapters.firecrawl.extract",
         "hound_web_adapters.camofox.interact",
+        "hound_web_adapters.whisper.transcribe",
     }
 
     def name(node: ast.expr) -> str | None:

@@ -13,6 +13,7 @@ import hashlib
 import math
 import os
 import stat
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -20,6 +21,7 @@ from typing import Any, Mapping
 
 from hound_research.evidence import EvidenceError, validate_public_url
 
+from .adapter_validation import AdapterOutcomeError, validate_search_options
 from .contracts import canonical_bytes, canonical_hash
 
 
@@ -30,7 +32,10 @@ MAX_WIRE_BODY_BYTES = 1_048_576
 SUPPORTED_SOURCE_MEDIA_TYPE = "application/octet-stream"
 SUPPORTED_SOURCE_ENCODING = "identity"
 SOURCE_OPERATIONS = frozenset({"ingest.file", "ingest.media", "import.record"})
-ADAPTER_OPERATIONS = frozenset({"ingest.search", "ingest.url"})
+# Source-less operations whose content comes from one in-daemon provider
+# exchange.  ``transcribe`` declares no SOURCE either: its bytes are the
+# already-authorized media capture the daemon resolves for itself.
+ADAPTER_OPERATIONS = frozenset({"ingest.search", "ingest.url", "transcribe"})
 MAX_QUERY_CHARS = 1_024
 MAX_LEAD_ID_CHARS = 128
 
@@ -136,15 +141,27 @@ def _adapter_payload(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize one source-less adapter payload into its canonical identity."""
 
     if operation == "ingest.search":
-        _strict(payload, {"query", "limit"}, "ingest.search payload")
-        return {
+        _strict(payload, {"query", "limit"}, "ingest.search payload", optional={"options"})
+        normalized: dict[str, Any] = {
             "query": _bounded_text(payload["query"], "ingest.search.query", MAX_QUERY_CHARS),
             "limit": _bounded_int(payload["limit"], "ingest.search.limit", minimum=1, maximum=50),
         }
+        if "options" in payload:
+            try:
+                validate_search_options(payload["options"])
+            except AdapterOutcomeError as error:
+                raise CommitContractError(f"ingest.search.options is invalid: {error}") from error
+            normalized["options"] = deepcopy(payload["options"])
+        return normalized
+    if operation == "transcribe":
+        # The caller binds one capture ID and nothing else: provider, model,
+        # version, language, and every timing are daemon-produced provenance.
+        _strict(payload, {"capture_id"}, "transcribe payload")
+        return {"capture_id": _sha256(payload["capture_id"], "transcribe.capture_id")}
     if operation != "ingest.url":  # pragma: no cover - callers bind the allowlist
         raise CommitContractError("operation is not an adapter operation")
     _strict(payload, {"url", "lineage"}, "ingest.url payload", optional={"max_pages"})
-    normalized: dict[str, Any] = {"url": _public_url(payload["url"]), "lineage": _url_lineage(payload["lineage"])}
+    normalized = {"url": _public_url(payload["url"]), "lineage": _url_lineage(payload["lineage"])}
     if "max_pages" in payload:
         normalized["max_pages"] = _bounded_int(payload["max_pages"], "ingest.url.max_pages", minimum=2, maximum=20)
     return normalized
@@ -173,7 +190,7 @@ ROUTE_BINDINGS: tuple[RouteBinding, ...] = (
     RouteBinding("POST", "/v1/ingest/url", "ingest.url", "ingest.url", True),
     RouteBinding("POST", "/v1/ingest/file", "ingest.file", "ingest.file", True),
     RouteBinding("POST", "/v1/ingest/media", "ingest.media", "ingest.media", True),
-    RouteBinding("POST", "/v1/transcribe", "transcribe", "transcribe", False),
+    RouteBinding("POST", "/v1/transcribe", "transcribe", "transcribe", True),
     RouteBinding("POST", "/v1/import-record", "import.record", "import.record", True),
 )
 AVAILABLE_ROUTE_BINDINGS: tuple[RouteBinding, ...] = tuple(binding for binding in ROUTE_BINDINGS if binding.available)

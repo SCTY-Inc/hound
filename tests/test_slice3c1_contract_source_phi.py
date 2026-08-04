@@ -79,9 +79,11 @@ def _manifest_entry(digest: str) -> dict[str, str]:
 
 
 def test_routes_are_exact_and_only_declared_bindings_are_available() -> None:
-    assert {binding.operation for binding in AVAILABLE_ROUTE_BINDINGS} == {"ingest.file", "ingest.media", "import.record", "ingest.search", "ingest.url"}
+    # B5 made ``transcribe`` the sixth and last reserved binding available.
+    assert {binding.operation for binding in AVAILABLE_ROUTE_BINDINGS} == {"ingest.file", "ingest.media", "import.record", "ingest.search", "ingest.url", "transcribe"}
     assert resolve_route("POST", "/v1/ingest/file").available is True
     assert resolve_route("POST", "/v1/ingest/media").available is True
+    assert resolve_route("POST", "/v1/transcribe").available is True
     assert resolve_route("POST", "/v1/import-record").available is True
     with pytest.raises(CommitContractError):
         resolve_route("post", "/v1/ingest/file")

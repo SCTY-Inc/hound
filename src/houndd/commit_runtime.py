@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from .adapter_validation import (
     AdapterOutcomeError,
     validate_adapter_outcome,
     validate_adapter_record,
+    validate_search_options,
 )
 from .commit import (
     ADAPTER_OPERATIONS,
@@ -81,8 +83,10 @@ _LEGACY_OPEN_FIELDS = _OPEN_FIELDS - {"usage"}
 QUARANTINE_SCHEMA = "houndd.quarantine-record.v1"
 SEARCH_RECORD_SCHEMA = "houndd.search-record.v1"
 URL_RECORD_SCHEMA = "houndd.url-record.v1"
-_ADAPTER_ARTIFACTS: dict[str, tuple[str, str]] = {"ingest.search": ("search", SEARCH_RECORD_SCHEMA), "ingest.url": ("extract", URL_RECORD_SCHEMA)}
-_ADAPTER_PROVIDERS: dict[str, str] = {"ingest.search": "exa", "ingest.url": "firecrawl"}
+MEDIA_CAPTURE_SCHEMA = "houndd.media-capture-record.v1"
+TRANSCRIPT_RECORD_SCHEMA = "houndd.transcript-record.v1"
+_ADAPTER_ARTIFACTS: dict[str, tuple[str, str]] = {"ingest.search": ("search", SEARCH_RECORD_SCHEMA), "ingest.url": ("extract", URL_RECORD_SCHEMA), "transcribe": ("transcription", TRANSCRIPT_RECORD_SCHEMA)}
+_ADAPTER_PROVIDERS: dict[str, str] = {"ingest.search": "exa", "ingest.url": "firecrawl", "transcribe": "openai"}
 _ADAPTER_REASONS = frozenset({"none", "provider_failed", "provider_abstained", "adapter_absent", "interrupted"})
 _EVIDENCE_STATUS: dict[str, str] = {"completed": "clear", "partial": "partial", "failed": "failure", "degraded": "degraded", "refused": "refused", "interrupted": "interrupted"}
 _STAGED_OUTCOMES = frozenset({"completed", "partial"})
@@ -482,15 +486,25 @@ class CommitRuntime:
 
         if type(payload) is not dict:
             raise CommitIntegrityError("canonical adapter payload is invalid")
+        if operation == "transcribe":
+            if set(payload) != {"capture_id"}:
+                raise CommitIntegrityError("canonical transcribe payload is invalid")
+            _sha(payload.get("capture_id"), "canonical transcribe capture_id")
+            return payload
         if operation == "ingest.search":
             if (
-                set(payload) != {"query", "limit"}
+                set(payload) - {"options"} != {"query", "limit"}
                 or type(payload.get("query")) is not str
                 or not payload["query"]
                 or type(payload.get("limit")) is not int
                 or not 1 <= payload["limit"] <= 50
             ):
                 raise CommitIntegrityError("canonical ingest.search payload is invalid")
+            if "options" in payload:
+                try:
+                    validate_search_options(payload["options"])
+                except AdapterOutcomeError as error:
+                    raise CommitIntegrityError("canonical ingest.search options are invalid") from error
             return payload
         lineage = payload.get("lineage")
         if (
@@ -514,12 +528,108 @@ class CommitRuntime:
             raise CommitIntegrityError("canonical ingest.url lineage is invalid")
         return payload
 
+    def _capture_record(self, capture_id: str) -> dict[str, Any]:
+        """Read one completed media capture record and prove its exact identity.
+
+        The record is immutable and was authorized before the attempt existed,
+        so every later plan build (including interrupted recovery) rederives
+        the capture from durable truth instead of trusting the marker.
+        """
+
+        assert self.records is not None
+        try:
+            record = self.records.read_json(capture_id)
+        except StoreError as error:
+            raise CommitIntegrityError("authorized media capture is unreadable") from error
+        source = record.get("source") if type(record) is dict else None
+        if (
+            type(record) is not dict
+            or set(record) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "source", "lineage"}
+            or record.get("schema_version") != MEDIA_CAPTURE_SCHEMA
+            or record.get("operation") != "ingest.media"
+            or record.get("outcome") != "completed"
+            or type(source) is not dict
+            or set(source) != {"sha256", "byte_length", "media_type", "encoding"}
+            or source.get("media_type") != "application/octet-stream"
+            or source.get("encoding") != "identity"
+            or type(source.get("byte_length")) is not int
+            or source["byte_length"] < 0
+            or canonical_hash(record) != capture_id
+        ):
+            raise CommitIntegrityError("authorized media capture is malformed")
+        _sha(source["sha256"], "media capture source sha256")
+        return record
+
+    @staticmethod
+    def _capture_binding(record: dict[str, Any], capture_id: str) -> dict[str, Any]:
+        """Derive the transcript record's closed capture block from that record."""
+
+        source = record["source"]
+        return {
+            "record_id": capture_id,
+            "source_sha256": source["sha256"],
+            "byte_length": source["byte_length"],
+            "media_type": source["media_type"],
+        }
+
+    def _resolve_capture(self, capture_id: str, scope: PrincipalScope | None) -> tuple[dict[str, Any], bytes]:
+        """Bind an authorized capture and its exact bytes before any model call.
+
+        VISION requires the capture ID to resolve to an authorized ``kind=media``
+        capture under the effective scope with that exact hash, type, and
+        lineage before the provider is touched.  An ID that resolves to nothing
+        the principal may see is refused identically to one that never existed,
+        so an unauthorized caller learns nothing about either.
+        """
+
+        assert self.records is not None and self.journal is not None
+        authorized: dict[str, Any] | None = None
+        for event in self.journal.entries():
+            if scope is None or not authorize_event_header(scope, event):
+                continue
+            artifact = event.get("artifact")
+            classification = event.get("classification")
+            if (
+                type(artifact) is dict
+                and artifact.get("schema") == MEDIA_CAPTURE_SCHEMA
+                and artifact.get("kind") == "media"
+                and artifact.get("record_id") == capture_id
+                and type(classification) is dict
+                and classification.get("outcome") == "completed"
+            ):
+                authorized = event
+                break
+        if authorized is None:
+            raise CommitRefusal("declared capture does not resolve in scope")
+        record = self._capture_record(capture_id)
+        binding = self._capture_binding(record, capture_id)
+        dedupe = authorized.get("dedupe")
+        if (
+            authorized["artifact"].get("hash") != capture_id
+            or type(dedupe) is not dict
+            or dedupe.get("content_sha256") != binding["source_sha256"]
+            or dedupe.get("object_key") != f"media:{binding['source_sha256']}"
+            or authorized.get("lineage") != record["lineage"]
+        ):
+            raise CommitIntegrityError("authorized media capture disagrees with its event")
+        try:
+            # ``get`` verifies the digest, so this yields the capture's exact
+            # bytes or nothing; the length then binds the record's own claim.
+            audio = self.records.blobs.get(binding["source_sha256"])
+        except StoreError as error:
+            raise CommitIntegrityError("authorized media capture has no verified source bytes") from error
+        if len(audio) != binding["byte_length"]:
+            raise CommitIntegrityError("authorized media capture length disagrees with its bytes")
+        return binding, audio
+
     @staticmethod
     def _plan_requires_content(marker: dict[str, Any]) -> bool:
         """Report whether the plan's outcome names a durable content object."""
 
         body = marker["record_body"]
-        if body.get("schema_version") == QUARANTINE_SCHEMA:
+        # A quarantine manifest names no object, and a transcription record is
+        # hashes and provenance only: neither stages content for any outcome.
+        if body.get("schema_version") in {QUARANTINE_SCHEMA, TRANSCRIPT_RECORD_SCHEMA}:
             return False
         if marker["operation"] in ADAPTER_OPERATIONS:
             return body.get("outcome") in _STAGED_OUTCOMES
@@ -918,13 +1028,21 @@ class CommitRuntime:
         requests: int = 0,
         cost: float = 0,
         quarantine: bool = False,
+        model: str = _NO_CONTENT,
+        model_version: str = _NO_CONTENT,
+        language: str = _NO_CONTENT,
+        text_sha256: str = _NO_CONTENT,
+        text_byte_length: int = 0,
+        segments: tuple[Any, ...] = (),
     ) -> dict[str, Any]:
         """Replace the marker's plan with one validated adapter outcome plan."""
 
         assert self.journal is not None
         operation = marker["operation"]
         payload = marker["canonical_request"]["operation"]["payload"]
-        staged = outcome in _STAGED_OUTCOMES and not quarantine
+        # ``ADAPTER_MEDIA_TYPES`` is exactly the set of adapter operations that
+        # stage a content object, so ``transcribe`` stages nothing ever.
+        staged = outcome in _STAGED_OUTCOMES and not quarantine and operation in ADAPTER_MEDIA_TYPES
         digest = hashlib.sha256(content).hexdigest()
         common = {
             "attempt_id": marker["attempt_id"],
@@ -942,6 +1060,25 @@ class CommitRuntime:
                 "lineage": marker["lineage"],
             }
             marker["source"] = {"sha256": digest, "byte_length": len(content)}
+        elif operation == "transcribe":
+            # Hashes and policy-safe provenance only, per VISION: no transcript
+            # text, no provider response, and no staged object for any outcome.
+            body = {
+                "schema_version": TRANSCRIPT_RECORD_SCHEMA,
+                **common,
+                "reason": reason,
+                "provider": _ADAPTER_PROVIDERS[operation],
+                "retrieved_at": retrieved_at,
+                "model": model,
+                "model_version": model_version,
+                "language": language,
+                "capture": self._capture_binding(self._capture_record(payload["capture_id"]), payload["capture_id"]),
+                "text_sha256": text_sha256,
+                "text_byte_length": text_byte_length,
+                "segments": [dict(segment) for segment in segments],
+                "lineage": marker["lineage"],
+            }
+            marker["source"] = dict(_EMPTY_CONTENT)
         else:
             body = {
                 "schema_version": _ADAPTER_ARTIFACTS[operation][1],
@@ -955,6 +1092,10 @@ class CommitRuntime:
             }
             if operation == "ingest.search":
                 body |= {"query": payload["query"], "limit": payload["limit"], "leads": [dict(lead) for lead in leads]}
+                if "options" in payload:
+                    # The record binds what was asked, so the provider-received
+                    # bound survives in durable truth for every outcome.
+                    body["options"] = deepcopy(payload["options"])
             else:
                 body["url"] = payload["url"]
             marker["source"] = {"sha256": digest, "byte_length": len(content)} if staged else dict(_EMPTY_CONTENT)
@@ -1124,6 +1265,10 @@ class CommitRuntime:
     def _lineage(request: CommitRequest, scope: PrincipalScope | None, journal: Journal) -> dict[str, str]:
         if request.operation in {"ingest.file", "ingest.media", "ingest.search"}:
             return dict(_NO_LINEAGE)
+        if request.operation == "transcribe":
+            # A transcription's lineage is its resolved capture, bound before
+            # acceptance rather than derived from a declared payload field.
+            raise CommitIntegrityError("transcribe lineage is derived from its capture")
         if request.operation == "ingest.url":
             declared = request.payload["lineage"]
             if declared["kind"] == "direct":
@@ -1398,8 +1543,16 @@ class CommitRuntime:
                 template = self._completed_binding(reservation, marker)
                 return make_commit_response(request.request_id, ok=template["ok"], outcome=template["outcome"], record_ids=template["record_ids"], entry_ids=template["entry_ids"], usage=template["usage"])
             assert self.anchor is not None and self.records is not None and self.journal is not None
+            audio = b""
+            if request.operation == "transcribe":
+                # Capture binding is enforced here, before any attempt exists:
+                # an unresolvable ID creates no reservation, no record, no
+                # event, and reaches no provider.
+                capture, audio = self._resolve_capture(request.payload["capture_id"], scope)
+                lineage = {"relation": "media", "record_id": capture["record_id"], "lead_id": "none"}
+            else:
+                lineage = self._lineage(request, scope, self.journal)
             scope_id, attempt_id, request_hash, capability, canonical = self._pair(request, route, principal)
-            lineage = self._lineage(request, scope, self.journal)
             reservation_name, open_name = self._names(scope_id, attempt_id)
             marker = {"schema_version": _OPEN_SCHEMA, "scope_id": scope_id, "attempt_id": attempt_id, "request_hash": request_hash, "canonical_request": canonical, "operation": request.operation, "source": dict(_EMPTY_CONTENT), "record_id": "", "record_body": {}, "lineage": lineage, "access": access, "policy_id": request.policy_id, "producer": request.producer.to_dict(), "status": "open", "usage": {"requests": 0, "bytes": 0, "cost": 0}, "envelope": {}}
             template = self._adapter_plan_into(marker, outcome="interrupted", reason="interrupted", retrieved_at=_now())
@@ -1413,7 +1566,12 @@ class CommitRuntime:
             # One adapter call, no retry, no fallback, no caller-selected
             # provider.  Every failure below is a durable outcome, never a 5xx.
             try:
-                result = adapter_host.invoke(request.operation, dict(request.payload))
+                payload = dict(request.payload)
+                if request.operation == "transcribe":
+                    # The provider sees the authorized capture's exact bytes,
+                    # never a caller-supplied path, source, or model field.
+                    payload["audio"] = audio
+                result = adapter_host.invoke(request.operation, payload)
             except AdapterUnavailable as error:
                 return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="degraded", reason="adapter_absent", retrieved_at=_now(), requests=error.requests)
             except AdapterAbstained as error:
@@ -1421,6 +1579,27 @@ class CommitRuntime:
             except AdapterHostError as error:
                 return self._finalize_adapter(reservation, reservation_name, marker, open_name, request, outcome="failed", reason="provider_failed", retrieved_at=_now(), requests=error.requests)
             self._fault("after_adapter")
+            if request.operation not in ADAPTER_MEDIA_TYPES:
+                # Nothing is staged, so there is nothing to scan before staging:
+                # the transcription record carries only hashes and provenance.
+                return self._finalize_adapter(
+                    reservation,
+                    reservation_name,
+                    marker,
+                    open_name,
+                    request,
+                    outcome=result.outcome,
+                    reason="none",
+                    retrieved_at=result.retrieved_at,
+                    requests=result.requests,
+                    cost=result.cost,
+                    model=result.model,
+                    model_version=result.model_version,
+                    language=result.language,
+                    text_sha256=result.text_sha256,
+                    text_byte_length=result.text_byte_length,
+                    segments=result.segments,
+                )
             try:
                 decision = scan_text(result.content, ADAPTER_MEDIA_TYPES[request.operation], request.operation)
             except (PhiInputError, ValueError) as error:

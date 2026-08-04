@@ -1,0 +1,418 @@
+{
+ "note": "Verbatim (record, journal event) pairs captured read-only from the production discovery store on 2026-08-04, before ingest.search gained options. Every pair must stay valid unchanged.",
+ "pairs": [
+  {
+   "event": {
+    "access": "public",
+    "appended_at": "2026-08-03T16:19:20.339785Z",
+    "artifact": {
+     "authorized_uri": "houndd://record/c01ea05230d0edd9499ed3f2b9727a58c1be5bb497547c9498676e601fde6944",
+     "hash": "c01ea05230d0edd9499ed3f2b9727a58c1be5bb497547c9498676e601fde6944",
+     "kind": "search",
+     "record_id": "c01ea05230d0edd9499ed3f2b9727a58c1be5bb497547c9498676e601fde6944",
+     "schema": "houndd.search-record.v1"
+    },
+    "classification": {
+     "evidence_status": "clear",
+     "outcome": "completed"
+    },
+    "dedupe": {
+     "content_sha256": "4903c616530373fa3f33f47a8139197fe934ffe0ecd14128d19da0fb0b87607f",
+     "object_key": "search:4903c616530373fa3f33f47a8139197fe934ffe0ecd14128d19da0fb0b87607f"
+    },
+    "entry_id": "0917a1fdaac54413bf878b825c1b3dc860cae9a60a7819190e30cce8d5b94f8a",
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "policy_id": "atum-owner",
+    "producer": {
+     "capability": "ingest.search",
+     "owner_id": "ali",
+     "run_id": "smoke-2026-08-03"
+    },
+    "schema_version": "houndd.journal.v1",
+    "sequence": 3,
+    "source": {
+     "canonical_url": "none",
+     "native_id": "c01ea05230d0edd9499ed3f2b9727a58c1be5bb497547c9498676e601fde6944",
+     "provider": "exa"
+    },
+    "usage": {
+     "bytes": 7662,
+     "cost": 0,
+     "requests": 1
+    }
+   },
+   "record": {
+    "attempt_id": "5ddc6caa889c057cea3eb14f113dde49442b29acefeeb2b12547281e4228310b",
+    "byte_length": 7662,
+    "content_sha256": "4903c616530373fa3f33f47a8139197fe934ffe0ecd14128d19da0fb0b87607f",
+    "evidence_status": "clear",
+    "leads": [
+     {
+      "native_id": "https://archrespite.org/lifespan-respite-care-program-state-grants-notice-of-funding-opportunity-nofo/",
+      "title": "Lifespan Respite Care Program \u2013 State Grants Notice of Funding Opportunity (NOFO) | ARCH National Respite Network & Resource Center",
+      "url": "https://archrespite.org/lifespan-respite-care-program-state-grants-notice-of-funding-opportunity-nofo/"
+     },
+     {
+      "native_id": "https://alzfdn.org/find-a-member/grant-information/milton-phyllis-berg-family-respite-care-grants/",
+      "title": "Milton & Phyllis Berg Family Respite Care Grants",
+      "url": "https://alzfdn.org/find-a-member/grant-information/milton-phyllis-berg-family-respite-care-grants/"
+     },
+     {
+      "native_id": "https://alzfdn.org/wp-content/uploads/2026/03/ef354c8d-de71-403c-9e22-308ef0d88711_2026-Respite-Grant-Application_.pdf-rev-4-2026.pdf",
+      "title": "AFA Milton & Phyllis Berg Respite Care Grant Criteria and Submission Directions",
+      "url": "https://alzfdn.org/wp-content/uploads/2026/03/ef354c8d-de71-403c-9e22-308ef0d88711_2026-Respite-Grant-Application_.pdf-rev-4-2026.pdf"
+     },
+     {
+      "native_id": "http://acl.gov/programs/support-caregivers/national-family-caregiver-support-program",
+      "title": "National Family Caregiver Support Program",
+      "url": "http://acl.gov/programs/support-caregivers/national-family-caregiver-support-program"
+     },
+     {
+      "native_id": "https://www.frederickcountymd.gov/DocumentCenter/View/357655/FY26-RESPITE-APPLICATION",
+      "title": "RESPITE APPLICATION CHECKLIST",
+      "url": "https://www.frederickcountymd.gov/DocumentCenter/View/357655/FY26-RESPITE-APPLICATION"
+     }
+    ],
+    "limit": 5,
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "operation": "ingest.search",
+    "outcome": "completed",
+    "provider": "exa",
+    "query": "family caregiver respite grants 2026",
+    "reason": "none",
+    "request_hash": "838ede794f39f1a3b70a0bdad6c4b573f04aa9be264b24cc6de2ea9d3babcb45",
+    "retrieved_at": "2026-08-03T16:19:20.335758Z",
+    "schema_version": "houndd.search-record.v1"
+   },
+   "record_id": "c01ea05230d0edd9499ed3f2b9727a58c1be5bb497547c9498676e601fde6944"
+  },
+  {
+   "event": {
+    "access": "public",
+    "appended_at": "2026-08-03T16:24:48.349249Z",
+    "artifact": {
+     "authorized_uri": "houndd://record/e3f5bd963dd6755e0476f9967e94fff64acb1c9a9ab1c1a8fc71d3395a666bdc",
+     "hash": "e3f5bd963dd6755e0476f9967e94fff64acb1c9a9ab1c1a8fc71d3395a666bdc",
+     "kind": "search",
+     "record_id": "e3f5bd963dd6755e0476f9967e94fff64acb1c9a9ab1c1a8fc71d3395a666bdc",
+     "schema": "houndd.search-record.v1"
+    },
+    "classification": {
+     "evidence_status": "clear",
+     "outcome": "completed"
+    },
+    "dedupe": {
+     "content_sha256": "04f5746dee5e2678bc2e3290e8897835c1d2c2d22edbcb7516a14d6689d2b2f6",
+     "object_key": "search:04f5746dee5e2678bc2e3290e8897835c1d2c2d22edbcb7516a14d6689d2b2f6"
+    },
+    "entry_id": "df53aed878909f806658681d4dcdd5c4b877377b3ed6bf00e092d5d5b593a111",
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "policy_id": "atum-owner",
+    "producer": {
+     "capability": "ingest.search",
+     "owner_id": "gc-benefits",
+     "run_id": "radar-shadow"
+    },
+    "schema_version": "houndd.journal.v1",
+    "sequence": 5,
+    "source": {
+     "canonical_url": "none",
+     "native_id": "e3f5bd963dd6755e0476f9967e94fff64acb1c9a9ab1c1a8fc71d3395a666bdc",
+     "provider": "exa"
+    },
+    "usage": {
+     "bytes": 7430,
+     "cost": 0,
+     "requests": 1
+    }
+   },
+   "record": {
+    "attempt_id": "30662a0d0baeb627402afd850bde97e04978cd9e8c26f3bf1a14aadbdd098516",
+    "byte_length": 7430,
+    "content_sha256": "04f5746dee5e2678bc2e3290e8897835c1d2c2d22edbcb7516a14d6689d2b2f6",
+    "evidence_status": "clear",
+    "leads": [
+     {
+      "native_id": "https://assets.thehartford.com/image/upload/vt_individual_fmli_faq.pdf",
+      "title": "Vermont Family and Medical Leave Insurance (FMLI) for Individuals",
+      "url": "https://assets.thehartford.com/image/upload/vt_individual_fmli_faq.pdf"
+     },
+     {
+      "native_id": "https://fmli.thehartford.com/",
+      "title": "Vermont FMLI",
+      "url": "https://fmli.thehartford.com/"
+     },
+     {
+      "native_id": "https://legalclarity.org/does-vermont-have-paid-family-leave-how-vt-fmli-works/",
+      "title": "Does Vermont Have Paid Family Leave? How VT-FMLI Works - LegalClarity",
+      "url": "https://legalclarity.org/does-vermont-have-paid-family-leave-how-vt-fmli-works/"
+     },
+     {
+      "native_id": "https://humanresources.vermont.gov/benefits-wellness/leave/family-medical-leave/employee-information",
+      "title": "Employee Information | Department of Human Resources",
+      "url": "https://humanresources.vermont.gov/benefits-wellness/leave/family-medical-leave/employee-information"
+     },
+     {
+      "native_id": "https://www.mutualofomaha.com/employer-based-plans/paid-family-medical-leave/vermont",
+      "title": "Vermont's Family and Medical Leave Insurance Plan",
+      "url": "https://www.mutualofomaha.com/employer-based-plans/paid-family-medical-leave/vermont"
+     }
+    ],
+    "limit": 5,
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "operation": "ingest.search",
+    "outcome": "completed",
+    "provider": "exa",
+    "query": "Vermont paid family leave caregiver benefit eligibility application 2026",
+    "reason": "none",
+    "request_hash": "d528e5b6bf7d5c42eac69ad0e60a0543a17e70bfbaa4d24798b26a91e1a4f434",
+    "retrieved_at": "2026-08-03T16:24:48.338032Z",
+    "schema_version": "houndd.search-record.v1"
+   },
+   "record_id": "e3f5bd963dd6755e0476f9967e94fff64acb1c9a9ab1c1a8fc71d3395a666bdc"
+  },
+  {
+   "event": {
+    "access": "public",
+    "appended_at": "2026-08-03T16:24:49.779010Z",
+    "artifact": {
+     "authorized_uri": "houndd://record/ba38f46a896f102d509a1005fb5c70c055fc4af74dd10608e1effd04cd8955a5",
+     "hash": "ba38f46a896f102d509a1005fb5c70c055fc4af74dd10608e1effd04cd8955a5",
+     "kind": "search",
+     "record_id": "ba38f46a896f102d509a1005fb5c70c055fc4af74dd10608e1effd04cd8955a5",
+     "schema": "houndd.search-record.v1"
+    },
+    "classification": {
+     "evidence_status": "clear",
+     "outcome": "completed"
+    },
+    "dedupe": {
+     "content_sha256": "e26bbb59ce886e70470bd8e5169a3f5bc50fbe830560793adc046e8068d0263b",
+     "object_key": "search:e26bbb59ce886e70470bd8e5169a3f5bc50fbe830560793adc046e8068d0263b"
+    },
+    "entry_id": "b83d667881dfcba024369df80a54433be1c27be91f4bdce88c5741a5936705a2",
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "policy_id": "atum-owner",
+    "producer": {
+     "capability": "ingest.search",
+     "owner_id": "gc-benefits",
+     "run_id": "radar-shadow"
+    },
+    "schema_version": "houndd.journal.v1",
+    "sequence": 6,
+    "source": {
+     "canonical_url": "none",
+     "native_id": "ba38f46a896f102d509a1005fb5c70c055fc4af74dd10608e1effd04cd8955a5",
+     "provider": "exa"
+    },
+    "usage": {
+     "bytes": 7294,
+     "cost": 0,
+     "requests": 1
+    }
+   },
+   "record": {
+    "attempt_id": "58bde04c986a6d97e452c7ddb444360c4788955034ab246c99405b1d6daf6203",
+    "byte_length": 7294,
+    "content_sha256": "e26bbb59ce886e70470bd8e5169a3f5bc50fbe830560793adc046e8068d0263b",
+    "evidence_status": "clear",
+    "leads": [
+     {
+      "native_id": "https://dhs.sd.gov/en/division-developmental-disabilities/family-support-360",
+      "title": "Family Support 360",
+      "url": "https://dhs.sd.gov/en/division-developmental-disabilities/family-support-360"
+     },
+     {
+      "native_id": "https://dss.sd.gov/formsandpubs/docs/MEDELGBLTY/EA265.pdf",
+      "title": "Request for Long-Term Care or Home Community Based Waiver Services assistance",
+      "url": "https://dss.sd.gov/formsandpubs/docs/MEDELGBLTY/EA265.pdf"
+     },
+     {
+      "native_id": "https://dhs.sd.gov/content/dam/digital/united-states/south-dakota/sdo/pdf/public-notices/HOPE-Waiver-Renewal-Application-March2025.pdf",
+      "title": "Application for 1915(c) HCBS Waiver:  Draft SD.010.08.00 - Oct 01, 2026",
+      "url": "https://dhs.sd.gov/content/dam/digital/united-states/south-dakota/sdo/pdf/public-notices/HOPE-Waiver-Renewal-Application-March2025.pdf"
+     },
+     {
+      "native_id": "https://dss.sd.gov/economicassistance/medical_programs.aspx",
+      "title": "South Dakota Medicaid Coverage Groups",
+      "url": "https://dss.sd.gov/economicassistance/medical_programs.aspx"
+     },
+     {
+      "native_id": "https://dss.sd.gov/medicaid/hcbs.aspx",
+      "title": "Medicaid Home and Community Based Services",
+      "url": "https://dss.sd.gov/medicaid/hcbs.aspx"
+     }
+    ],
+    "limit": 5,
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "operation": "ingest.search",
+    "outcome": "completed",
+    "provider": "exa",
+    "query": "South Dakota Medicaid HCBS self direction caregiver benefit eligibility application 2026",
+    "reason": "none",
+    "request_hash": "bb27b6344cc8b8a3a74568a5d0732b4354dd9ed7f2457729983ddfa98b3629cc",
+    "retrieved_at": "2026-08-03T16:24:49.773910Z",
+    "schema_version": "houndd.search-record.v1"
+   },
+   "record_id": "ba38f46a896f102d509a1005fb5c70c055fc4af74dd10608e1effd04cd8955a5"
+  },
+  {
+   "event": {
+    "access": "public",
+    "appended_at": "2026-08-04T11:02:21.770355Z",
+    "artifact": {
+     "authorized_uri": "houndd://record/8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703",
+     "hash": "8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703",
+     "kind": "search",
+     "record_id": "8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703",
+     "schema": "houndd.search-record.v1"
+    },
+    "classification": {
+     "evidence_status": "interrupted",
+     "outcome": "interrupted"
+    },
+    "dedupe": {
+     "content_sha256": "8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703",
+     "object_key": "search-outcome:8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703"
+    },
+    "entry_id": "ab6a4f4828c01f7a1080ebd6c760007476129080d343c100061d1eb044e4e115",
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "policy_id": "atum-owner",
+    "producer": {
+     "capability": "ingest.search",
+     "owner_id": "gc-web",
+     "run_id": "pulse-shadow"
+    },
+    "schema_version": "houndd.journal.v1",
+    "sequence": 900,
+    "source": {
+     "canonical_url": "none",
+     "native_id": "8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703",
+     "provider": "exa"
+    },
+    "usage": {
+     "bytes": 0,
+     "cost": 0,
+     "requests": 0
+    }
+   },
+   "record": {
+    "attempt_id": "855d01654d900aaac8f32666464e536354abc74399d92285feb05c1b4927f8b5",
+    "byte_length": 0,
+    "content_sha256": "none",
+    "evidence_status": "interrupted",
+    "leads": [],
+    "limit": 16,
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "operation": "ingest.search",
+    "outcome": "interrupted",
+    "provider": "exa",
+    "query": "caregiving study outcomes",
+    "reason": "interrupted",
+    "request_hash": "ca2528778e918ca347bbe99af3b2dc5c8b49e0c1182ae093897ed0400a276401",
+    "retrieved_at": "2026-08-04T07:30:42.419381Z",
+    "schema_version": "houndd.search-record.v1"
+   },
+   "record_id": "8787d925497c601dbd35e3f27564243a8c17c58903b7c7484a3ba481509f3703"
+  },
+  {
+   "event": {
+    "access": "public",
+    "appended_at": "2026-08-04T11:12:51.643106Z",
+    "artifact": {
+     "authorized_uri": "houndd://record/5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912",
+     "hash": "5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912",
+     "kind": "search",
+     "record_id": "5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912",
+     "schema": "houndd.search-record.v1"
+    },
+    "classification": {
+     "evidence_status": "interrupted",
+     "outcome": "interrupted"
+    },
+    "dedupe": {
+     "content_sha256": "5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912",
+     "object_key": "search-outcome:5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912"
+    },
+    "entry_id": "1033af7e9e0782e9d860a3f4492d10f97cce0e33c58d0728ce620f5ab6ff0e33",
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "policy_id": "atum-owner",
+    "producer": {
+     "capability": "ingest.search",
+     "owner_id": "gc-wiki",
+     "run_id": "refresh-wiki-2026-08-04"
+    },
+    "schema_version": "houndd.journal.v1",
+    "sequence": 931,
+    "source": {
+     "canonical_url": "none",
+     "native_id": "5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912",
+     "provider": "exa"
+    },
+    "usage": {
+     "bytes": 0,
+     "cost": 0,
+     "requests": 0
+    }
+   },
+   "record": {
+    "attempt_id": "519e9c67c9748110100333fa98c4c3be25160e4cd19e98ef25c41fd9bb23e33d",
+    "byte_length": 0,
+    "content_sha256": "none",
+    "evidence_status": "interrupted",
+    "leads": [],
+    "limit": 8,
+    "lineage": {
+     "lead_id": "none",
+     "record_id": "none",
+     "relation": "none"
+    },
+    "operation": "ingest.search",
+    "outcome": "interrupted",
+    "provider": "exa",
+    "query": "caregiver coping strategy research update 2026",
+    "reason": "interrupted",
+    "request_hash": "328afe513386371c788d278ee6637d1f42746db75f746ee976bc51c17c2f39b9",
+    "retrieved_at": "2026-08-04T11:10:07.985364Z",
+    "schema_version": "houndd.search-record.v1"
+   },
+   "record_id": "5a87d838a07e9eecc5b16f9a97f3203bfc5a56be7259a0b96a0aad442101f912"
+  }
+ ]
+}

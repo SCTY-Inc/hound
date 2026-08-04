@@ -18,8 +18,39 @@ from .transactions import TransactionCoordinator
 
 
 _RECORD_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-_OUTCOME_SCHEMAS = frozenset({"houndd.import-outcome.v1", "houndd.file-record.v1", "houndd.media-capture-record.v1", "houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
-_ADAPTER_SCHEMAS = frozenset({"houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
+_MEDIA_CAPTURE_SCHEMA = "houndd.media-capture-record.v1"
+_TRANSCRIPT_SCHEMA = "houndd.transcript-record.v1"
+_OUTCOME_SCHEMAS = frozenset({"houndd.import-outcome.v1", "houndd.file-record.v1", _MEDIA_CAPTURE_SCHEMA, "houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1", _TRANSCRIPT_SCHEMA})
+_ADAPTER_SCHEMAS = frozenset({"houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1", _TRANSCRIPT_SCHEMA})
+
+
+def _verify_transcript_capture(records: RecordStore, record: dict[str, Any]) -> None:
+    """Prove a transcription still names a real capture with the exact bytes.
+
+    A transcription cannot exist without its capture lineage, so verification
+    resolves the named capture record independently instead of trusting the
+    transcript's own copy of the capture identity.
+    """
+
+    capture = record["capture"]
+    try:
+        origin = records.read_json(capture["record_id"])
+    except StoreError as error:
+        raise ValueError("transcript capture record is missing") from error
+    source = origin.get("source") if type(origin) is dict else None
+    if (
+        type(origin) is not dict
+        or origin.get("schema_version") != _MEDIA_CAPTURE_SCHEMA
+        or origin.get("outcome") != "completed"
+        or type(source) is not dict
+        or source.get("sha256") != capture["source_sha256"]
+        or source.get("byte_length") != capture["byte_length"]
+        or source.get("media_type") != capture["media_type"]
+        or hashlib.sha256(canonical_bytes(origin)).hexdigest() != capture["record_id"]
+    ):
+        raise ValueError("transcript capture record does not bind its transcript")
+
+
 def _verify_adapter_outcome(records: RecordStore, event: dict[str, Any], record: Any, schema: str, record_id: str, dedupe: Any, referenced_blobs: set[str]) -> None:
     """Bind one Slice 3C2 outcome record to its exact journal event."""
 
@@ -29,6 +60,8 @@ def _verify_adapter_outcome(records: RecordStore, event: dict[str, Any], record:
         outcome = validate_adapter_outcome(record, event, record_id=record_id)
     except AdapterOutcomeError as error:
         raise ValueError("adapter outcome does not bind the journal event") from error
+    if schema == _TRANSCRIPT_SCHEMA:
+        _verify_transcript_capture(records, record)
     if not outcome.staged:
         return
     digest = record["content_sha256"]

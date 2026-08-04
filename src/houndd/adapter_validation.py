@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from hound_research.evidence import EvidenceError, validate_public_url
 
-from .contracts import canonical_hash, validate_journal_envelope
+from .contracts import canonical_bytes, canonical_hash, validate_journal_envelope
 
 
 class AdapterOutcomeError(ValueError):
@@ -18,8 +18,12 @@ class AdapterOutcomeError(ValueError):
 
 SEARCH_RECORD_SCHEMA = "houndd.search-record.v1"
 URL_RECORD_SCHEMA = "houndd.url-record.v1"
+TRANSCRIPT_RECORD_SCHEMA = "houndd.transcript-record.v1"
 QUARANTINE_SCHEMA = "houndd.quarantine-record.v1"
 MAX_CONTENT_BYTES = 16 * 1024 * 1024
+MAX_TRANSCRIPT_SEGMENTS = 2_048
+MAX_LANGUAGE_CHARS = 64
+MAX_MODEL_CHARS = 128
 MAX_QUERY_CHARS = 1_024
 # Providers use URLs as native lead IDs (Exa's providerId is the result URL),
 # so this bound must hold URL-scale identifiers, not short opaque tokens.
@@ -30,6 +34,7 @@ _NO_LINEAGE = {"relation": "none", "record_id": "none", "lead_id": "none"}
 _BINDINGS = {
     "ingest.search": ("search", SEARCH_RECORD_SCHEMA, "exa"),
     "ingest.url": ("extract", URL_RECORD_SCHEMA, "firecrawl"),
+    "transcribe": ("transcription", TRANSCRIPT_RECORD_SCHEMA, "openai"),
 }
 _EVIDENCE = {
     "completed": "clear",
@@ -82,8 +87,9 @@ def _fail(message: str) -> None:
     raise AdapterOutcomeError(message)
 
 
-def _object(value: object, fields: set[str], label: str) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != fields:
+def _object(value: object, fields: set[str], label: str, *, optional: set[str] = set()) -> dict[str, Any]:
+    keys = set(value) if type(value) is dict else None
+    if keys is None or not fields <= keys or keys - fields - optional:
         _fail(f"{label} has an invalid shape")
     return value
 
@@ -145,6 +151,13 @@ def _lineage(value: object, operation: str) -> dict[str, str]:
         return {"relation": relation, "record_id": record_id, "lead_id": lead_id}
     if lineage == _NO_LINEAGE:
         return {"relation": relation, "record_id": record_id, "lead_id": lead_id}
+    if operation == "transcribe":
+        # A transcription's only lineage is the capture it was authorized
+        # against; the no-lineage form above belongs to its quarantine record.
+        if relation != "media" or lead_id != "none":
+            _fail("transcript lineage relation is invalid")
+        _sha(record_id, "transcript lineage record_id")
+        return lineage
     if relation != "search":
         _fail("URL lineage relation is invalid")
     _sha(record_id, "URL lineage record_id")
@@ -247,6 +260,159 @@ def _journal(
     return event
 
 
+def validate_search_options(value: object) -> dict[str, Any]:
+    """Check one search options object against the provider's own vocabulary.
+
+    The daemon does not own the option grammar; the exa adapter does.  Routing
+    every caller-supplied and record-bound options object through the adapter's
+    normalizer keeps one vocabulary at the wire, at the record, and at the
+    provider request itself.  The import is deferred so this module stays free
+    of adapter transport machinery.
+    """
+
+    from hound_research.web import MAX_SEARCH_OPTIONS_BYTES
+    from hound_web_adapters._http import AdapterError
+    from hound_web_adapters.exa import normalize_search_options
+
+    if type(value) is not dict:
+        _fail("search options are invalid")
+    try:
+        normalize_search_options(value)
+    except AdapterError as error:
+        raise AdapterOutcomeError(f"search options are invalid: {error}") from error
+    if len(canonical_bytes(value)) > MAX_SEARCH_OPTIONS_BYTES:
+        _fail("search options are too large")
+    return value
+
+
+_TRANSCRIBED = frozenset({"completed", "partial"})
+_TRANSCRIPT_FIELDS = {
+    "schema_version",
+    "attempt_id",
+    "request_hash",
+    "operation",
+    "outcome",
+    "evidence_status",
+    "reason",
+    "provider",
+    "retrieved_at",
+    "model",
+    "model_version",
+    "language",
+    "capture",
+    "text_sha256",
+    "text_byte_length",
+    "segments",
+    "lineage",
+}
+_EMPTY_CONTENT = {"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "byte_length": 0}
+
+
+def _segments(value: object, transcribed: bool) -> list[dict[str, Any]]:
+    """Check ordered, non-overlapping segment provenance and nothing else.
+
+    A segment retains its position, its timings, and the hash of its text.  The
+    text itself is never part of a transcription record.
+    """
+
+    if type(value) is not list or len(value) > MAX_TRANSCRIPT_SEGMENTS:
+        _fail("transcript segments are invalid")
+    if bool(value) != transcribed:
+        _fail("transcript segments do not bind the outcome")
+    segments: list[dict[str, Any]] = []
+    previous_end = 0
+    for index, segment in enumerate(value):
+        segment = _object(segment, {"index", "start_ms", "end_ms", "text_sha256"}, "transcript segment")
+        start = segment["start_ms"]
+        end = segment["end_ms"]
+        if (
+            segment["index"] != index
+            or type(start) is not int
+            or type(end) is not int
+            or type(segment["index"]) is not int
+            or start < previous_end
+            or end < start
+        ):
+            _fail("transcript segment timings are invalid")
+        _sha(segment["text_sha256"], "transcript segment text_sha256")
+        previous_end = end
+        segments.append(dict(segment))
+    return segments
+
+
+def _transcript_outcome(
+    record: dict[str, Any],
+    *,
+    record_id: str | None,
+    outcome: str,
+    evidence: str,
+    lineage: dict[str, str],
+    expected_payload: Mapping[str, Any] | None,
+    content_identity: Mapping[str, Any] | None,
+) -> AdapterOutcome:
+    """Validate one ``houndd.transcript-record.v1`` body as durable truth.
+
+    The record is hashes and policy-safe provenance only: no transcript text,
+    no provider response, and no staged content object anywhere.  A
+    non-transcribed outcome carries no model, language, or text identity at
+    all, so a failed or degraded attempt can never read as thin evidence.
+    """
+
+    _object(record, _TRANSCRIPT_FIELDS, "transcript outcome")
+    if (
+        _fixed_text(record["schema_version"], TRANSCRIPT_RECORD_SCHEMA, "transcript schema") != TRANSCRIPT_RECORD_SCHEMA
+        or _fixed_text(record["provider"], "openai", "transcript provider") != "openai"
+        or _fixed_text(record["reason"], _REASONS[outcome], "transcript reason") != _REASONS[outcome]
+    ):
+        _fail("transcript provider, schema, or reason is invalid")
+    _timestamp(record["retrieved_at"], "transcript retrieved_at")
+    transcribed = outcome in _TRANSCRIBED
+
+    capture = _object(record["capture"], {"record_id", "source_sha256", "byte_length", "media_type"}, "transcript capture")
+    capture_id = _sha(capture["record_id"], "transcript capture record_id")
+    _sha(capture["source_sha256"], "transcript capture source_sha256")
+    _uint(capture["byte_length"], "transcript capture byte_length", maximum=MAX_CONTENT_BYTES)
+    if _fixed_text(capture["media_type"], "application/octet-stream", "transcript capture media_type") != "application/octet-stream":
+        _fail("transcript capture media type is unsupported")
+    if lineage != {"relation": "media", "record_id": capture_id, "lead_id": "none"}:
+        _fail("transcript lineage does not name its capture")
+    if expected_payload is not None and capture_id != expected_payload.get("capture_id"):
+        _fail("transcript record does not bind its request")
+
+    model = _text(record["model"], "transcript model", maximum=MAX_MODEL_CHARS)
+    model_version = _text(record["model_version"], "transcript model_version", maximum=MAX_MODEL_CHARS)
+    language = _text(record["language"], "transcript language", maximum=MAX_LANGUAGE_CHARS)
+    if not transcribed and (model, model_version, language) != ("none", "none", "none"):
+        _fail("non-transcribed outcome claims model provenance")
+    if transcribed and "none" in {model, model_version}:
+        _fail("transcribed outcome has no model provenance")
+
+    text_length = record["text_byte_length"]
+    if transcribed:
+        _sha(record["text_sha256"], "transcript text_sha256")
+        if _uint(text_length, "transcript text_byte_length", maximum=MAX_CONTENT_BYTES) == 0:
+            _fail("transcribed outcome has no text")
+    elif record["text_sha256"] != "none" or type(text_length) is not int or text_length != 0:
+        _fail("non-transcribed outcome claims text")
+    _segments(record["segments"], transcribed)
+    # Nothing is staged for any transcript outcome: the record is the object.
+    if content_identity is not None and dict(content_identity) != _EMPTY_CONTENT:
+        _fail("transcript plan claims a staged object")
+    if record_id is not None and canonical_hash(record) != record_id:
+        _fail("transcript record hash is invalid")
+    return AdapterOutcome(
+        "transcribe",
+        "transcription",
+        TRANSCRIPT_RECORD_SCHEMA,
+        "openai",
+        outcome,
+        evidence,
+        False,
+        "none",
+        {"object_key": f"transcript:{record_id}", "content_sha256": record_id or ""},
+    )
+
+
 def validate_adapter_record(
     record: object,
     *,
@@ -322,6 +488,17 @@ def validate_adapter_record(
             _fail("quarantine record hash is invalid")
         return AdapterOutcome(operation, kind, QUARANTINE_SCHEMA, provider, outcome, evidence, False, "none", {"object_key": f"quarantine:{record_id}", "content_sha256": record_id or ""})
 
+    if operation == "transcribe":
+        return _transcript_outcome(
+            record,
+            record_id=record_id,
+            outcome=outcome,
+            evidence=evidence,
+            lineage=lineage,
+            expected_payload=expected_payload,
+            content_identity=content_identity,
+        )
+
     fields = {
         "schema_version",
         "attempt_id",
@@ -337,7 +514,9 @@ def validate_adapter_record(
         "lineage",
     }
     fields |= {"query", "limit", "leads"} if operation == "ingest.search" else {"url"}
-    _object(record, fields, "adapter outcome")
+    # ``options`` is additive: every record committed before it existed omits
+    # the field and must stay exactly as valid as the day it was written.
+    _object(record, fields, "adapter outcome", optional={"options"} if operation == "ingest.search" else set())
     if (
         _fixed_text(record["schema_version"], operation_schema, "adapter schema")
         != operation_schema
@@ -376,7 +555,13 @@ def validate_adapter_record(
         leads = _leads(record["leads"], limit)
         if not staged and leads:
             _fail("unstaged search outcome claims leads")
-        if expected_payload is not None and (query != expected_payload.get("query") or limit != expected_payload.get("limit")):
+        if "options" in record:
+            validate_search_options(record["options"])
+        if expected_payload is not None and (
+            query != expected_payload.get("query")
+            or limit != expected_payload.get("limit")
+            or record.get("options") != expected_payload.get("options")
+        ):
             _fail("search record does not bind its request")
         canonical_url = "none"
     else:
@@ -454,9 +639,12 @@ __all__ = [
     "AdapterOutcome",
     "AdapterOutcomeError",
     "MAX_CONTENT_BYTES",
+    "MAX_TRANSCRIPT_SEGMENTS",
     "QUARANTINE_SCHEMA",
     "SEARCH_RECORD_SCHEMA",
+    "TRANSCRIPT_RECORD_SCHEMA",
     "URL_RECORD_SCHEMA",
     "validate_adapter_outcome",
     "validate_adapter_record",
+    "validate_search_options",
 ]

@@ -14,6 +14,7 @@ from hound_cli.cli import _HoundArgumentParser, _emit, _exit_for_result, _input_
 from hound_cli.contracts import ContractError
 from hound_cli.orchestrator import HoundError
 from hound_cli.runtime import RuntimeErrorHound
+from houndd.adapter_validation import AdapterOutcomeError, validate_search_options
 from houndd.commit import CommitContractError, MAX_WIRE_BODY_BYTES, parse_commit_request, resolve_route
 from houndd.contracts import canonical_bytes
 from houndd.query_contracts import parse_query_request
@@ -113,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--filter-json", default="{}")
     query.add_argument("--limit", type=int, default=50)
     query.add_argument("--cursor")
+    query.add_argument("--order", choices=("ascending", "descending"), default="ascending")
     query.add_argument("--view", choices=("intake-ledger.v1",))
     query.add_argument("--request-id", default="hound-research-query")
     query.set_defaults(handler=_handle_journal_query)
@@ -166,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     _envelope_arguments(search_ingest)
     search_ingest.add_argument("--query", required=True)
     search_ingest.add_argument("--limit", type=int, default=10)
+    search_ingest.add_argument("--options-json", help="JSON object of bounded provider search options")
     search_ingest.set_defaults(handler=_handle_ingest_search)
 
     url_ingest = ingest_sub.add_parser("url", help="Submit one URL extraction through houndd")
@@ -175,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
     url_ingest.add_argument("--lineage-search-record")
     url_ingest.add_argument("--lead-id")
     url_ingest.set_defaults(handler=_handle_ingest_url)
+
+    transcribe = top.add_parser("transcribe", help="Transcribe one authorized media capture through houndd")
+    _envelope_arguments(transcribe)
+    transcribe.add_argument("--capture-id", required=True)
+    transcribe.set_defaults(handler=_handle_transcribe)
 
     import_record = top.add_parser("import-record", help="Mirror one legacy record through local houndd")
     _commit_arguments(import_record)
@@ -269,6 +277,8 @@ def _handle_journal_query(args: argparse.Namespace) -> dict[str, Any]:
             payload["cursor"] = args.cursor
         if args.view is not None:
             payload["view"] = args.view
+        if args.order != "ascending":
+            payload["order"] = args.order
         parse_query_request(payload)
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise HoundError("journal query payload is invalid", exit_code=2) from error
@@ -511,7 +521,16 @@ def _handle_ingest_search(args: argparse.Namespace) -> dict[str, Any]:
     if not args.query:
         raise HoundError("--query must not be empty", exit_code=2)
     limit = max(1, min(50, args.limit))
-    payload = {"query": args.query, "limit": limit}
+    payload: dict[str, Any] = {"query": args.query, "limit": limit}
+    if args.options_json is not None:
+        try:
+            options = json.loads(args.options_json)
+        except ValueError as error:
+            raise HoundError("--options-json must be a JSON object", exit_code=2) from error
+        try:
+            payload["options"] = validate_search_options(options)
+        except AdapterOutcomeError as error:
+            raise HoundError(f"--options-json {error}", exit_code=2) from error
     socket_path, request = _reserved_commit_request(args, "/v1/ingest/search", "ingest.search", payload)
     return _submit_commit(args, socket_path, request)
 
@@ -533,6 +552,16 @@ def _handle_ingest_url(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_pages is not None:
         payload["max_pages"] = args.max_pages
     socket_path, request = _reserved_commit_request(args, "/v1/ingest/url", "ingest.url", payload)
+    return _submit_commit(args, socket_path, request)
+
+
+def _handle_transcribe(args: argparse.Namespace) -> dict[str, Any]:
+    """Submit one capture ID; provider, model, and every timing stay daemon-owned."""
+
+    capture_id = args.capture_id
+    if len(capture_id) != 64 or any(character not in "0123456789abcdef" for character in capture_id):
+        raise HoundError("--capture-id must be a media capture record ID", exit_code=2)
+    socket_path, request = _reserved_commit_request(args, "/v1/transcribe", "transcribe", {"capture_id": capture_id})
     return _submit_commit(args, socket_path, request)
 
 

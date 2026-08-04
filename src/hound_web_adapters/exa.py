@@ -73,8 +73,14 @@ def _domains(value: object, label: str) -> list[str]:
     return domains
 
 
-def _options(search_input: dict[str, Any]) -> dict[str, Any]:
-    raw = search_input.get("options", {})
+def normalize_search_options(raw: object) -> dict[str, Any]:
+    """Normalize one search options object into the exact provider request fields.
+
+    This is the single vocabulary for search options.  The daemon validates
+    caller-supplied options through this function so a committed record can
+    never bind an option the provider would refuse.
+    """
+
     if not isinstance(raw, dict):
         raise AdapterError("Exa options must be an object")
     unknown = set(raw) - _OPTIONS
@@ -148,7 +154,7 @@ def search(
     timeout: float = 30,
 ) -> dict[str, Any]:
     search_input = validate_web_input("search", payload)
-    options = _options(search_input)
+    options = normalize_search_options(search_input.get("options", {}))
     api_key = env.get("EXA_API_KEY")
     if (
         not isinstance(api_key, str)
