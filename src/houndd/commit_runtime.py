@@ -48,6 +48,7 @@ from .commit import (
 from .contracts import canonical_bytes, canonical_hash, make_journal_envelope, validate_journal_envelope
 from .journal import Journal, JournalError
 from .phi import PhiInputError, scan_text
+from .projection import Projection
 from .store import ImmutableConflict, RecordStore, StoreError
 
 
@@ -832,6 +833,24 @@ class CommitRuntime:
         elif event != envelope:
             raise CommitIntegrityError("journal event disagrees with prepared commit")
 
+    def _refresh_projection(self) -> None:
+        """Rebuild the disposable index from the journal, and never raise.
+
+        The index is a query aid, so this uses the one projection writer that
+        startup recovery and ``journal.rebuild-index`` already use rather than
+        maintaining a second, incrementally divergent copy.  Every failure is
+        absorbed: the journal is canonical truth, a failed rebuild leaves the
+        prior projection byte-for-byte usable, and startup recovery repairs
+        the drift.  Nothing here may fail a commit whose event is durable.
+        """
+
+        try:
+            assert self.journal is not None and self.records is not None
+            with Projection(self.root, create=True) as projection:
+                projection.rebuild(self.journal, self.records)
+        except Exception:
+            return
+
     def _complete_pair(
         self,
         reservation: dict[str, Any],
@@ -845,6 +864,10 @@ class CommitRuntime:
         self._verify_published_plan(marker)
         if self.journal.get(marker["envelope"]["entry_id"]) != marker["envelope"]:
             raise CommitIntegrityError("planned journal event is missing or changed")
+        # Refresh before the pair reads complete so the index never lags an
+        # observable commit, and so a crash in this window still leaves the
+        # pair in a phase reconcile drives back through here.
+        self._refresh_projection()
         marker["status"] = "complete"
         self._write("commit3c1", "open", open_name, value=marker)
         reservation["response"] = self._plan_template(marker)

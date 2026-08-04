@@ -271,9 +271,9 @@ def test_b6_verify_route_reports_canonical_truth_and_ignores_the_disposable_inde
 def test_b6_rebuild_index_route_restores_the_projection_from_the_canonical_journal(live) -> None:
     path, state = live
 
-    # A durable commit never refreshes the projection, so a served store is
-    # already drifted before anything is deleted here.
-    assert verify_store(state)["valid"] is False
+    # A durable commit refreshes the projection (B9), so the only drift this
+    # route has left to repair is the one deleted here.
+    assert verify_store(state)["valid"] is True
     with Projection(state) as projection:
         projection.delete()
         assert projection.rows() == []
