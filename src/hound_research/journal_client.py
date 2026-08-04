@@ -180,7 +180,13 @@ def _request_id(request: dict[str, Any]) -> str:
     return request_id
 
 
-def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) -> dict[str, Any]:
+# Reads are near-instant, but the daemon serves one connection at a time and a
+# commit holds it through a full provider round trip — a read arriving behind
+# one must out-wait it, not spuriously report the daemon unavailable.
+READ_EXCHANGE_TIMEOUT_SECONDS = 60
+
+
+def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = READ_EXCHANGE_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Exchange one journal query or single-entry read."""
 
     request_id = _request_id(request)
@@ -254,7 +260,7 @@ def record_strict_response(raw: bytes, *, request_id: str) -> dict[str, Any]:
     return value
 
 
-def record_exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) -> dict[str, Any]:
+def record_exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = READ_EXCHANGE_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Exchange one record.get read."""
 
     request_id = _request_id(request)
@@ -286,7 +292,7 @@ def report_strict_response(raw: bytes, *, request_id: str, schema: str) -> dict[
     return value
 
 
-def report_exchange(socket_path: Path, request: dict[str, Any], *, schema: str, timeout: float = 5) -> dict[str, Any]:
+def report_exchange(socket_path: Path, request: dict[str, Any], *, schema: str, timeout: float = READ_EXCHANGE_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Exchange one journal.verify or journal.rebuild-index read."""
 
     request_id = _request_id(request)
