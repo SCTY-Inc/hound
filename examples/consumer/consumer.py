@@ -6,10 +6,10 @@ cursor, applies each event exactly once to its own idempotent output, and
 persists its cursor to a small per-lane state file with an atomic write. See
 ``docs/how-to-consume.md`` for the replay discipline this module implements.
 
-Only the Python standard library and ``hound_client`` are imported. Neither
-``houndd`` internals nor ``hound_research`` are required: this module depends
-on the documented wire contract (``houndd.uds.v1``), not on the daemon's
-implementation.
+The wire exchange and response validation live in ``hound_client``, the
+shared strict client every houndd consumer builds on; this module only adapts
+its typed ``journal_query`` result into the small dict/exception shape the
+rest of this file (and its callers) already expect.
 """
 
 from __future__ import annotations
@@ -17,15 +17,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import sys
 from pathlib import Path
 from typing import Any
 
-from hound_client.client import MAX_FRAME_BYTES, WIRE_VERSION, canonical_bytes
+from hound_client import (
+    HounddClient,
+    HounddClientError,
+    HounddJournalCursorRejectedError,
+)
 
-READ_REQUEST_SCHEMA = "houndd.read-request.v1"
-READ_RESPONSE_SCHEMA = "houndd.read-response.v1"
 DEFAULT_LIMIT = 50
 
 
@@ -40,16 +41,6 @@ class CursorRejectedError(ConsumerError):
     is to resnapshot from the start (a fresh cursorless query) and let
     idempotent processing absorb any re-delivered entries.
     """
-
-
-def _read_exact(connection: socket.socket, size: int) -> bytes:
-    data = bytearray()
-    while len(data) < size:
-        chunk = connection.recv(size - len(data))
-        if not chunk:
-            raise ConsumerError("houndd response was truncated")
-        data.extend(chunk)
-    return bytes(data)
 
 
 def query_journal(
@@ -70,65 +61,25 @@ def query_journal(
     for every other transport or contract fault.
     """
 
-    payload: dict[str, Any] = {"filter": {}, "limit": limit}
-    if cursor is not None:
-        payload["cursor"] = cursor
-    request = {
-        "wire_version": WIRE_VERSION,
-        "method": "GET",
-        "path": "/v1/journal",
-        "body": {
-            "schema_version": READ_REQUEST_SCHEMA,
-            "request_id": request_id,
-            "producer": {"owner_id": owner_id, "capability": "journal.query", "run_id": run_id},
-            "requested_access": requested_access,
-            "policy_id": policy_id,
-            "operation": {"name": "journal.query", "payload": payload},
-        },
-    }
-    raw = canonical_bytes(request)
-    if len(raw) > MAX_FRAME_BYTES:
-        raise ConsumerError("journal query request frame is out of bounds")
+    client = HounddClient(
+        socket_path,
+        owner_id=owner_id,
+        policy_id=policy_id,
+        requested_access=requested_access,
+        read_timeout=max(1, int(timeout)),
+    )
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(timeout)
-            connection.connect(os.fspath(socket_path))
-            connection.sendall(len(raw).to_bytes(4, "big") + raw)
-            connection.shutdown(socket.SHUT_WR)
-            size = int.from_bytes(_read_exact(connection, 4), "big")
-            if not 0 < size <= MAX_FRAME_BYTES:
-                raise ConsumerError("houndd response frame is out of bounds")
-            frame = _read_exact(connection, size)
-            if connection.recv(1):
-                raise ConsumerError("houndd response has trailing bytes")
-    except OSError as error:
-        raise ConsumerError(f"houndd is unavailable: {error}") from error
-
-    try:
-        response = json.loads(frame.decode("utf-8"))
-    except (UnicodeError, ValueError) as error:
-        raise ConsumerError("houndd response is not valid JSON") from error
-    body = response.get("body") if isinstance(response, dict) else None
-    if (
-        not isinstance(response, dict)
-        or response.get("wire_version") != WIRE_VERSION
-        or not isinstance(body, dict)
-        or body.get("request_id") != request_id
-        or body.get("schema_version") != READ_RESPONSE_SCHEMA
-    ):
-        raise ConsumerError("houndd response does not answer this request")
-
-    status = response.get("status")
-    if status == 200:
-        if body.get("ok") is not True or body.get("outcome") != "completed" or not isinstance(body.get("result"), list):
-            raise ConsumerError("houndd read response is invalid")
-        return body
-    # A 400 on a request that carried a cursor is, in this consumer's own
-    # request shape (empty filter, bounded limit), only reachable by the
-    # cursor being unrecoverable -- never by a malformed filter it never sends.
-    if status == 400 and cursor is not None:
-        raise CursorRejectedError("houndd rejected the persisted cursor")
-    raise ConsumerError(f"journal.query failed: status={status} outcome={body.get('outcome')}")
+        entries, next_cursor = client.journal_query(
+            cursor=cursor,
+            limit=limit,
+            run_id=run_id,
+            request_id=request_id,
+        )
+    except HounddJournalCursorRejectedError as error:
+        raise CursorRejectedError(str(error)) from error
+    except HounddClientError as error:
+        raise ConsumerError(str(error)) from error
+    return {"result": entries, "cursor": next_cursor}
 
 
 def load_state(state_path: Path) -> dict[str, Any]:

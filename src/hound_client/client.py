@@ -17,6 +17,7 @@ import json
 import math
 import os
 import socket
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,34 @@ _RECORD_ERRORS = {
     "invalid_request": (False, "request is invalid"),
     "service_unavailable": (True, "service is unavailable"),
 }
+_ACCESS_TIERS = frozenset({"public", "workspace", "restricted"})
+_JOURNAL_ENTRY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "entry_id",
+        "sequence",
+        "appended_at",
+        "producer",
+        "artifact",
+        "classification",
+        "access",
+        "policy_id",
+        "dedupe",
+        "lineage",
+        "source",
+        "usage",
+    }
+)
+_JOURNAL_ERRORS = {
+    400: {
+        "invalid_request": (False, "request is invalid"),
+        "filter_not_available": (False, "filter is not available"),
+    },
+    503: {
+        "service_unavailable": (True, "service is unavailable"),
+        "response_too_large": (True, "service response is unavailable"),
+    },
+}
 
 # A commit is synchronous: the daemon calls the search or extraction provider
 # inside the request, so this bounds a provider round trip rather than an IPC
@@ -59,6 +88,19 @@ READ_TIMEOUT_SECONDS = 15
 
 class HounddClientError(RuntimeError):
     """Raised when the local houndd daemon cannot complete a request."""
+
+
+class HounddJournalCursorRejectedError(HounddClientError):
+    """The daemon could not recover a persisted journal cursor.
+
+    There is no partial-resume option for a rejected cursor: the caller must
+    resnapshot with ``cursor=None`` and rely on idempotent processing to
+    absorb whatever gets redelivered.
+    """
+
+
+class HounddJournalFilterUnavailableError(HounddClientError):
+    """The requested journal filter is not available to this caller's scope."""
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -151,6 +193,99 @@ def _safe_error(
     if expected is None or (error["retryable"], error["message"]) != expected:
         raise HounddClientError(f"houndd {label} is invalid")
     return error
+
+
+def _entry_usage(value: object) -> dict[str, int | float]:
+    usage = _fields(value, set(), {"requests", "bytes", "cost"}, "journal entry usage")
+    for key, item in usage.items():
+        if type(item) is bool or type(item) not in {int, float} or not math.isfinite(item) or item < 0:
+            raise HounddClientError(f"houndd journal entry usage.{key} is invalid")
+    return usage
+
+
+def _hash(value: object, label: str) -> str:
+    text = _text(value, label)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise HounddClientError(f"houndd {label} is not a lowercase SHA-256 hex digest")
+    return text
+
+
+def _entry_timestamp(value: object, label: str) -> str:
+    text = _text(value, label)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise HounddClientError(f"houndd {label} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise HounddClientError(f"houndd {label} must include a timezone")
+    return text
+
+
+def _journal_entry(value: object) -> dict[str, Any]:
+    """Validate one journal envelope and its self-binding entry ID.
+
+    Every field is checked against the exact envelope shape, then the entry
+    ID is re-derived from the envelope's own canonical bytes: a page that is
+    wire-canonical as a whole but carries a tampered field inside one entry
+    (a flipped access tier, a rewritten policy ID) fails here even though the
+    outer frame already passed ``_canonical_object``.
+    """
+
+    entry = _fields(value, _JOURNAL_ENTRY_FIELDS, set(), "journal entry")
+    _hash(entry["entry_id"], "journal entry ID")
+    if type(entry["sequence"]) is not int or entry["sequence"] < 0:
+        raise HounddClientError("houndd journal entry sequence is invalid")
+    _entry_timestamp(entry["appended_at"], "journal entry timestamp")
+    producer = _fields(entry["producer"], {"owner_id", "capability", "run_id"}, set(), "journal entry producer")
+    for key in producer:
+        _text(producer[key], f"journal entry producer.{key}")
+    artifact = _fields(entry["artifact"], {"kind", "schema", "record_id", "hash", "authorized_uri"}, set(), "journal entry artifact")
+    for key in ("kind", "schema", "record_id", "authorized_uri"):
+        _text(artifact[key], f"journal entry artifact.{key}")
+    _hash(artifact["hash"], "journal entry artifact hash")
+    classification = _fields(entry["classification"], {"outcome", "evidence_status"}, set(), "journal entry classification")
+    for key in classification:
+        _text(classification[key], f"journal entry classification.{key}")
+    if entry["access"] not in _ACCESS_TIERS:
+        raise HounddClientError("houndd journal entry access is invalid")
+    _text(entry["policy_id"], "journal entry policy ID")
+    dedupe = _fields(entry["dedupe"], {"object_key", "content_sha256"}, set(), "journal entry dedupe")
+    _text(dedupe["object_key"], "journal entry dedupe object key")
+    _hash(dedupe["content_sha256"], "journal entry dedupe content hash")
+    lineage = _fields(entry["lineage"], {"relation", "record_id", "lead_id"}, set(), "journal entry lineage")
+    for key in lineage:
+        _text(lineage[key], f"journal entry lineage.{key}")
+    source = _fields(entry["source"], {"provider", "native_id", "canonical_url"}, set(), "journal entry source")
+    for key in source:
+        _text(source[key], f"journal entry source.{key}")
+    _entry_usage(entry["usage"])
+    unsigned = {key: item for key, item in entry.items() if key != "entry_id"}
+    if hashlib.sha256(canonical_bytes(unsigned)).hexdigest() != entry["entry_id"]:
+        raise HounddClientError("houndd journal entry ID does not match its canonical envelope")
+    return entry
+
+
+def _journal_result_ids(result: object) -> tuple[list[str], list[str]]:
+    """Light entry_id/artifact.record_id extraction for the ids-binding check.
+
+    Deliberately shallow -- the full per-field decode lives in
+    ``_journal_entry`` and only runs for a 200 that already passed this and
+    every other closed-shape check.
+    """
+
+    if type(result) is not list:
+        raise HounddClientError("houndd journal response result is invalid")
+    entry_ids: list[str] = []
+    record_ids: list[str] = []
+    for item in result:
+        if type(item) is not dict:
+            raise HounddClientError("houndd journal entry is invalid")
+        entry_ids.append(_text(item.get("entry_id"), "journal entry ID"))
+        artifact = item.get("artifact")
+        if type(artifact) is not dict:
+            raise HounddClientError("houndd journal entry artifact is invalid")
+        record_ids.append(_text(artifact.get("record_id"), "journal entry record ID"))
+    return entry_ids, record_ids
 
 
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -272,6 +407,47 @@ def _validate_commit_response(response: dict[str, Any], request: dict[str, Any])
         _safe_error(body["error"], {"unavailable": _COMMIT_ERRORS["unavailable"]}, "unavailable commit error")
 
 
+def _validate_journal_response(
+    response: dict[str, Any],
+    body: dict[str, Any],
+    record_ids: list[str],
+    entry_ids: list[str],
+) -> None:
+    if response["status"] == 200:
+        if (
+            body["ok"] is not True
+            or body["outcome"] != "completed"
+            or "result" not in body
+            or "error" in body
+            or "projection" in body
+            or set(body) - {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage", "result", "cursor"}
+        ):
+            raise HounddClientError("houndd journal response is invalid")
+        derived_entry_ids, derived_record_ids = _journal_result_ids(body["result"])
+        if entry_ids != derived_entry_ids or record_ids != derived_record_ids:
+            raise HounddClientError("houndd journal response ids do not bind its result")
+        if "cursor" in body:
+            _text(body["cursor"], "journal cursor")
+        return
+    expected = {400: "invalid", 404: "not_found", 503: "unavailable"}
+    if (
+        response["status"] not in expected
+        or body["ok"] is not False
+        or body["outcome"] != expected[response["status"]]
+        or record_ids
+        or entry_ids
+        or set(body) - {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage", "error"}
+    ):
+        raise HounddClientError("houndd journal response is invalid")
+    allowed = _JOURNAL_ERRORS.get(response["status"])
+    if allowed is not None:
+        if "error" not in body:
+            raise HounddClientError("houndd journal response is invalid")
+        _safe_error(body["error"], allowed, "journal error")
+    elif "error" in body:
+        raise HounddClientError("houndd journal response is invalid")
+
+
 def _validate_read_response(response: dict[str, Any], request: dict[str, Any]) -> None:
     body = _fields(response["body"], {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"}, {"result", "cursor", "projection", "error"}, "read response")
     if body["schema_version"] != READ_RESPONSE_SCHEMA:
@@ -295,6 +471,9 @@ def _validate_read_response(response: dict[str, Any], request: dict[str, Any]) -
             _safe_error(body["error"], {"service_unavailable": (True, "service is not ready")}, "ready error")
             return
         raise HounddClientError("houndd ready response is invalid")
+    if path == "/v1/journal":
+        _validate_journal_response(response, body, record_ids, entry_ids)
+        return
     record_id = request["body"]["operation"]["payload"]["record_id"]
     if response["status"] == 200:
         if body["ok"] is not True or body["outcome"] != "completed" or record_ids != [record_id] or entry_ids or "error" in body or set(body) - {"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage", "result"}:
@@ -482,6 +661,59 @@ class HounddClient:
             raise HounddClientError(f"{label} content does not match its declared digest")
         return record, content
 
+    def journal_query(
+        self,
+        *,
+        query_filter: dict[str, Any] | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        run_id: str,
+        request_id: str,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Read one page of journal entries. Returns ``(entries, next_cursor)``.
+
+        ``next_cursor`` is ``None`` once the page has drained everything
+        visible at the query's high-watermark; the caller resnapshots with
+        ``cursor=None`` to pick up a fresh watermark and continue. Raises
+        ``HounddJournalCursorRejectedError`` when a supplied ``cursor`` can no
+        longer be recovered, and ``HounddJournalFilterUnavailableError`` when
+        ``query_filter`` selects outside this caller's authorized scope.
+        """
+
+        if query_filter is None:
+            query_filter = {}
+        if type(query_filter) is not dict:
+            raise HounddClientError("houndd journal filter is invalid")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise HounddClientError("houndd journal limit is invalid")
+        payload: dict[str, Any] = {"filter": query_filter, "limit": limit}
+        if cursor is not None:
+            payload["cursor"] = _text(cursor, "journal cursor")
+        request = {
+            "wire_version": WIRE_VERSION,
+            "method": "GET",
+            "path": "/v1/journal",
+            "body": self._body(
+                schema_version=READ_REQUEST_SCHEMA,
+                request_id=request_id,
+                capability="journal.query",
+                run_id=run_id,
+                payload=payload,
+            ),
+        }
+        response = self._exchange(request, timeout=self.read_timeout)
+        body = response["body"]
+        if response["status"] == 200:
+            entries = [_journal_entry(item) for item in body["result"]]
+            return entries, body.get("cursor")
+        error = body.get("error")
+        error_code = error.get("code") if type(error) is dict else None
+        if response["status"] == 400 and error_code == "filter_not_available":
+            raise HounddJournalFilterUnavailableError(f"journal.query filter is not available: {_failure(body)}")
+        if response["status"] == 400 and cursor is not None:
+            raise HounddJournalCursorRejectedError(f"journal.query rejected the persisted cursor: {_failure(body)}")
+        raise HounddClientError(f"journal.query failed: {_failure(body)}")
+
     def _body(
         self,
         *,
@@ -541,6 +773,8 @@ __all__ = [
     "COMMIT_TIMEOUT_SECONDS",
     "HounddClient",
     "HounddClientError",
+    "HounddJournalCursorRejectedError",
+    "HounddJournalFilterUnavailableError",
     "MAX_FRAME_BYTES",
     "READ_REQUEST_SCHEMA",
     "READ_TIMEOUT_SECONDS",

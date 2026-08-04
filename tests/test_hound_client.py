@@ -19,6 +19,8 @@ from hound_client import (
     MAX_FRAME_BYTES,
     HounddClient,
     HounddClientError,
+    HounddJournalCursorRejectedError,
+    HounddJournalFilterUnavailableError,
     canonical_bytes,
     default_socket_path,
 )
@@ -515,6 +517,330 @@ def test_record_get_non_200_reports_the_daemon_message(tmp_path: Path) -> None:
     with pytest.raises(HounddClientError, match="record.get rec-1 failed: not_found"):
         _client(socket_path).record_get("rec-1", run_id="run-1")
     stub.join()
+
+
+# --- journal.query -----------------------------------------------------------
+
+
+def _journal_entry_dict(*, entry_index: int = 0, access: str = "public") -> dict[str, Any]:
+    unsigned = {
+        "schema_version": "houndd.journal.v1",
+        "sequence": entry_index,
+        "appended_at": "2026-08-01T00:00:00Z",
+        "producer": {"owner_id": "ingest", "capability": "capture", "run_id": "seed"},
+        "artifact": {
+            "kind": "capture",
+            "schema": "houndd.capture.v1",
+            "record_id": f"record-{entry_index}",
+            "hash": hashlib.sha256(f"record-{entry_index}".encode()).hexdigest(),
+            "authorized_uri": f"houndd://record-{entry_index}",
+        },
+        "classification": {"outcome": "completed", "evidence_status": "evidence"},
+        "access": access,
+        "policy_id": "policy-1",
+        "dedupe": {
+            "object_key": f"record-{entry_index}",
+            "content_sha256": hashlib.sha256(f"content-{entry_index}".encode()).hexdigest(),
+        },
+        "lineage": {"relation": "none", "record_id": f"record-{entry_index}", "lead_id": "none"},
+        "source": {"provider": "fixture", "native_id": f"record-{entry_index}", "canonical_url": f"https://fixture.test/{entry_index}"},
+        "usage": {},
+    }
+    entry = dict(unsigned)
+    entry["entry_id"] = hashlib.sha256(houndd_canonical_bytes(unsigned)).hexdigest()
+    return entry
+
+
+def _journal_response(
+    *,
+    request_id: str,
+    entries: list[dict[str, Any]] | None = None,
+    cursor: str | None = None,
+    status: int = 200,
+    ok: bool = True,
+    outcome: str = "completed",
+    error: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = [] if entries is None else entries
+    body: dict[str, Any] = {
+        "schema_version": "houndd.read-response.v1",
+        "request_id": request_id,
+        "ok": ok,
+        "outcome": outcome,
+        "record_ids": [entry["artifact"]["record_id"] for entry in result],
+        "entry_ids": [entry["entry_id"] for entry in result],
+        "usage": {"requests": 0, "bytes": 0, "cost": 0},
+    }
+    if status == 200:
+        body["result"] = result
+        if cursor is not None:
+            body["cursor"] = cursor
+    if error is not None:
+        body["error"] = error
+    if extra is not None:
+        body.update(extra)
+    return {"wire_version": "houndd.uds.v1", "status": status, "body": body}
+
+
+def _journal_query(
+    client: HounddClient, *, cursor: str | None = None, request_id: str = "journal-req-1"
+) -> tuple[list[dict[str, Any]], str | None]:
+    return client.journal_query(cursor=cursor, limit=10, run_id="run-1", request_id=request_id)
+
+
+def test_journal_query_sends_exact_request_frame_and_returns_entries_and_cursor(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    entry = _journal_entry_dict()
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(_journal_response(request_id=frame["body"]["request_id"], entries=[entry], cursor="cursor-token-1")),
+    )
+
+    entries, cursor = _client(socket_path).journal_query(cursor=None, limit=10, run_id="run-1", request_id="journal-req-1")
+    stub.join()
+
+    assert entries == [entry]
+    assert cursor == "cursor-token-1"
+    assert stub.request_frame == {
+        "wire_version": "houndd.uds.v1",
+        "method": "GET",
+        "path": "/v1/journal",
+        "body": {
+            "schema_version": "houndd.read-request.v1",
+            "request_id": "journal-req-1",
+            "producer": {"owner_id": "lane-owner", "capability": "journal.query", "run_id": "run-1"},
+            "requested_access": "public",
+            "policy_id": "policy-1",
+            "operation": {"name": "journal.query", "payload": {"filter": {}, "limit": 10}},
+        },
+    }
+
+
+def test_journal_query_includes_the_cursor_in_the_request_payload_when_provided(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(socket_path, lambda frame: _framed(_journal_response(request_id=frame["body"]["request_id"], entries=[])))
+
+    entries, cursor = _client(socket_path).journal_query(cursor="prior-cursor", limit=5, run_id="run-1", request_id="journal-req-2")
+    stub.join()
+
+    assert entries == []
+    assert cursor is None
+    assert stub.request_frame is not None
+    assert stub.request_frame["body"]["operation"]["payload"] == {"filter": {}, "limit": 5, "cursor": "prior-cursor"}
+
+
+def test_journal_query_rejects_a_forged_entry_with_a_tampered_field_but_unchanged_ids(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    entry = _journal_entry_dict()
+    tampered = dict(entry)
+    tampered["access"] = "restricted"  # flipped after the entry ID was computed; the ID no longer binds
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(_journal_response(request_id=frame["body"]["request_id"], entries=[tampered])),
+    )
+
+    with pytest.raises(HounddClientError, match="entry ID does not match its canonical envelope"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_duplicate_response_keys(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    response = _journal_response(request_id="journal-req-1", entries=[])
+    body = houndd_canonical_bytes(response["body"])
+    raw = b'{"body":' + body + b',"body":' + body + b',"status":200,"wire_version":"houndd.uds.v1"}'
+    stub = StubHoundd(socket_path, len(raw).to_bytes(4, "big") + raw)
+
+    with pytest.raises(HounddClientError, match="has duplicate JSON keys"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_trailing_bytes(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(socket_path, _framed(_journal_response(request_id="journal-req-1", entries=[])) + b"trailing")
+
+    with pytest.raises(HounddClientError, match="trailing bytes"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_wrong_request_id(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(socket_path, _framed(_journal_response(request_id="other-request", entries=[])))
+
+    with pytest.raises(HounddClientError, match="houndd response does not answer this request"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_a_non_canonical_response(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    encoded = json.dumps(_journal_response(request_id="journal-req-1", entries=[]), indent=2).encode("utf-8")
+    stub = StubHoundd(socket_path, len(encoded).to_bytes(4, "big") + encoded)
+
+    with pytest.raises(HounddClientError, match="houndd response is not canonical"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_ids_that_do_not_bind_the_result(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    entry = _journal_entry_dict()
+
+    def reply(frame: dict[str, Any]) -> bytes:
+        response = _journal_response(request_id=frame["body"]["request_id"], entries=[entry])
+        response["body"]["entry_ids"] = ["some-other-entry-id"]
+        return _framed(response)
+
+    stub = StubHoundd(socket_path, reply)
+
+    with pytest.raises(HounddClientError, match="ids do not bind its result"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_an_unrequested_projection_field(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(
+                request_id=frame["body"]["request_id"],
+                entries=[],
+                extra={"projection": {"schema_version": "houndd.intake-ledger.v1", "integrity": "verified", "high_watermark": "0"}},
+            )
+        ),
+    )
+
+    with pytest.raises(HounddClientError, match="houndd journal response is invalid"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_surfaces_filter_not_available_as_a_distinct_error(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(
+                request_id=frame["body"]["request_id"],
+                status=400,
+                ok=False,
+                outcome="invalid",
+                error={"code": "filter_not_available", "retryable": False, "message": "filter is not available"},
+            )
+        ),
+    )
+
+    with pytest.raises(HounddJournalFilterUnavailableError, match="filter is not available"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_surfaces_a_rejected_cursor_as_a_distinct_error(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(
+                request_id=frame["body"]["request_id"],
+                status=400,
+                ok=False,
+                outcome="invalid",
+                error={"code": "invalid_request", "retryable": False, "message": "request is invalid"},
+            )
+        ),
+    )
+
+    with pytest.raises(HounddJournalCursorRejectedError, match="rejected the persisted cursor"):
+        _client(socket_path).journal_query(cursor="stale-cursor", limit=10, run_id="run-1", request_id="journal-req-1")
+    stub.join()
+
+
+def test_journal_query_400_without_a_cursor_is_generic_not_cursor_rejected(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(
+                request_id=frame["body"]["request_id"],
+                status=400,
+                ok=False,
+                outcome="invalid",
+                error={"code": "invalid_request", "retryable": False, "message": "request is invalid"},
+            )
+        ),
+    )
+
+    with pytest.raises(HounddClientError) as caught:
+        _client(socket_path).journal_query(cursor=None, limit=10, run_id="run-1", request_id="journal-req-1")
+    stub.join()
+
+    assert not isinstance(caught.value, HounddJournalCursorRejectedError)
+    assert not isinstance(caught.value, HounddJournalFilterUnavailableError)
+
+
+def test_journal_query_rejects_an_error_code_outside_the_allowlist(tmp_path: Path) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(
+                request_id=frame["body"]["request_id"],
+                status=400,
+                ok=False,
+                outcome="invalid",
+                error={"code": "made_up_error", "retryable": False, "message": "request is invalid"},
+            )
+        ),
+    )
+
+    with pytest.raises(HounddClientError, match="journal error is invalid"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+@pytest.mark.parametrize(
+    "status,outcome,error",
+    (
+        (404, "not_found", None),
+        (503, "unavailable", {"code": "service_unavailable", "retryable": True, "message": "service is unavailable"}),
+        (503, "unavailable", {"code": "response_too_large", "retryable": True, "message": "service response is unavailable"}),
+    ),
+)
+def test_journal_query_non_completed_statuses_report_the_daemon_message(
+    tmp_path: Path,
+    status: int,
+    outcome: str,
+    error: dict[str, Any] | None,
+) -> None:
+    socket_path = tmp_path / "houndd.sock"
+    stub = StubHoundd(
+        socket_path,
+        lambda frame: _framed(
+            _journal_response(request_id=frame["body"]["request_id"], status=status, ok=False, outcome=outcome, error=error)
+        ),
+    )
+
+    with pytest.raises(HounddClientError, match="journal.query failed"):
+        _journal_query(_client(socket_path))
+    stub.join()
+
+
+def test_journal_query_rejects_an_out_of_range_limit(tmp_path: Path) -> None:
+    with pytest.raises(HounddClientError, match="journal limit is invalid"):
+        _client(tmp_path / "houndd.sock").journal_query(limit=0, run_id="run-1", request_id="journal-req-1")
+
+
+def test_journal_query_rejects_a_non_dict_filter(tmp_path: Path) -> None:
+    with pytest.raises(HounddClientError, match="journal filter is invalid"):
+        _client(tmp_path / "houndd.sock").journal_query(
+            query_filter=["not", "a", "dict"],  # type: ignore[arg-type]
+            run_id="run-1",
+            request_id="journal-req-1",
+        )
 
 
 # --- readiness --------------------------------------------------------------

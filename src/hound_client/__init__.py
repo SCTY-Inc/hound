@@ -11,6 +11,8 @@ from .client import (
     WIRE_VERSION,
     HounddClient,
     HounddClientError,
+    HounddJournalCursorRejectedError,
+    HounddJournalFilterUnavailableError,
     canonical_bytes,
     default_socket_path,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "COMMIT_TIMEOUT_SECONDS",
     "HounddClient",
     "HounddClientError",
+    "HounddJournalCursorRejectedError",
+    "HounddJournalFilterUnavailableError",
     "MAX_FRAME_BYTES",
     "READ_REQUEST_SCHEMA",
     "READ_TIMEOUT_SECONDS",
