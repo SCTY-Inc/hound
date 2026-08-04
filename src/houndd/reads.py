@@ -1,4 +1,4 @@
-"""Slice 3D: authorized single-entry and single-record pure reads."""
+"""Slice 3D: authorized single-entry, single-record, and maintenance reads."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ _LEGACY_OBJECT_PREFIX = "legacy:"
 _ENTRY_FIELDS = frozenset({"entry_id"})
 _RECORD_REQUIRED = frozenset({"record_id"})
 _RECORD_FIELDS = frozenset({"record_id", "include_content"})
+# Only these outcomes commit a dereferenceable staged object.  Every other
+# outcome carries a dedupe commitment to bytes that were never stored, so its
+# ``content_sha256`` must never be dereferenced.
+_STAGED_OUTCOMES = frozenset({"completed", "partial"})
 
 
 def _identifier(value: Any, label: str) -> str:
@@ -53,6 +57,13 @@ class RecordBinding:
     record_id: str
     schema: str
     staged_sha256: str | None
+
+
+def parse_maintenance_request(payload: Any) -> None:
+    """A verify or rebuild-index payload is exactly the empty object."""
+
+    if type(payload) is not dict or payload:
+        raise ReadContractError("maintenance read payload has missing or unknown fields")
 
 
 def parse_entry_request(payload: Any) -> EntryRequest:
@@ -89,6 +100,23 @@ def select_entry(
     return None
 
 
+def _staged_blob(event: Mapping[str, Any]) -> str | None:
+    """Name the blob this event actually staged, or nothing.
+
+    A dedupe commitment is not evidence that an object exists.  An interrupted
+    ``ingest.file`` commits its source digest without ever staging those bytes,
+    so the outcome alone decides whether the digest is dereferenceable.  A
+    completed import is excluded here too: its bytes are the separately
+    readable legacy object, not a staged blob.
+    """
+
+    if event["classification"]["outcome"] not in _STAGED_OUTCOMES:
+        return None
+    if event["dedupe"]["object_key"].startswith(_LEGACY_OBJECT_PREFIX):
+        return None
+    return event["dedupe"]["content_sha256"]
+
+
 def select_record(
     events: tuple[Mapping[str, Any], ...],
     scope: PrincipalScope,
@@ -108,8 +136,7 @@ def select_record(
             continue
         object_key = event["dedupe"]["object_key"]
         if event["artifact"]["record_id"] == record_id:
-            staged = None if object_key.startswith(_LEGACY_OBJECT_PREFIX) else event["dedupe"]["content_sha256"]
-            return RecordBinding(record_id, event["artifact"]["schema"], staged)
+            return RecordBinding(record_id, event["artifact"]["schema"], _staged_blob(event))
         if object_key == legacy_object_key:
             return RecordBinding(record_id, LEGACY_OBJECT_SCHEMA, None)
     return None
@@ -146,6 +173,7 @@ __all__ = [
     "RecordBinding",
     "RecordRequest",
     "parse_entry_request",
+    "parse_maintenance_request",
     "parse_record_request",
     "read_record",
     "select_entry",

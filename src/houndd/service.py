@@ -24,7 +24,7 @@ from .phi import PhiInputError, PhiManifestError, PhiScanner, phi_manifest_path
 from .contracts import canonical_bytes
 from .query_contracts import QueryContractError, parse_query_request
 from .query_engine import QuerySnapshotError
-from .reads import ReadContractError, parse_entry_request, parse_record_request, read_record, select_entry, select_record, verified_events
+from .reads import ReadContractError, parse_entry_request, parse_maintenance_request, parse_record_request, read_record, select_entry, select_record, verified_events
 from .snapshot import DurableJournalQueryAdapter, DurableQueryError, QueryFilterNotAvailable
 from .intake_projection import IntakeProjectionError, project_intake_ledger_page
 from .service_identity import ServiceIdentity, ServiceIdentityError
@@ -42,11 +42,13 @@ CONNECTION_TIMEOUT_SECONDS = 0.2
 ACCEPT_TIMEOUT_SECONDS = 0.2
 REQUEST_SCHEMA = "houndd.read-request.v1"
 RESPONSE_SCHEMA = "houndd.read-response.v1"
+VERIFY_REPORT_SCHEMA = "houndd.verify-report.v1"
+REBUILD_REPORT_SCHEMA = "houndd.rebuild-index-report.v1"
 _REQUEST_FIELDS = frozenset({"schema_version", "request_id", "producer", "requested_access", "policy_id", "operation"})
 _RESPONSE_REQUIRED = frozenset({"schema_version", "request_id", "ok", "outcome", "record_ids", "entry_ids", "usage"})
 _RESPONSE_OPTIONAL = frozenset({"result", "cursor", "projection", "error"})
 _FRAME_FIELDS = frozenset({"wire_version", "method", "path", "body"})
-_READ_OPERATIONS = frozenset({"service.health", "service.ready", "journal.query", "journal.get", "record.get"})
+_READ_OPERATIONS = frozenset({"service.health", "service.ready", "journal.query", "journal.get", "record.get", "journal.verify", "journal.rebuild-index"})
 _ACCESS_CEILINGS = {
     "public": frozenset({"public"}),
     "workspace": frozenset({"public", "workspace"}),
@@ -752,6 +754,63 @@ class HounddService:
         except (ReadContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
 
+    def _dispatch_verify(self, principal: AuthenticatedPrincipal, request: ReadRequest) -> dict[str, Any]:
+        """Report whether canonical truth verifies, and nothing else.
+
+        The verdict covers records, blobs, journal, transactions, and
+        idempotency, and deliberately excludes the disposable projection: an
+        index is never canonical truth, and a stale one is repaired by
+        rebuild-index rather than reported as damaged evidence.
+
+        A store that fails verification is a truthful completed answer, not an
+        unavailable service.  The report never carries ``verify_store``'s
+        failure strings: they name records, blobs, transactions, and file
+        paths across every policy partition.
+        """
+
+        try:
+            assert self.policy is not None and self.store is not None
+            _assert_frozen(self.policy, self.state_root)
+            if self._scope(principal, request) is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            parse_maintenance_request(request.payload)
+            report = {"schema_version": VERIFY_REPORT_SCHEMA, "valid": verify_store(self.state_root, projection=False)["valid"] is True}
+            return _response(request.request_id, 200, outcome="completed", result=[report], entry_ids=[], record_ids=[])
+        except ResponseTooLarge:
+            return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
+        except (PolicyError, QuerySnapshotError, StoreError, JournalError, OSError):
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        except (ReadContractError, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+
+    def _dispatch_rebuild_index(self, principal: AuthenticatedPrincipal, request: ReadRequest) -> dict[str, Any]:
+        """Rebuild the disposable projection from canonical truth alone.
+
+        A projection is never canonical truth, so this appends no journal
+        entry, stores no object, and needs no idempotency key.  The reported
+        validity is the same rebuild-then-verify pair startup performs, and it
+        includes the projection this route just rebuilt, so an index still
+        disagreeing with the journal is reported rather than claimed rebuilt.
+        """
+
+        try:
+            assert self.policy is not None and self.store is not None
+            if self._owner_pid != os.getpid():
+                return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+            _assert_frozen(self.policy, self.state_root)
+            if self._scope(principal, request) is None:
+                return _response(request.request_id, 404, outcome="not_found")
+            parse_maintenance_request(request.payload)
+            self.store.rebuild_index()
+            report = {"schema_version": REBUILD_REPORT_SCHEMA, "valid": verify_store(self.state_root)["valid"] is True}
+            return _response(request.request_id, 200, outcome="completed", result=[report], entry_ids=[], record_ids=[])
+        except ResponseTooLarge:
+            return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
+        except (PolicyError, QuerySnapshotError, StoreError, JournalError, OSError):
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
+        except (ReadContractError, ValueError):
+            return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
+
     def _dispatch(self, principal: AuthenticatedPrincipal, frame: dict[str, Any]) -> dict[str, Any]:
         if frame["method"] == "POST":
             return self._dispatch_commit(principal, frame)
@@ -759,7 +818,7 @@ class HounddService:
             raise RequestError("method is invalid")
         request = parse_read_request(frame["body"])
         path = frame["path"]
-        if path not in {"/v1/journal", "/v1/journal/entry", "/v1/record", "/v1/health", "/v1/ready"}:
+        if path not in {"/v1/journal", "/v1/journal/entry", "/v1/journal/verify", "/v1/journal/rebuild-index", "/v1/record", "/v1/health", "/v1/ready"}:
             raise RequestError("path is invalid")
         if path == "/v1/health":
             if request.operation != "service.health" or request.claim.capability != "service.health":
@@ -778,6 +837,14 @@ class HounddService:
             if request.operation != "journal.get" or request.claim.capability != "journal.get":
                 raise RequestError("journal entry route operation binding is invalid")
             return self._dispatch_entry(principal, request)
+        if path == "/v1/journal/verify":
+            if request.operation != "journal.verify" or request.claim.capability != "journal.verify":
+                raise RequestError("journal verify route operation binding is invalid")
+            return self._dispatch_verify(principal, request)
+        if path == "/v1/journal/rebuild-index":
+            if request.operation != "journal.rebuild-index" or request.claim.capability != "journal.rebuild-index":
+                raise RequestError("journal rebuild-index route operation binding is invalid")
+            return self._dispatch_rebuild_index(principal, request)
         if path == "/v1/record":
             if request.operation != "record.get" or request.claim.capability != "record.get":
                 raise RequestError("record route operation binding is invalid")
@@ -796,10 +863,13 @@ class HounddService:
             adapter = DurableJournalQueryAdapter(self.store.journal, self.identity)
         except QueryFilterNotAvailable:
             return _response(request.request_id, 400, outcome="invalid", error=("filter_not_available", False, "filter is not available"))
+        except (PolicyError, ServiceIdentityError, DurableQueryError, QuerySnapshotError, StoreError, JournalError, OSError):
+            # Integrity conditions are listed before the request-shape clause
+            # because a verified-snapshot failure is also a ``ValueError``: a
+            # corrupt journal must be unavailable, never a caller's bad request.
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
         except (QueryContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
-        except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
-            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
         prepared: EncodedResponse | None = None
 
         def fits(page: Any) -> bool:
@@ -839,10 +909,11 @@ class HounddService:
                 page = None if ledger is None else ledger[0]
         except QueryFilterNotAvailable:
             return _response(request.request_id, 400, outcome="invalid", error=("filter_not_available", False, "filter is not available"))
+        except (PolicyError, ServiceIdentityError, DurableQueryError, QuerySnapshotError, StoreError, JournalError, OSError):
+            # See above: snapshot, journal, and store integrity outrank shape.
+            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
         except (QueryContractError, ValueError):
             return _response(request.request_id, 400, outcome="invalid", error=("invalid_request", False, "request is invalid"))
-        except (PolicyError, ServiceIdentityError, DurableQueryError, OSError):
-            return _response(request.request_id, 503, outcome="unavailable", error=("service_unavailable", True, "service is unavailable"))
         if page is not None and prepared is not None:
             return prepared
         return _response(request.request_id, 503, outcome="unavailable", error=("response_too_large", True, "service response is unavailable"))
@@ -956,4 +1027,4 @@ class HounddService:
             store.close()
 
 
-__all__ = ["FrameError", "HounddService", "MAX_FRAME_BYTES", "PolicyError", "REQUEST_SCHEMA", "RESPONSE_SCHEMA", "ResponseTooLarge", "ServiceError", "WIRE_VERSION", "load_frozen_policy", "read_frame"]
+__all__ = ["FrameError", "HounddService", "MAX_FRAME_BYTES", "PolicyError", "REBUILD_REPORT_SCHEMA", "REQUEST_SCHEMA", "RESPONSE_SCHEMA", "ResponseTooLarge", "ServiceError", "VERIFY_REPORT_SCHEMA", "WIRE_VERSION", "load_frozen_policy", "read_frame"]

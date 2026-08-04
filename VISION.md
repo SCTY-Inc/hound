@@ -922,9 +922,16 @@ encoded response would exceed the fixed wire bound, `record.get` fails logical
 truncated, or re-encoded content. Policy, integrity, verification, and store
 failures remain logical `503`.
 
-Explicitly deferred from Slice 3D: the verify/rebuild API, streaming or ranged
-content, and every event-by-record or record-by-event lookup family. Evidence
-names Slice 3D only and adds no HSP row or completion claim.
+Explicitly deferred from Slice 3D: streaming or ranged content, and every
+event-by-record or record-by-event lookup family. Evidence names Slice 3D only
+and adds no HSP row or completion claim. The verify/rebuild API landed later
+under GOALIE B6 as `journal.verify` and `journal.rebuild-index` on the read
+boundary: empty payloads, verdict-only reports (`{schema_version, valid}` —
+never `verify_store`'s failure strings, which name records and paths across
+every policy partition), authorization by maintenance-capability grant, and a
+false verdict as a truthful `200`/exit-1 answer. `journal.verify` excludes the
+disposable projection; `journal.rebuild-index` rebuilds it and verifies
+including it.
 
 ## Immutable records and journal
 

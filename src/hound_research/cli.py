@@ -17,10 +17,10 @@ from hound_cli.runtime import RuntimeErrorHound
 from houndd.commit import CommitContractError, MAX_WIRE_BODY_BYTES, parse_commit_request, resolve_route
 from houndd.contracts import canonical_bytes
 from houndd.query_contracts import parse_query_request
-from houndd.service import WIRE_VERSION
+from houndd.service import REBUILD_REPORT_SCHEMA, VERIFY_REPORT_SCHEMA, WIRE_VERSION
 from .commit_client import CommitClientError, exchange as commit_exchange, exit_code as commit_exit_code
 from .evidence import EvidenceError, validate_public_url
-from .journal_client import JournalClientError, exchange, record_exchange
+from .journal_client import JournalClientError, exchange, record_exchange, report_exchange
 
 
 def verify_web_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -126,6 +126,16 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--entry-id", required=True)
     get.add_argument("--request-id", default="hound-research-journal-get")
     get.set_defaults(handler=_handle_journal_get)
+
+    for verb, default_request_id in (("verify", "hound-research-journal-verify"), ("rebuild-index", "hound-research-journal-rebuild-index")):
+        report = journal_sub.add_parser(verb, help=f"Run journal {verb} through houndd")
+        report.add_argument("--socket", required=True)
+        report.add_argument("--owner-id", required=True)
+        report.add_argument("--run-id", required=True)
+        report.add_argument("--policy-id", required=True)
+        report.add_argument("--requested-access", choices=("public", "workspace", "restricted"), default="restricted")
+        report.add_argument("--request-id", default=default_request_id)
+        report.set_defaults(handler=_handle_journal_report, journal_verb=verb)
 
     record = top.add_parser("record", help="Fetch one committed record through houndd")
     record_sub = record.add_subparsers(dest="record_command", required=True)
@@ -310,6 +320,40 @@ def _handle_journal_get(args: argparse.Namespace) -> dict[str, Any]:
     if type(result) is not list or len(result) != 1:
         raise HoundError("houndd response violates the read contract", exit_code=5)
     return result[0]
+
+
+_JOURNAL_REPORTS = {
+    "verify": ("/v1/journal/verify", "journal.verify", VERIFY_REPORT_SCHEMA),
+    "rebuild-index": ("/v1/journal/rebuild-index", "journal.rebuild-index", REBUILD_REPORT_SCHEMA),
+}
+
+
+def _handle_journal_report(args: argparse.Namespace) -> dict[str, Any]:
+    path, operation, schema = _JOURNAL_REPORTS[args.journal_verb]
+    socket_path = _envelope_socket(args)
+    request = {
+        "wire_version": WIRE_VERSION,
+        "method": "GET",
+        "path": path,
+        "body": {
+            "schema_version": "houndd.read-request.v1",
+            "request_id": args.request_id,
+            "producer": {"owner_id": args.owner_id, "capability": operation, "run_id": args.run_id},
+            "requested_access": args.requested_access,
+            "policy_id": args.policy_id,
+            "operation": {"name": operation, "payload": {}},
+        },
+    }
+    try:
+        response = report_exchange(socket_path, request, schema=schema)
+    except JournalClientError as error:
+        raise HoundError(str(error), exit_code=5) from error
+    status = response["status"]
+    if status != 200:
+        raise HoundError(json.dumps(response["body"], sort_keys=True, separators=(",", ":")), exit_code={400: 2, 404: 3, 503: 5}[status])
+    # A report whose ``valid`` is false is a completed answer; ``_exit_for_result``
+    # turns it into exit 1 rather than a transport or request fault.
+    return response["body"]["result"][0]
 
 
 def _write_record_bytes(path: Path, data: bytes) -> None:
