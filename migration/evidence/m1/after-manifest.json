@@ -1,0 +1,26 @@
+{
+ "entries_by_capability": {
+  "import.record": 827,
+  "ingest.search": 25,
+  "ingest.url": 7
+ },
+ "entries_by_owner": {
+  "ali": 829,
+  "gc-benefits": 22,
+  "gc-web": 8
+ },
+ "failed": 0,
+ "imported": 824,
+ "journal_entries_total": 859,
+ "run_id": "m1-backfill-2026-08-04",
+ "schema_version": "hound.m1.manifest.v1",
+ "verification": {
+  "byte_fidelity_spot_checks": {
+   "identical": 5,
+   "sampled": 5
+  },
+  "phi_clear_manifest_entries": 827,
+  "verify_store_failures": 0,
+  "verify_store_valid": true
+ }
+}
