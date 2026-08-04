@@ -44,27 +44,23 @@
       "contract_ref": "repos/givecare/gc-web/research/hound-driver.json",
       "scan_roots": [
         "repos/givecare/gc-web/scripts/pulse-lane.sh",
-        "repos/givecare/gc-web/research/hound-driver.json",
-        "repos/givecare/gc-web/research/article-extract-adapter.py"
+        "repos/givecare/gc-web/scripts/pulse-acquire.py",
+        "repos/givecare/gc-web/research/hound-driver.json"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-web/scripts/pulse-lane.sh",
-        "repos/givecare/gc-web/research/hound-driver.json",
-        "repos/givecare/gc-web/research/article-extract-adapter.py"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
       ],
       "blocked_reason": null,
       "wave": 2,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "stage": "shadow",
+      "status": "shadow",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
-        "baseline_scan": null,
+        "baseline_scan": "repos/hound/migration/evidence/lanes/pulse/import-mirror.md",
         "stage_ledger": null,
-        "parity": null,
+        "parity": "repos/hound/migration/evidence/lanes/pulse/parity.md",
         "static_no_direct_provider": null,
         "credential_unset": null,
         "unix_socket": null,
@@ -86,32 +82,28 @@
         "repos/givecare/gc-benefits/scripts/daily_hound_radar.py",
         "repos/givecare/gc-benefits/hound-driver.json"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-benefits/AUTOMATION.md",
-        "repos/givecare/gc-benefits/scripts/daily_hound_radar.py",
-        "repos/givecare/gc-benefits/hound-driver.json"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
       ],
       "blocked_reason": null,
       "wave": 2,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "stage": "migrated",
+      "status": "migrated",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
-        "baseline_scan": null,
-        "stage_ledger": null,
-        "parity": null,
-        "static_no_direct_provider": null,
-        "credential_unset": null,
-        "unix_socket": null,
-        "recovery_drill": null,
-        "full_cycle": null,
+        "baseline_scan": "repos/hound/migration/evidence/lanes/benefits-radar/import-mirror.md",
+        "stage_ledger": "repos/hound/migration/stage-ledger.v1.json",
+        "parity": "repos/hound/migration/evidence/lanes/benefits-radar/parity.md",
+        "static_no_direct_provider": "repos/hound/migration/evidence/lanes/benefits-radar/static-no-direct-provider.md",
+        "credential_unset": "repos/hound/migration/evidence/lanes/benefits-radar/credential-unset.md",
+        "unix_socket": "repos/hound/migration/evidence/lanes/benefits-radar/unix-socket.md",
+        "recovery_drill": "repos/hound/migration/evidence/lanes/benefits-radar/recovery-drill.md",
+        "full_cycle": "repos/hound/migration/evidence/lanes/benefits-radar/full-cycle.md",
         "legacy_absent": null
       },
-      "approval_ref": null
+      "approval_ref": "125e6f9bdf46cb29dbd5a07a579012cf3ad0c31c609641c6a7c15c594d1d5142"
     },
     {
       "id": "wiki-refresh",
@@ -124,18 +116,15 @@
         "repos/givecare/gc-wiki/AUTOMATION.md",
         "repos/givecare/gc-wiki/research/hound-driver.json"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-wiki/AUTOMATION.md",
-        "repos/givecare/gc-wiki/research/hound-driver.json"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
       ],
       "blocked_reason": null,
       "wave": 3,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "stage": "import_mirror",
+      "status": "baseline",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
         "baseline_scan": null,
@@ -161,18 +150,15 @@
         "repos/givecare/gc-intel/AUTOMATION.md",
         "repos/givecare/gc-intel/hound-driver.json"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-intel/AUTOMATION.md",
-        "repos/givecare/gc-intel/hound-driver.json"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
       ],
       "blocked_reason": null,
       "wave": 3,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "stage": "import_mirror",
+      "status": "baseline",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
         "baseline_scan": null,
@@ -198,18 +184,15 @@
         "repos/givecare/gc-web/research/policy/civic.ts",
         "repos/givecare/gc-web/AUTOMATION.md"
       ],
-      "legacy_paths": [
-        "repos/givecare/gc-web/research/policy/civic.ts",
-        "repos/givecare/gc-web/AUTOMATION.md"
-      ],
+      "legacy_paths": [],
       "target_ops": [
         "ingest.search",
         "ingest.url"
       ],
       "blocked_reason": null,
       "wave": 3,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
+      "stage": "import_mirror",
+      "status": "baseline",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
         "baseline_scan": null,

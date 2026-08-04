@@ -1,4 +1,173 @@
 {
  "schema_version": "hound.migration.stage-ledger.v1",
- "entries": []
+ "entries": [
+  {
+   "lane": "benefits-radar",
+   "from_stage": "freeze_contracts",
+   "to_stage": "import_mirror",
+   "timestamp": "2026-08-04T16:12:00Z",
+   "evidence": {
+    "baseline_scan": "repos/hound/migration/evidence/lanes/benefits-radar/import-mirror.md",
+    "stage_ledger": null,
+    "parity": null,
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 0,
+   "previous_entry_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+   "entry_hash": "aa294680e2e69e46d86afb8c0748d47d10eb1d4c2f5f67d185f6c83155a2d7d3"
+  },
+  {
+   "lane": "pulse",
+   "from_stage": "freeze_contracts",
+   "to_stage": "import_mirror",
+   "timestamp": "2026-08-04T16:12:10Z",
+   "evidence": {
+    "baseline_scan": "repos/hound/migration/evidence/lanes/pulse/import-mirror.md",
+    "stage_ledger": null,
+    "parity": null,
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 1,
+   "previous_entry_hash": "aa294680e2e69e46d86afb8c0748d47d10eb1d4c2f5f67d185f6c83155a2d7d3",
+   "entry_hash": "70c46b5e2bf5d3578df567b150e20c0f0fbb255b1b21f9dd84594f9f1cbbb4f5"
+  },
+  {
+   "lane": "wiki-refresh",
+   "from_stage": "freeze_contracts",
+   "to_stage": "import_mirror",
+   "timestamp": "2026-08-04T16:12:20Z",
+   "evidence": {
+    "baseline_scan": "repos/hound/migration/evidence/m1/before-manifest.json",
+    "stage_ledger": null,
+    "parity": null,
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 2,
+   "previous_entry_hash": "70c46b5e2bf5d3578df567b150e20c0f0fbb255b1b21f9dd84594f9f1cbbb4f5",
+   "entry_hash": "3f2d95cdbde706c4c94eb481ca6a455fab3f6405e7d9c99d9bb80f056bdb49b6"
+  },
+  {
+   "lane": "intel-refresh",
+   "from_stage": "freeze_contracts",
+   "to_stage": "import_mirror",
+   "timestamp": "2026-08-04T16:12:30Z",
+   "evidence": {
+    "baseline_scan": null,
+    "stage_ledger": null,
+    "parity": null,
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 3,
+   "previous_entry_hash": "3f2d95cdbde706c4c94eb481ca6a455fab3f6405e7d9c99d9bb80f056bdb49b6",
+   "entry_hash": "39b393cc7679766d7370a9fefb7257010d9f7e1839be9ad5ebe8dbdb804d5395"
+  },
+  {
+   "lane": "civic-policy-radar",
+   "from_stage": "freeze_contracts",
+   "to_stage": "import_mirror",
+   "timestamp": "2026-08-04T16:12:40Z",
+   "evidence": {
+    "baseline_scan": null,
+    "stage_ledger": null,
+    "parity": null,
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 4,
+   "previous_entry_hash": "39b393cc7679766d7370a9fefb7257010d9f7e1839be9ad5ebe8dbdb804d5395",
+   "entry_hash": "fd655e2f1972abf84e641c9e33586394d69fcf0a6b54629c1d0a60da24ab3bea"
+  },
+  {
+   "lane": "benefits-radar",
+   "from_stage": "import_mirror",
+   "to_stage": "shadow",
+   "timestamp": "2026-08-04T16:13:00Z",
+   "evidence": {
+    "baseline_scan": null,
+    "stage_ledger": null,
+    "parity": "repos/hound/migration/evidence/lanes/benefits-radar/parity.md",
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 5,
+   "previous_entry_hash": "fd655e2f1972abf84e641c9e33586394d69fcf0a6b54629c1d0a60da24ab3bea",
+   "entry_hash": "c1de8c17a9a08f0971c6e96b63f3a177ebc518bff92e55eaeafcdbdc66a934bd"
+  },
+  {
+   "lane": "pulse",
+   "from_stage": "import_mirror",
+   "to_stage": "shadow",
+   "timestamp": "2026-08-04T16:13:10Z",
+   "evidence": {
+    "baseline_scan": null,
+    "stage_ledger": null,
+    "parity": "repos/hound/migration/evidence/lanes/pulse/parity.md",
+    "static_no_direct_provider": null,
+    "credential_unset": null,
+    "unix_socket": null,
+    "recovery_drill": null,
+    "full_cycle": null,
+    "legacy_absent": null
+   },
+   "approval_ref": null,
+   "sequence": 6,
+   "previous_entry_hash": "c1de8c17a9a08f0971c6e96b63f3a177ebc518bff92e55eaeafcdbdc66a934bd",
+   "entry_hash": "571e43888ff0eeb20c86eb54fe65cc663165597d24ed5fad5914f5b8fd102439"
+  },
+  {
+   "lane": "benefits-radar",
+   "from_stage": "shadow",
+   "to_stage": "migrated",
+   "timestamp": "2026-08-04T16:14:00Z",
+   "evidence": {
+    "baseline_scan": null,
+    "stage_ledger": null,
+    "parity": "repos/hound/migration/evidence/lanes/benefits-radar/parity.md",
+    "static_no_direct_provider": "repos/hound/migration/evidence/lanes/benefits-radar/static-no-direct-provider.md",
+    "credential_unset": "repos/hound/migration/evidence/lanes/benefits-radar/credential-unset.md",
+    "unix_socket": "repos/hound/migration/evidence/lanes/benefits-radar/unix-socket.md",
+    "recovery_drill": "repos/hound/migration/evidence/lanes/benefits-radar/recovery-drill.md",
+    "full_cycle": "repos/hound/migration/evidence/lanes/benefits-radar/full-cycle.md",
+    "legacy_absent": null
+   },
+   "approval_ref": "125e6f9bdf46cb29dbd5a07a579012cf3ad0c31c609641c6a7c15c594d1d5142",
+   "sequence": 7,
+   "previous_entry_hash": "571e43888ff0eeb20c86eb54fe65cc663165597d24ed5fad5914f5b8fd102439",
+   "entry_hash": "a3c2dc9b86f801034f400751902d46606088bb05daa52f87033f2665d4f095d9"
+  }
+ ]
 }

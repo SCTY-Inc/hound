@@ -85,7 +85,7 @@ MATCH_FIELDS = frozenset({"kind", "value"})
 MATCH_KINDS = frozenset({"literal", "token"})
 MAX_SCAN_BYTES = 1_048_576
 MAX_LINE_BYTES = 16_384
-CANONICAL_ROW_DIGEST = "550b6dc5aa4f96eb8fb0d6e9f8ae1062feb98403c14d26f351a329a437cc7d1e"
+CANONICAL_ROW_DIGEST = "cdf8603d051e088af3d2fbd5608ef2527c246ee7ea84992e7ce0dc93b97c9c92"
 CANONICAL_CATALOG_DIGEST = "c319e49bae8dc4450a904e44fe08b397a93be1778cd0fbde6ef85b66323b6ca4"
 MAX_CATALOG_BYTES = 65_536
 MAX_INVENTORY_BYTES = 1_048_576
@@ -341,14 +341,28 @@ def validate_inventory(inventory: object, *, require_paths: bool = False, worksp
             errors.append(f"{label}.stage is not allowed")
         if type(item["status"]) is str and item["status"] not in STATUSES:
             errors.append(f"{label}.status is not allowed")
-        if type(item["stage"]) is not str or item["stage"] != "freeze_contracts":
-            errors.append(f"{label}.stage must remain freeze_contracts in the baseline manifest")
-        if type(item.get("evidence")) is dict:
-            if any(pointer is not None for pointer in item["evidence"].values()):
-                errors.append(f"{label}.evidence must remain entirely null in the baseline manifest")
-        if item["approval_ref"] is not None:
-            errors.append(f"{label}.approval_ref must remain null")
-        _exact(item["approval_ref"], type(None), f"{label}.approval_ref", errors)
+        # Stages advance with the stage ledger (2026-08-04 replan): a row's
+        # status must belong to its stage, evidence may only be named at or
+        # past the stage that requires it, and approval_ref exists only from
+        # migrated onward (HSP-22 — the ledger walk verifies the binding).
+        stage = item["stage"] if type(item["stage"]) is str else None
+        stage_statuses = {
+            "freeze_contracts": {"legacy_path_active", "blocked_contract", "baseline"},
+            "import_mirror": {"baseline"},
+            "shadow": {"shadow"},
+            "migrated": {"migrated"},
+            "retired": {"retired"},
+        }
+        if stage in stage_statuses and type(item["status"]) is str and item["status"] not in stage_statuses[stage]:
+            errors.append(f"{label}.status does not belong to its stage")
+        if stage == "freeze_contracts":
+            if type(item.get("evidence")) is dict and any(pointer is not None for pointer in item["evidence"].values()):
+                errors.append(f"{label}.evidence must be null before import_mirror")
+        if stage in {"freeze_contracts", "import_mirror", "shadow", None}:
+            if item["approval_ref"] is not None:
+                errors.append(f"{label}.approval_ref exists only from migrated onward")
+        elif item["approval_ref"] is not None and not _exact(item["approval_ref"], str, f"{label}.approval_ref", errors):
+            pass
         _exact(item["blocked_reason"], (str if item["blocked_reason"] is not None else type(None)), f"{label}.blocked_reason", errors)
         if type(item["wave"]) is not int or item["wave"] < 2:
             errors.append(f"{label}.wave must be an integer migration wave")

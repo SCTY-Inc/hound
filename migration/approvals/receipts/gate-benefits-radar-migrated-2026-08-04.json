@@ -1,0 +1,32 @@
+{
+ "gate_id": "gate-benefits-radar-migrated-2026-08-04",
+ "lane": "benefits-radar",
+ "queue_ref": "https://review.givecareapp.com/",
+ "requested_at": "2026-08-04T16:10:00Z",
+ "schema_version": "hound.approval.gate-receipt.v1",
+ "subject": {
+  "artifacts": [
+   {
+    "hash": "d6d633fd285d3a4f63df7a5b695dbef093d17a605b009fba1d9ec732e8a59ddf",
+    "path": "repos/hound/migration/evidence/lanes/benefits-radar/static-no-direct-provider.md"
+   },
+   {
+    "hash": "d2ab14e04eb977286490bcdabee3ddab16f1acef8e1d5a75e051723b8c7b4fbd",
+    "path": "repos/hound/migration/evidence/lanes/benefits-radar/credential-unset.md"
+   },
+   {
+    "hash": "ddd28814d43e0a4d9811eebbd183601aaa589deecca6748bb91ad0d0e087dd9e",
+    "path": "repos/hound/migration/evidence/lanes/benefits-radar/unix-socket.md"
+   },
+   {
+    "hash": "81dd1fc2e81d6feaa08680a9a22737cde9241735d0aec4596ccd673c919b27fb",
+    "path": "repos/hound/migration/evidence/lanes/benefits-radar/recovery-drill.md"
+   },
+   {
+    "hash": "5a1d41c9e8c634c8548a8030416e58941ba64b735f3111693f26752acef5e0cb",
+    "path": "repos/hound/migration/evidence/lanes/benefits-radar/full-cycle.md"
+   }
+  ],
+  "plan_id": "cutover-benefits-radar-2026-08"
+ }
+}

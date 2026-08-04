@@ -57,6 +57,11 @@ def _workspace_for_manifest(tmp_path: Path, manifest: dict[str, object]) -> Path
             candidate = workspace / row["contract_ref"]
             candidate.parent.mkdir(parents=True, exist_ok=True)
             candidate.write_text("# fixture\n")
+        for pointer in row["evidence"].values():
+            if type(pointer) is str:
+                candidate = workspace / pointer
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text("# fixture\n")
     return workspace
 
 
@@ -99,7 +104,7 @@ def test_deep_json_cli_fails_in_the_canonical_error_domain(
     [
         (lambda m: m["consumers"].pop(), "exactly"),
         (lambda m: m["consumers"].append(m["consumers"][0].copy()), "duplicate consumer id"),
-        (lambda m: m["consumers"][0]["legacy_paths"].append(m["consumers"][0]["legacy_paths"][0]), "duplicate"),
+        (lambda m: m["consumers"][0]["legacy_paths"].extend(["repos/dup.py", "repos/dup.py"]), "duplicate"),
         (lambda m: m["consumers"][0]["scan_roots"].append(m["consumers"][0]["scan_roots"][0]), "duplicate"),
         (lambda m: m["consumers"][0]["scan_roots"].append("**"), "broad"),
         (lambda m: m["consumers"][0].update({"unexpected": True}), "field closure"),
@@ -164,12 +169,6 @@ def test_baseline_evidence_may_be_null_but_nonnull_pointers_are_bounded() -> Non
     errors = validate_inventory(manifest)
     assert not any("baseline_scan" in error for error in errors)
     assert any("stage_ledger" in error for error in errors)
-
-
-def test_freeze_baseline_has_no_future_evidence_pointers() -> None:
-    for row in _manifest()["consumers"]:
-        assert row["evidence"]["baseline_scan"] is None
-        assert row["evidence"]["stage_ledger"] is None
 
 
 @pytest.mark.parametrize("value", ["OnCalendar=Mon *-*-* 00:00", "0 0 * * 1", "FIRECRAWL_API_KEY=not-a-real-key", "sk-abcdefghijklm"])
@@ -454,8 +453,8 @@ def test_raw_provider_endpoint_fails_closed_unless_exact_indicator_is_cataloged(
 
 def test_acceptance_manifest_does_not_claim_hsp15_and_vision_commands_are_runnable() -> None:
     acceptance = json.loads((ROOT / "migration" / "acceptance.v1.json").read_text())
-    assert "HSP-15" not in acceptance["claims"]
-    assert "HSP-15" in acceptance["no_new_claim_hsps"]
+    hsp15 = next(row for row in acceptance["rows"] if row["id"] == "HSP-15")
+    assert hsp15["status"] != "complete" and hsp15["missing"]
     vision = (ROOT / "VISION.md").read_text()
     assert "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy" in vision
     assert "`python migration/check_consumer_inventory.py`" not in vision
@@ -517,12 +516,6 @@ def test_artifact_pairing_uses_bounded_same_provider_window(tmp_path: Path) -> N
     for row in manifest["consumers"][1:]: row["scan_roots"] = []; row["legacy_paths"] = []
     result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
     assert [f["line"] for f in result.findings if f["category"] == "evidence_artifact"] == [2]
-
-
-def test_checked_in_rows_are_fully_frozen() -> None:
-    for row in _manifest()["consumers"]:
-        assert row["stage"] == "freeze_contracts" and row["approval_ref"] is None
-        assert all(value is None for value in row["evidence"].values())
 
 
 @pytest.mark.parametrize("name, payload, needle", [
@@ -806,8 +799,8 @@ def test_every_authoritative_row_field_has_exact_canonical_closure(field: str) -
         "target_ops": ["ingest.url"],
         "blocked_reason": "altered",
         "wave": row["wave"] + 1,
-        "stage": "shadow",
-        "status": "baseline",
+        "stage": "retired",
+        "status": "retired",
         "credential_boundary": "altered-boundary",
         "evidence": {key: None for key in row["evidence"]},
         "approval_ref": None,
@@ -821,13 +814,6 @@ def test_every_authoritative_row_field_has_exact_canonical_closure(field: str) -
     errors = validate_inventory(manifest)
 
     assert "consumer rows must match the exact canonical closure" in errors
-
-
-def test_checked_in_rows_are_all_null_baseline_freeze_contracts() -> None:
-    rows = _manifest()["consumers"]
-    assert len(rows) == 12
-    assert all(row["stage"] == "freeze_contracts" and row["approval_ref"] is None for row in rows)
-    assert all(all(value is None for value in row["evidence"].values()) for row in rows)
 
 
 def test_unknown_raw_provider_transports_and_bare_token_are_classified_exactly(tmp_path: Path) -> None:
@@ -856,12 +842,12 @@ def test_catalog_has_no_tavily_entry() -> None:
     assert all("tavily" not in str(value).lower() for indicator in catalog["indicators"] for value in indicator.values())
 
 
-def test_acceptance_claims_are_limited_to_hsp13_and_hsp18_regression() -> None:
+def test_acceptance_manifest_bounds_the_inventory_and_no_bypass_claims() -> None:
     acceptance = json.loads((ROOT / "migration" / "acceptance.v1.json").read_text())
-    assert acceptance["partial_hsps"] == ["HSP-13"]
-    assert acceptance["regression_only_hsps"] == ["HSP-18"]
-    assert "HSP-15" not in acceptance["claims"]
-    assert acceptance["no_new_claim_hsps"] == ["HSP-15"]
+    status = {row["id"]: row["status"] for row in acceptance["rows"]}
+    assert status["HSP-13"] == "complete"
+    assert status["HSP-18"] == "partial"
+    assert status["HSP-15"] != "complete"
 
 
 def test_vision_retains_future_hsp15_contract_and_eventual_commands() -> None:
@@ -1462,3 +1448,27 @@ def test_catalog_public_validator_rejects_equality_only_string_subclasses(
     errors = validate_catalog(catalog)
 
     assert error in errors
+
+
+def test_checked_in_rows_match_the_stage_ledger() -> None:
+    """The inventory's stages are the stage ledger's replayed truth (E2)."""
+
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from migration.stage_ledger import lane_stage, load_ledger
+
+    ledger = load_ledger(Path(__file__).resolve().parents[1] / "migration" / "stage-ledger.v1.json")
+    rows = _manifest()["consumers"]
+    assert len(rows) == 12
+    for row in rows:
+        expected = lane_stage(ledger, row["id"])
+        assert row["stage"] == expected, f"{row['id']}: inventory {row['stage']} != ledger {expected}"
+        if row["stage"] == "migrated":
+            assert type(row["approval_ref"]) is str and row["approval_ref"]
+            required = ("static_no_direct_provider", "credential_unset", "unix_socket", "recovery_drill", "full_cycle")
+            assert all(type(row["evidence"][key]) is str for key in required)
+        if row["stage"] == "freeze_contracts":
+            assert row["approval_ref"] is None
+            assert all(value is None for value in row["evidence"].values())
+
+
