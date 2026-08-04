@@ -190,7 +190,7 @@
     {
       "id": "civic-policy-radar",
       "kind": "acquisition",
-      "owner": "scty-civic",
+      "owner": "gc-web",
       "cadence_category": "weekly",
       "cadence_authority": "givecare/refresh-policy",
       "contract_ref": "repos/givecare/gc-web/AUTOMATION.md",
@@ -263,7 +263,7 @@
     {
       "id": "manual-web",
       "kind": "acquisition",
-      "owner": "research operator",
+      "owner": "ali",
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
       "contract_ref": "repos/hound/docs/how-to-consume.md",
@@ -296,7 +296,7 @@
     {
       "id": "manual-x",
       "kind": "acquisition",
-      "owner": "research operator",
+      "owner": "ali",
       "cadence_category": "on-demand",
       "cadence_authority": "research operator",
       "contract_ref": "repos/hound/docs/how-to-consume.md",

@@ -1,0 +1,33 @@
+{
+  "schema_version": "hound.migration.policy-overlay.v1",
+  "subject": "linux-uid:1000",
+  "policy_id": "atum-owner",
+  "readable_tiers": [
+    "public"
+  ],
+  "allowed_output_tiers": [
+    "public"
+  ],
+  "operator": {
+    "owner_id": "ali",
+    "own_producer_capabilities": [
+      "ingest.file",
+      "import.record",
+      "ingest.search",
+      "ingest.url"
+    ],
+    "wildcard_producer_capabilities": [
+      "journal.query",
+      "journal.get",
+      "record.get"
+    ]
+  },
+  "review_surfaces": [
+    {
+      "owner_id": "workpad-review",
+      "run_id": "workpad-intake-ledger.v1",
+      "capability": "journal.query",
+      "producer_selector_source": "acquisition_lane_owner_target_ops"
+    }
+  ]
+}
