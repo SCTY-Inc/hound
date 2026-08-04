@@ -1,0 +1,234 @@
+{
+ "schema_version": "hound.e5.matrix-inventory.v1",
+ "hsp": "HSP-12",
+ "hsp_text": "Failure/recovery acceptance covers concurrent same-content captures, crash after fetch/before commit, 429s, timeouts, truncated bytes, transcript failures, outage abstention, cursor replay, ACL non-leakage, backup restore, exact-hash approval binding, 0/1/16 MiB source limits, base64 wire overhead, digest mismatch, held-FD nofollow regular-file TOCTOU checks, the Slice 3C1 local clear-manifest PHI gate and pre-acceptance refusal, unsupported-media/encoding invalidation before scanner evaluation, future-slice bounded non-PHI quarantine, and ambiguous record/event/lineage recovery.",
+ "hsp_assert_text": "Fixture: the complete fault matrix and portable backup. Test/command: `PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider` plus recovery/fault integration suite. Assert: no loss, no unauthorized disclosure, no `SOURCE` path/base64/kind persistence, no downstream duplicate effect, preserved IDs/lineage after restore, supported-but-unattested source is `400`/`source_refused`, scanner/manifest error is `503`, no raw bytes on 3C1 refusal, and approval rejection on any hash drift. Retain: full pytest log, fault matrix, restored-store verification, and approval failure report.",
+ "goalie_row": "E5",
+ "status": "matrix_complete_with_one_known_defect",
+ "notes": "Every HSP-12 demand row below is proved by an existing test, a new test in tests/test_e5_fault_matrix.py, or both. One row (backup restore / crash recovery for the transcribe lane) surfaced a pre-existing production defect in houndd/projection.py that this file does not own and does not fix; it is pinned as a strict xfail (test_e5_backup_restore_drill_including_a_completed_transcription_KNOWN_DEFECT) so the suite stays green while the gap stays impossible to silently regress-hide. See known_defects below.",
+ "demands": [
+  {
+   "demand": "concurrent same-content captures",
+   "covered_by": [
+    "tests/test_hsp07_dedupe.py::test_hsp07_equal_blob_occurrences_are_distinct_events_and_concurrent_keys_are_safe"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "crash after fetch/before commit (interrupted-recovery crash matrix)",
+   "covered_by": [
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_prepared_record_recovers_once_and_collision_never_reads_source",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_open_import_recovery_is_outcome_only_and_replays_without_raw_object",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_open_file_recovery_has_one_interrupted_outcome_and_no_blob",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_recovery_completes_a_source_stage_left_before_outcome_record",
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_crash_at_every_commit_point_recovers_exactly_once",
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_real_process_kill_recovers_one_outcome_without_reinvoking",
+    "tests/test_b4_media_capture.py::test_b4_media_crash_matrix_recovers_at_every_commit_point",
+    "tests/test_b5_transcribe.py::test_b5_crash_matrix_recovers_at_every_commit_point"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "429s",
+   "covered_by": [
+    "tests/test_web_adapters.py::test_exa_deterministic_client_failure_is_not_retried",
+    "tests/test_b5_transcribe.py::test_b5_whisper_provider_error_status_is_one_failed_exchange"
+   ],
+   "new_in_e5": [
+    "tests/test_e5_fault_matrix.py::test_e5_transcript_failure_against_the_real_whisper_adapter_is_one_durable_failed_outcome"
+   ],
+   "status": "existing_plus_new",
+   "why_new": "Prior 429 coverage is either a bare AdapterFailed injection via a fake host, or hound_web_adapters.whisper.transcribe() called standalone; nothing drove a real 429 through AdapterHost.from_env + CommitRuntime.execute_adapter end to end."
+  },
+  {
+   "demand": "timeouts",
+   "covered_by": [
+    "tests/test_web_adapters.py::test_http_transport_marks_a_no_response_failure_as_retryable"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "truncated bytes",
+   "covered_by": [
+    "tests/test_hound_client.py::test_truncated_response_body_is_rejected",
+    "tests/test_hound_client.py::test_frame_length_outside_the_bound_is_rejected_before_the_body"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "transcript failures",
+   "covered_by": [
+    "tests/test_b5_transcribe.py::test_b5_non_transcribed_outcomes_are_durable_and_claim_no_provenance"
+   ],
+   "new_in_e5": [
+    "tests/test_e5_fault_matrix.py::test_e5_transcript_failure_against_the_real_whisper_adapter_is_one_durable_failed_outcome"
+   ],
+   "status": "existing_plus_new",
+   "why_new": "Genuinely missing case: a real Whisper 429 flowing through the full commit path (capture binding, real AdapterHost.from_env wiring, durable failed record, journal, verify_store), not a fake-host exception injection."
+  },
+  {
+   "demand": "outage abstention",
+   "covered_by": [
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_service_freezes_provider_credentials_at_startup",
+    "tests/test_b5_transcribe.py::test_b5_degraded_when_no_openai_key_is_bound",
+    "tests/test_hound_client.py::test_ready_rejects_a_degraded_daemon"
+   ],
+   "new_in_e5": [
+    "tests/test_e5_fault_matrix.py::test_e5_outage_abstention_is_durable_and_credential_silent_across_adapter_operations"
+   ],
+   "status": "existing_plus_new",
+   "why_new": "Consolidates outage abstention across every adapter operation (search/url/transcribe) in one pass using the real credential-derived AdapterHost.from_env({}) houndd binds at startup, and asserts no credential material leaks into durable state -- prior coverage was per-operation and scattered."
+  },
+  {
+   "demand": "cursor replay",
+   "covered_by": [
+    "tests/test_hsp08_cursor.py",
+    "tests/test_hsp08_durable_query.py",
+    "tests/test_b14_descending_query.py"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "ACL non-leakage",
+   "covered_by": [
+    "tests/test_hsp09_access.py",
+    "tests/test_hsp09_query_authorization.py",
+    "tests/test_b6_journal_maintenance_routes.py::test_b6_maintenance_routes_deny_unauthorized_scopes_generically",
+    "tests/test_b7_telemetry.py"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "backup restore",
+   "covered_by": [],
+   "new_in_e5": [
+    "tests/test_e5_fault_matrix.py::test_e5_backup_restore_drill_survives_original_destruction",
+    "tests/test_e5_fault_matrix.py::test_e5_backup_restore_drill_including_a_completed_transcription_KNOWN_DEFECT"
+   ],
+   "status": "new_with_known_defect",
+   "why_new": "No prior test built a live-shaped store with the commit runtime, copied it, destroyed the original outright, and proved verify_store green plus journal.query serving identical results from the copy alone. The drill covers ingest.file, import.record, ingest.media, and ingest.search cleanly. Extending it to a completed transcription surfaced known_defects[0] below; that lane is pinned as a strict xfail rather than silently dropped from the matrix."
+  },
+  {
+   "demand": "exact-hash approval binding",
+   "covered_by": [
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_tampered_reservation_is_integrity_while_changed_request_is_collision",
+    "tests/test_b4_media_capture.py::test_b4_media_tampered_reservation_is_integrity_while_changed_request_is_collision"
+   ],
+   "new_in_e5": [
+    "tests/test_e5_fault_matrix.py::test_e5_exact_hash_approval_binding_rejects_drift_across_every_commit_operation"
+   ],
+   "status": "existing_plus_new",
+   "why_new": "Prior coverage of collision-on-changed-request only existed for ingest.file and ingest.media. The three adapter operations -- ingest.search, ingest.url, transcribe -- had zero collision-on-drift coverage anywhere in the suite. This test consolidates hash-drift rejection across all six commit operations in one place."
+  },
+  {
+   "demand": "0/1/16 MiB source limits",
+   "covered_by": [
+    "tests/test_slice3c1_contract_source_phi.py::test_canonical_base64_and_exact_encoded_and_decoded_boundaries"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "base64 wire overhead",
+   "covered_by": [
+    "tests/test_slice3c1_contract_source_phi.py::test_canonical_base64_and_exact_encoded_and_decoded_boundaries"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "digest mismatch",
+   "covered_by": [
+    "tests/test_slice3c1_contract_source_phi.py::test_source_mismatch_and_subtype_attacks_fail_closed",
+    "tests/test_slice3a_evidence.py"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "held-FD nofollow regular-file TOCTOU checks",
+   "covered_by": [
+    "tests/test_slice3c1_contract_source_phi.py::test_source_normalization_removes_transport_and_path_is_held_nofollow",
+    "tests/test_slice3c1_contract_source_phi.py::test_missing_required_path_primitive_fails_closed",
+    "tests/test_slice3c1_contract_source_phi.py::test_path_fifo_never_blocks_and_fails_closed",
+    "tests/test_slice3c1_contract_source_phi.py::test_path_post_read_mode_race_and_growth_fail_closed",
+    "tests/test_slice3c1_contract_source_phi.py::test_path_current_binding_replacement_fails_closed",
+    "tests/test_slice3c1_contract_source_phi.py::test_path_binding_and_held_descriptor_fail_after_fork"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "the Slice 3C1 local clear-manifest PHI gate and pre-acceptance refusal",
+   "covered_by": [
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_refusal_and_reserved_route_do_not_create_state",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_unavailable_phi_manifest_never_reads_source_or_creates_attempt",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_manifest_change_during_normalization_fails_before_reservation",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_manifest_change_before_reservation_fails_closed",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_replaced_phi_manifest_and_forked_service_fail_before_source",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_authorization_denial_never_reads_source_or_creates_attempt",
+    "tests/test_b4_media_capture.py::test_b4_media_scanner_rejects_uncertified_digest"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "unsupported-media/encoding invalidation before scanner evaluation",
+   "covered_by": [
+    "tests/test_slice3c1_contract_source_phi.py::test_phi_manifest_rejects_wrong_mode_order_duplicates_and_unsupported_subtypes",
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_text_scanner_rejects_unsupported_representations"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "future-slice bounded non-PHI quarantine",
+   "covered_by": [
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_suspected_content_quarantines_without_persisting_raw_bytes",
+    "tests/test_slice3c2_adapter_commit.py::test_slice3c2_scanner_error_stages_nothing_and_recovers_interrupted"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  },
+  {
+   "demand": "ambiguous record/event/lineage recovery",
+   "covered_by": [
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_unscoped_import_lineage_selects_no_existing_event",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_ambiguous_authorized_import_lineage_rejects_before_reservation",
+    "tests/test_slice3c1_commit_runtime.py::test_slice3c1_recovery_rejects_partial_pair_and_event_without_record"
+   ],
+   "new_in_e5": [],
+   "status": "existing"
+  }
+ ],
+ "new_test_file": "tests/test_e5_fault_matrix.py",
+ "new_tests": [
+  "test_e5_exact_hash_approval_binding_rejects_drift_across_every_commit_operation",
+  "test_e5_outage_abstention_is_durable_and_credential_silent_across_adapter_operations",
+  "test_e5_transcript_failure_against_the_real_whisper_adapter_is_one_durable_failed_outcome",
+  "test_e5_backup_restore_drill_survives_original_destruction",
+  "test_e5_backup_restore_drill_including_a_completed_transcription_KNOWN_DEFECT"
+ ],
+ "known_defects": [
+  {
+   "id": "e5-defect-1",
+   "title": "Projection rebuild (and therefore houndd startup recovery) crashes after any completed transcription",
+   "file": "src/houndd/projection.py",
+   "function": "_derive_rows",
+   "discovered_by": "tests/test_e5_fault_matrix.py::test_e5_backup_restore_drill_including_a_completed_transcription_KNOWN_DEFECT",
+   "pinned_as": "strict xfail (test fails loudly -- XPASS -- the moment the bug is fixed, forcing removal of the marker)",
+   "severity": "blocking",
+   "description": "_derive_rows() treats every completed outcome whose object_key does not start with 'legacy:' as blob-backed, and unconditionally calls records.blobs.get(content_sha256). A completed transcription's object_key is 'transcript:<hash>'; by VISION design (B5), transcript bytes are never staged as a blob. The lookup raises houndd.store.UnsafeStoreError. Because HounddService.__init__ calls store.recover() -> Projection.rebuild() at startup (HSP-20's mandatory startup recovery), houndd fails to boot against its own state root after the first completed transcription anywhere in its journal -- not merely a rebuild-index maintenance-route edge case, a daemon boot crash. The live incrementally-maintained projection is also affected: verify_store(state) (projection=True, default) reports 'projection drift' as invalid for the same reason, without crashing, immediately after a completed transcribe commit under normal operation.",
+   "impact": "Blocks the HSP-12 backup-restore claim and the HSP-20 crash-recovery claim for the transcribe lane specifically. Any live deployment that completes even one transcription and then restarts houndd will not come back up.",
+   "fix": "Add a third branch in _derive_rows alongside the existing 'legacy:' branch: skip the blob lookup for object_key.startswith('transcript:') (or generalize to any adapter operation outside ADAPTER_MEDIA_TYPES that stages no content), matching commit_runtime.py's own '_plan_requires_content' logic used to decide whether to stage a blob in the first place.",
+   "owner": "unassigned -- out of tests/test_e5_fault_matrix.py's file ownership; needs routing to whoever owns src/houndd/projection.py or the B5/transcribe lane",
+   "status": "FIXED 2026-08-04: projection._derive_rows and _DERIVED_BLOB_KEYS gained the transcript: branch; tripwire test flipped to a live green assertion in the same commit."
+  }
+ ]
+}

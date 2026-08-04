@@ -44,7 +44,7 @@ _INSERT_ENTRY = "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 _INSERT_BLOB = "INSERT OR IGNORE INTO blobs VALUES (?, ?)"
 # Rows the blobs table must hold, derived from the entries table alone.  Only a
 # completed, non-legacy outcome stages a blob (see ``_derive_rows``).
-_DERIVED_BLOB_KEYS = "SELECT content_sha256 FROM entries WHERE outcome = 'completed' AND substr(object_key, 1, 7) <> 'legacy:'"
+_DERIVED_BLOB_KEYS = "SELECT content_sha256 FROM entries WHERE outcome = 'completed' AND substr(object_key, 1, 7) <> 'legacy:' AND substr(object_key, 1, 11) <> 'transcript:'"
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
@@ -70,16 +70,17 @@ def _derive_rows(event: Mapping[str, Any], records: RecordStore) -> tuple[tuple[
     content_sha256 = event["dedupe"]["content_sha256"]
     object_key = event["dedupe"]["object_key"]
     # Only a completed outcome commits dereferenceable content: a completed
-    # import preserves exact bytes under its legacy record ID, every other
-    # completed artifact stages a blob, and non-completed outcomes carry a
-    # commitment with no object.
+    # import preserves exact bytes under its legacy record ID, a completed
+    # transcription stages nothing by PHI design (hashes-only provenance),
+    # every other completed artifact stages a blob, and non-completed
+    # outcomes carry a commitment with no object.
     blob_row: tuple[str, int] | None = None
     if event["classification"]["outcome"] == "completed":
         if object_key.startswith("legacy:"):
             legacy_body = records.read(object_key[len("legacy:"):])
             if hashlib.sha256(legacy_body).hexdigest() != content_sha256:
                 raise ProjectionError(f"legacy content {object_key} does not match its digest")
-        else:
+        elif not object_key.startswith("transcript:"):
             blob_row = (content_sha256, len(records.blobs.get(content_sha256)))
     producer = event["producer"]
     source = event["source"]
