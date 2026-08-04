@@ -52,7 +52,7 @@
         "ingest.search",
         "ingest.url"
       ],
-      "blocked_reason": null,
+      "blocked_reason": "Operationally live on houndd; formal migrated stage awaits retained scheduled-cycle evidence and Ali cutover approval.",
       "wave": 2,
       "stage": "shadow",
       "status": "shadow",
@@ -121,7 +121,7 @@
         "ingest.search",
         "ingest.url"
       ],
-      "blocked_reason": null,
+      "blocked_reason": "Operationally live on houndd; formal migrated stage awaits retained scheduled-cycle evidence and Ali cutover approval.",
       "wave": 3,
       "stage": "import_mirror",
       "status": "baseline",
@@ -155,7 +155,7 @@
         "ingest.search",
         "ingest.url"
       ],
-      "blocked_reason": null,
+      "blocked_reason": "Operationally live on houndd; formal migrated stage awaits retained scheduled-cycle evidence and Ali cutover approval.",
       "wave": 3,
       "stage": "import_mirror",
       "status": "baseline",
@@ -189,7 +189,7 @@
         "ingest.search",
         "ingest.url"
       ],
-      "blocked_reason": null,
+      "blocked_reason": "Operationally live on houndd; formal migrated stage awaits retained scheduled-cycle evidence and Ali cutover approval.",
       "wave": 3,
       "stage": "import_mirror",
       "status": "baseline",

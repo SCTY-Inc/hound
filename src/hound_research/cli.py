@@ -217,47 +217,23 @@ def _handle_verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _handle_source(args: argparse.Namespace) -> dict[str, Any]:
-    handlers = {
-        "discover": discover_sources,
-        "capture": capture_sources,
-        "inspect": inspect_sources,
-    }
-    return handlers[args.source_verb](
-        Path(args.driver).resolve(),
-        _payload(args),
-        as_of=args.as_of,
+    raise HoundError(
+        "direct source acquisition is disabled; submit ingestion through houndd",
+        exit_code=5,
     )
 
 
 def _handle_web(args: argparse.Namespace) -> dict[str, Any]:
-    return run_web(
-        Path(args.adapter).resolve(),
-        args.web_verb,
-        _payload(args),
-        record_root=Path(args.record_root).resolve(),
-        as_of=args.as_of,
+    raise HoundError(
+        "direct provider acquisition is disabled; submit ingestion through houndd",
+        exit_code=5,
     )
 
 
 def _handle_capture_store(args: argparse.Namespace) -> dict[str, Any]:
-    try:
-        body = Path(args.body).read_bytes()
-    except OSError as exc:
-        raise HoundError(f"cannot read capture body {args.body}: {exc}", exit_code=2) from exc
-    try:
-        metadata = json.loads(args.metadata_json) if args.metadata_json else None
-    except json.JSONDecodeError as exc:
-        raise HoundError(f"invalid JSON in --metadata-json: {exc}", exit_code=2) from exc
-    if metadata is not None and not isinstance(metadata, dict):
-        raise HoundError("--metadata-json must contain a JSON object", exit_code=2)
-    return store_capture(
-        args.root,
-        provider=args.provider,
-        source_url=args.source_url,
-        body=body,
-        media_type=args.media_type,
-        retrieved_at=args.retrieved_at,
-        metadata=metadata,
+    raise HoundError(
+        "direct capture intake is disabled; submit ingest.file or ingest.media through houndd",
+        exit_code=5,
     )
 
 

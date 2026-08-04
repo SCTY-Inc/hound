@@ -63,7 +63,7 @@
    ],
    "missing": [
     "radar-curation and youtube-transcription have not been cut over (GOALIE M4 / task #7, blocked on B5's transcript-representation decision D10), so the boundary is proven for 5 of the 7 acquisition lanes, not all of them",
-    "the inventory now tracks the ledger (benefits-radar migrated, pulse shadow, wiki/intel/civic import_mirror, 7 rows still freeze_contracts as of d23f53f), but the credential-unset proof itself is the E1 matrix artifact from a live atum run, not a repeatable CI suite; nothing in CI re-proves the boundary for a live lane"
+    "the inventory tracks the formal stage ledger (benefits-radar migrated, pulse shadow, wiki/intel/civic import_mirror, 7 rows still freeze_contracts) and explicitly records the other four live lanes as operationally live but formally blocked; the credential-unset proof itself is the E1 matrix artifact from a live atum run, not a repeatable CI suite"
    ],
    "deviations": []
   },
@@ -505,14 +505,14 @@
    "assertions": [
     "the checker rejects skipped or reordered stages and pre-gate deletion (proven against fixtures)",
     "the checked-in ledger is a valid hash chain: 8 entries, sequence 0..7, each binding its predecessor's entry hash",
-    "one lane (benefits-radar) has walked freeze_contracts -> import_mirror -> shadow -> migrated with per-stage evidence files and an approval_ref"
+    "the five operationally live lanes are represented in the ledger: benefits-radar is migrated, pulse is shadow, and wiki-refresh, intel-refresh, and civic-policy-radar are import_mirror; radar-curation and youtube-transcription remain outside this live five-lane wave"
    ],
    "missing": [
-    "only 1 of the 5 live lanes has reached 'migrated'. pulse stops at 'shadow'; wiki-refresh, intel-refresh, and civic-policy-radar stop at 'import_mirror'; radar-curation and youtube-transcription have no ledger entries at all (GOALIE task #8 is still in flight).",
+    "all 5 live lanes acquire through houndd, but only benefits-radar has reached the formal 'migrated' stage. pulse stops at 'shadow'; wiki-refresh, intel-refresh, and civic-policy-radar stop at 'import_mirror'; radar-curation and youtube-transcription are outside this live five-lane wave and have no ledger entries.",
     "no lane has reached 'retired' and every entry's 'legacy_absent' evidence slot is null, so the row's deletion gate ('delete only after recovery drill and one full scheduled cycle per lane') is unexercised",
     "no lane has all nine evidence slots. Counting each lane's union across its whole chain: benefits-radar 7/9 (missing stage_ledger, legacy_absent), pulse 2/9, wiki-refresh 1/9, intel-refresh 0/9, civic-policy-radar 0/9. The 'stage_ledger' slot is null on every entry in the ledger.",
     "the remaining lanes' full_cycle evidence depends on scheduled runs that have not happened yet (owner schedule: intel, benefits, and pulse on 2026-08-05; civic policy on the evening of 2026-08-05; wiki-refresh on 2026-08-10). Those four lanes stay partial until then; no row here claims a scheduled-run outcome in advance.",
-    "the row's ordering includes a shadow stage for Pulse and Benefits that the owner's 2026-08-04 full-cutover replan dropped; the ledger records shadow entries whose parity evidence is an explicit supersession note (migration/evidence/lanes/*/parity.md), not a parity comparison. VISION's ordering and the executed plan disagree and one of them must be amended (see HSP-16/HSP-17)."
+    "the owner's 2026-08-04 full-cutover replan superseded formal shadow parity with one real end-to-end run per lane, but the checked-in ledger retains the historical Pulse and Benefits shadow entries; their parity evidence is an explicit supersession note, not a parity comparison. The VISION ordering remains the normative contract until an owner-approved amendment."
    ],
    "deviations": []
   },
@@ -609,7 +609,7 @@
     "five of five live lanes ran credential-unset and degraded rather than bypassing (four owner-level runs; gc-web covers pulse and civic-policy-radar)"
    ],
    "missing": [
-    "'every migrated consumer' is not yet every consumer: radar-curation and youtube-transcription are not cut over, so the dynamic matrix covers 5 lanes, not the full inventory closure",
+    "the dynamic matrix proves all 5 operationally live acquisition lanes; radar-curation and youtube-transcription are not cut over, so the matrix does not cover the full acquisition inventory closure",
     "the transcribe proof required minting one real capture record, so migration/evidence/e1's phi_clear_manifest is not empty; every other byte sequence in the run, including the dedicated source_refused fixture, was refused as designed",
     "no test file owns this row: the dynamic matrix is a retained JSON artifact produced by a live run against the atum workspace, not a repeatable CI suite"
    ],

@@ -205,19 +205,12 @@ def test_plan_requires_an_output_path_and_cutoff(
     assert "required" in json.loads(stderr)["error"]
 
 
-def test_research_source_command_uses_source_v2_composition(
-    driver_repo: tuple[Path, Path], monkeypatch
+def test_research_source_command_fails_closed_after_no_bypass_cutover(
+    driver_repo: tuple[Path, Path],
 ) -> None:
     _, manifest_path = driver_repo
-    seen: list[tuple[Path, dict[str, object]]] = []
 
-    def discover(path: Path, payload: dict[str, object], *, as_of: str | None = None):
-        seen.append((path, payload))
-        return {"ok": True, "outcome": "completed", "as_of": as_of}
-
-    monkeypatch.setattr(research_cli, "discover_sources", discover)
-
-    code, stdout, _ = run_research_cli(
+    code, stdout, stderr = run_research_cli(
         "source",
         "discover",
         "--driver",
@@ -228,25 +221,18 @@ def test_research_source_command_uses_source_v2_composition(
         "2026-07-21",
     )
 
-    assert code == 0
-    assert json.loads(stdout)["outcome"] == "completed"
-    assert seen == [(manifest_path.resolve(), {"date": "2026-07-21"})]
+    assert code == 5
+    assert stdout == ""
+    assert "disabled" in json.loads(stderr)["error"]
 
 
-def test_research_web_commands_require_explicit_adapter_and_preserve_record_root(
-    driver_repo: tuple[Path, Path], tmp_path: Path, monkeypatch
+def test_research_web_commands_fail_closed_after_no_bypass_cutover(
+    driver_repo: tuple[Path, Path], tmp_path: Path
 ) -> None:
     _, manifest_path = driver_repo
-    seen: list[tuple[Path, str, dict[str, object], Path]] = []
-
-    def run_web(adapter, verb, payload, *, record_root, as_of=None):
-        seen.append((adapter, verb, payload, record_root))
-        return {"ok": True, "outcome": "completed", "record_id": "a" * 64}
-
-    monkeypatch.setattr(research_cli, "run_web", run_web)
     record_root = tmp_path / "records"
 
-    code, _, _ = run_research_cli(
+    code, stdout, stderr = run_research_cli(
         "search",
         "--adapter",
         str(manifest_path),
@@ -256,23 +242,17 @@ def test_research_web_commands_require_explicit_adapter_and_preserve_record_root
         str(record_root),
     )
 
-    assert code == 0
-    assert seen == [
-        (
-            manifest_path.resolve(),
-            "search",
-            {"query": "care", "limit": 2},
-            record_root.resolve(),
-        )
-    ]
+    assert code == 5
+    assert stdout == ""
+    assert "disabled" in json.loads(stderr)["error"]
 
 
-def test_research_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
+def test_research_capture_store_fails_closed_after_no_bypass_cutover(tmp_path: Path) -> None:
     body = tmp_path / "body.bin"
     body.write_bytes(b"source bytes")
     root = tmp_path / "captures"
 
-    stored, stdout, _ = run_research_cli(
+    stored, stdout, stderr = run_research_cli(
         "capture",
         "store",
         "--root",
@@ -288,19 +268,10 @@ def test_research_capture_store_and_verify_round_trip(tmp_path: Path) -> None:
         "--retrieved-at",
         "2026-07-21T12:00:00Z",
     )
-    assert stored == 0
-    capture_id = json.loads(stdout)["capture_id"]
-
-    verified, stdout, _ = run_research_cli(
-        "capture",
-        "verify",
-        "--root",
-        str(root),
-        "--capture-id",
-        capture_id,
-    )
-    assert verified == 0
-    assert json.loads(stdout)["valid"] is True
+    assert stored == 5
+    assert stdout == ""
+    assert "disabled" in json.loads(stderr)["error"]
+    assert not root.exists()
 
 
 def test_invalid_json_returns_a_machine_readable_error(

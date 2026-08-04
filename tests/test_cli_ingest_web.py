@@ -28,6 +28,38 @@ def run_research_cli(*args: str):
     return code, stdout.getvalue(), stderr.getvalue()
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("search", "--adapter", "adapters/exa/hound-driver.json", "--input", "{}"),
+        ("extract", "--adapter", "adapters/firecrawl/hound-driver.json", "--input", "{}"),
+        ("interact", "--adapter", "adapters/camofox/hound-driver.json", "--input", "{}"),
+        ("source", "discover", "--driver", "adapters/exa/hound-driver.json", "--input", "{}"),
+        (
+            "capture",
+            "store",
+            "--root",
+            "/tmp/hound-test-capture",
+            "--provider",
+            "exa",
+            "--source-url",
+            "https://example.test",
+            "--body",
+            "/tmp/missing",
+            "--media-type",
+            "text/plain",
+            "--retrieved-at",
+            "2026-08-04T00:00:00Z",
+        ),
+    ],
+)
+def test_legacy_acquisition_commands_fail_closed(args: tuple[str, ...]) -> None:
+    code, stdout, stderr = run_research_cli(*args)
+    assert code == 5
+    assert stdout == ""
+    assert "disabled" in stderr
+
+
 def _read_exact(connection: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:

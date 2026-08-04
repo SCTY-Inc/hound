@@ -47,31 +47,26 @@ def run(adapter_name: str, request: object, env: Mapping[str, str]) -> dict[str,
             "proofs": [],
             "diagnostics": [],
         }
-    operation, adapter = _ADAPTERS[adapter_name]
+    operation, _ = _ADAPTERS[adapter_name]
     if mode != "read" or request.get("operation") != operation:
         raise AdapterError(f"adapter {adapter_name!r} accepts only {operation} read requests")
-    data = adapter(request.get("input", {}), env=env)
-    return {
-        "schema_version": "hound.driver.response.v1",
-        "ok": True,
-        "outcome": "completed",
-        "data_schema": "hound.web.adapter.v1",
-        "data": data,
-        "artifacts": [],
-        "proofs": [],
-        "diagnostics": [],
-    }
+    # Provider adapters are owned by houndd after the no-bypass cutover. The
+    # standalone driver remains available for contract handshakes, but it
+    # must never become a second acquisition boundary.
+    raise AdapterError("direct provider adapter execution is disabled; use houndd")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     response: dict[str, Any]
+    blocked = False
     try:
         if len(arguments) != 1:
             raise AdapterError("usage: hound-web-adapter exa|firecrawl|camofox")
         request = json.load(sys.stdin)
         response = run(arguments[0], request, os.environ)
     except (AdapterError, WebError, ValueError, json.JSONDecodeError) as error:
+        blocked = isinstance(error, AdapterError) and str(error) == "direct provider adapter execution is disabled; use houndd"
         raw = error.raw if isinstance(error, AdapterError) else b""
         media_type = (
             error.media_type if isinstance(error, AdapterError) else "application/octet-stream"
@@ -102,7 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "diagnostics": [str(error)],
         }
     sys.stdout.write(canonical_json(response) + "\n")
-    return 0
+    return 5 if blocked else 0
 
 
 if __name__ == "__main__":
