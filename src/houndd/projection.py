@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +16,93 @@ from .store import RecordStore, StoreError, UnsafeStoreError
 
 class ProjectionError(StoreError):
     """The disposable projection cannot be rebuilt safely."""
+
+
+_ENTRIES_SCHEMA = """CREATE TABLE entries (
+    sequence INTEGER NOT NULL,
+    entry_id TEXT PRIMARY KEY,
+    appended_at TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    record_hash TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    access TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    evidence_status TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    canonical_url TEXT NOT NULL
+)"""
+_BLOBS_SCHEMA = """CREATE TABLE blobs (
+    content_sha256 TEXT PRIMARY KEY,
+    byte_length INTEGER NOT NULL
+)"""
+_INSERT_ENTRY = "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+_INSERT_BLOB = "INSERT OR IGNORE INTO blobs VALUES (?, ?)"
+# Rows the blobs table must hold, derived from the entries table alone.  Only a
+# completed, non-legacy outcome stages a blob (see ``_derive_rows``).
+_DERIVED_BLOB_KEYS = "SELECT content_sha256 FROM entries WHERE outcome = 'completed' AND substr(object_key, 1, 7) <> 'legacy:'"
+
+
+def _create_schema(connection: sqlite3.Connection) -> None:
+    """Create the one projection schema both drivers write."""
+
+    connection.execute(_ENTRIES_SCHEMA)
+    connection.execute(_BLOBS_SCHEMA)
+
+
+def _derive_rows(event: Mapping[str, Any], records: RecordStore) -> tuple[tuple[Any, ...], tuple[str, int] | None]:
+    """Derive one committed event's ``entries`` row and its optional ``blobs`` row.
+
+    This is the sole row derivation in the projection: the full rebuild and
+    the incremental append both drive it, so an incrementally maintained
+    projection cannot diverge from a from-scratch rebuild.  Each call verifies
+    exactly one record and reads at most one staged object, so it is the unit
+    both drivers are measured in.
+    """
+
+    record_id = event["artifact"]["record_id"]
+    if not records.verify_record(record_id, event["artifact"]["hash"]):
+        raise ProjectionError(f"record {record_id} failed before projection")
+    content_sha256 = event["dedupe"]["content_sha256"]
+    object_key = event["dedupe"]["object_key"]
+    # Only a completed outcome commits dereferenceable content: a completed
+    # import preserves exact bytes under its legacy record ID, every other
+    # completed artifact stages a blob, and non-completed outcomes carry a
+    # commitment with no object.
+    blob_row: tuple[str, int] | None = None
+    if event["classification"]["outcome"] == "completed":
+        if object_key.startswith("legacy:"):
+            legacy_body = records.read(object_key[len("legacy:"):])
+            if hashlib.sha256(legacy_body).hexdigest() != content_sha256:
+                raise ProjectionError(f"legacy content {object_key} does not match its digest")
+        else:
+            blob_row = (content_sha256, len(records.blobs.get(content_sha256)))
+    producer = event["producer"]
+    source = event["source"]
+    classification = event["classification"]
+    entry_row = (
+        event["sequence"],
+        event["entry_id"],
+        event["appended_at"],
+        record_id,
+        event["artifact"]["hash"],
+        object_key,
+        content_sha256,
+        event["access"],
+        event["policy_id"],
+        classification["outcome"],
+        classification["evidence_status"],
+        producer["owner_id"],
+        producer["capability"],
+        producer["run_id"],
+        source["provider"],
+        source["canonical_url"],
+    )
+    return entry_row, blob_row
 
 
 class Projection:
@@ -370,16 +458,34 @@ class Projection:
 
         connection = sqlite3.connect(":memory:")
         try:
+            connection.deserialize(self._read_descriptor(descriptor, opened.st_size))
+            connection.execute("PRAGMA secure_delete=ON")
             if read_only:
-                connection.deserialize(self._read_descriptor(descriptor, opened.st_size))
                 connection.execute("PRAGMA query_only=ON")
-            else:
-                connection.execute("PRAGMA secure_delete=ON")
             connection.row_factory = sqlite3.Row
             return connection
         except Exception:
             connection.close()
             raise
+
+    @staticmethod
+    def _insert_rows(
+        connection: sqlite3.Connection,
+        events: Sequence[Mapping[str, Any]],
+        records: RecordStore,
+        *,
+        fault: Callable[[str], None] | None,
+        phase: str,
+    ) -> None:
+        """Insert the derived rows for ``events`` into an open transaction."""
+
+        for event in events:
+            if fault is not None:
+                fault(phase)
+            entry_row, blob_row = _derive_rows(event, records)
+            connection.execute(_INSERT_ENTRY, entry_row)
+            if blob_row is not None:
+                connection.execute(_INSERT_BLOB, blob_row)
 
     def rebuild(
         self,
@@ -404,83 +510,8 @@ class Projection:
             connection.execute("PRAGMA secure_delete=ON")
             connection.row_factory = sqlite3.Row
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DROP TABLE IF EXISTS entries")
-            connection.execute("DROP TABLE IF EXISTS blobs")
-            connection.execute(
-                """CREATE TABLE entries (
-                    sequence INTEGER NOT NULL,
-                    entry_id TEXT PRIMARY KEY,
-                    appended_at TEXT NOT NULL,
-                    record_id TEXT NOT NULL,
-                    record_hash TEXT NOT NULL,
-                    object_key TEXT NOT NULL,
-                    content_sha256 TEXT NOT NULL,
-                    access TEXT NOT NULL,
-                    policy_id TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    evidence_status TEXT NOT NULL,
-                    owner_id TEXT NOT NULL,
-                    capability TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    canonical_url TEXT NOT NULL
-                )"""
-            )
-            connection.execute(
-                """CREATE TABLE blobs (
-                    content_sha256 TEXT PRIMARY KEY,
-                    byte_length INTEGER NOT NULL
-                )"""
-            )
-            for event in events:
-                if fault is not None:
-                    fault("during_projection_rebuild")
-                record_id = event["artifact"]["record_id"]
-                if not records.verify_record(record_id, event["artifact"]["hash"]):
-                    raise ProjectionError(f"record {record_id} failed before projection")
-                content_sha256 = event["dedupe"]["content_sha256"]
-                object_key = event["dedupe"]["object_key"]
-                # Only a completed outcome commits dereferenceable content: a
-                # completed import preserves exact bytes under its legacy
-                # record ID, every other completed artifact stages a blob, and
-                # non-completed outcomes carry a commitment with no object.
-                blob_length: int | None = None
-                if event["classification"]["outcome"] == "completed":
-                    if object_key.startswith("legacy:"):
-                        legacy_body = records.read(object_key[len("legacy:"):])
-                        if hashlib.sha256(legacy_body).hexdigest() != content_sha256:
-                            raise ProjectionError(f"legacy content {object_key} does not match its digest")
-                    else:
-                        blob_length = len(records.blobs.get(content_sha256))
-                producer = event["producer"]
-                source = event["source"]
-                classification = event["classification"]
-                connection.execute(
-                    "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        event["sequence"],
-                        event["entry_id"],
-                        event["appended_at"],
-                        record_id,
-                        event["artifact"]["hash"],
-                        event["dedupe"]["object_key"],
-                        content_sha256,
-                        event["access"],
-                        event["policy_id"],
-                        classification["outcome"],
-                        classification["evidence_status"],
-                        producer["owner_id"],
-                        producer["capability"],
-                        producer["run_id"],
-                        source["provider"],
-                        source["canonical_url"],
-                    ),
-                )
-                if blob_length is not None:
-                    connection.execute(
-                        "INSERT OR IGNORE INTO blobs VALUES (?, ?)",
-                        (content_sha256, blob_length),
-                    )
+            _create_schema(connection)
+            self._insert_rows(connection, events, records, fault=fault, phase="during_projection_rebuild")
             connection.commit()
             directory_before_publish = anchor.stat()
             if not self._same_directory_generation(directory_before_build, directory_before_publish):
@@ -494,6 +525,92 @@ class Projection:
             if connection is not None:
                 connection.close()
             return result
+
+    @staticmethod
+    def _assert_appends_onto(connection: sqlite3.Connection, events: Sequence[Mapping[str, Any]]) -> None:
+        """Prove the loaded projection is the full rebuild of the prefix before ``events``.
+
+        The proof is structural and reads no record or blob: the schema is the
+        one ``_create_schema`` writes, the entries hold exactly the contiguous
+        journal prefix ``0..events[0].sequence - 1``, the blobs hold exactly
+        the keys that prefix derives, and ``events`` themselves are the next
+        contiguous run.  Anything else is unproven, so it raises and the caller
+        rebuilds instead.
+        """
+
+        schema = {row["name"]: row["sql"] for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")}
+        if schema != {"entries": _ENTRIES_SCHEMA, "blobs": _BLOBS_SCHEMA}:
+            raise ProjectionError("projection schema is not the rebuild schema")
+        counts = connection.execute("SELECT COUNT(*) AS rows, COUNT(DISTINCT sequence) AS sequences, MIN(sequence) AS lowest, MAX(sequence) AS highest FROM entries").fetchone()
+        rows = counts["rows"]
+        if rows and (counts["lowest"] != 0 or counts["highest"] != rows - 1 or counts["sequences"] != rows):
+            raise ProjectionError("projection is not a contiguous journal prefix")
+        expected = 0 if not rows else counts["highest"] + 1
+        for offset, event in enumerate(events):
+            if event["sequence"] != expected + offset:
+                raise ProjectionError("appended events do not continue the projection")
+        orphans = connection.execute(f"SELECT COUNT(*) AS orphans FROM blobs WHERE content_sha256 NOT IN ({_DERIVED_BLOB_KEYS})").fetchone()["orphans"]
+        derived = connection.execute(f"SELECT COUNT(*) AS derived FROM (SELECT DISTINCT content_sha256 FROM ({_DERIVED_BLOB_KEYS}))").fetchone()["derived"]
+        held = connection.execute("SELECT COUNT(*) AS held FROM blobs").fetchone()["held"]
+        if orphans or held != derived:
+            raise ProjectionError("projection blobs do not match its entries")
+
+    def append(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        records: RecordStore,
+        *,
+        fault: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Add rows for newly committed ``events`` to the published projection.
+
+        This is the O(1)-per-event driver of the same ``_derive_rows``
+        derivation the full rebuild uses, so its result is the rebuild's
+        result: identical schema and identical row set.  It applies only where
+        it can prove that (see ``_assert_appends_onto``) and raises
+        ``ProjectionError`` otherwise; a caller that cannot tolerate a refusal
+        must fall back to ``rebuild``, which is unconditional.  Publication is
+        the rebuild's: the new database is built in memory and replaces the
+        visible leaf atomically, so a failure anywhere leaves the prior
+        projection byte-for-byte usable.
+        """
+
+        if not events:
+            raise ProjectionError("incremental append requires at least one event")
+        anchor = self._ensure_anchor()
+        with anchor.operation():
+            check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+            self._reclaim_stale_temps(anchor)
+            if "index.sqlite" not in anchor.listdir():
+                self._assert_index_absent(anchor)
+                raise ProjectionError("no published projection to append to")
+            descriptor, opened = self._open_index(anchor)
+            directory_before_build = anchor.stat()
+            connection: sqlite3.Connection | None = None
+            try:
+                try:
+                    connection = self._connect(descriptor, opened, read_only=False)
+                    self._assert_appends_onto(connection, events)
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._insert_rows(connection, events, records, fault=fault, phase="during_projection_append")
+                    connection.commit()
+                    entries = connection.execute("SELECT COUNT(*) AS rows FROM entries").fetchone()["rows"]
+                except sqlite3.Error as error:
+                    raise ProjectionError("projection cannot be appended to") from error
+                # The rows were derived from the database this descriptor still
+                # names, so prove that is still the published projection before
+                # replacing it with them.
+                self._validate_bound_index(anchor, descriptor, opened)
+                directory_before_publish = anchor.stat()
+                if not self._same_directory_generation(directory_before_build, directory_before_publish):
+                    raise UnsafeStoreError(f"{self.path} changed while the projection was appended to")
+                self._publish(anchor, connection.serialize())
+                check_private_stat(anchor.stat(), self.root, directory=True, error_type=UnsafeStoreError)
+                return {"valid": True, "entries": entries, "database": "index.sqlite"}
+            finally:
+                if connection is not None:
+                    connection.close()
+                os.close(descriptor)
 
     def rows(self) -> list[dict[str, Any]]:
         if self.anchor is None and not self.root.exists():

@@ -833,13 +833,17 @@ class CommitRuntime:
         elif event != envelope:
             raise CommitIntegrityError("journal event disagrees with prepared commit")
 
-    def _refresh_projection(self) -> None:
-        """Rebuild the disposable index from the journal, and never raise.
+    def _refresh_projection(self, envelope: dict[str, Any]) -> None:
+        """Add one committed event to the disposable index, and never raise.
 
-        The index is a query aid, so this uses the one projection writer that
-        startup recovery and ``journal.rebuild-index`` already use rather than
-        maintaining a second, incrementally divergent copy.  Every failure is
-        absorbed: the journal is canonical truth, a failed rebuild leaves the
+        The incremental append costs one record verification and at most one
+        staged read, so a commit never pays for the journal behind it.  It
+        applies only where it can prove it is extending the exact projection
+        of the journal prefix before ``envelope``; every other state — absent,
+        lagging, gapped, or foreign-schema index — falls back to the same full
+        ``rebuild`` that startup recovery and ``journal.rebuild-index`` use, so
+        the two drivers cannot leave a divergent index behind.  Every failure is
+        absorbed: the journal is canonical truth, a failed refresh leaves the
         prior projection byte-for-byte usable, and startup recovery repairs
         the drift.  Nothing here may fail a commit whose event is durable.
         """
@@ -847,7 +851,10 @@ class CommitRuntime:
         try:
             assert self.journal is not None and self.records is not None
             with Projection(self.root, create=True) as projection:
-                projection.rebuild(self.journal, self.records)
+                try:
+                    projection.append((envelope,), self.records)
+                except Exception:
+                    projection.rebuild(self.journal, self.records)
         except Exception:
             return
 
@@ -867,7 +874,7 @@ class CommitRuntime:
         # Refresh before the pair reads complete so the index never lags an
         # observable commit, and so a crash in this window still leaves the
         # pair in a phase reconcile drives back through here.
-        self._refresh_projection()
+        self._refresh_projection(marker["envelope"])
         marker["status"] = "complete"
         self._write("commit3c1", "open", open_name, value=marker)
         reservation["response"] = self._plan_template(marker)
