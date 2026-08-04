@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ _CHAIN_FIELDS = frozenset(
 _HEAD_FIELDS = frozenset({"sequence", "entry_id", "chain_sha256"})
 _EMPTY_CHAIN_SHA256 = "0" * 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
+_EMPTY_HEAD_BYTES = canonical_bytes({"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""})
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,51 @@ class PersistedJournalSnapshot:
     event_rows: tuple[bytes, ...]
     chain_rows: tuple[bytes, ...]
     head_bytes: bytes | None
+
+
+@dataclass(slots=True)
+class _VerifiedChain:
+    """One verification of an exact persisted journal byte prefix.
+
+    Every field is derived from ``events_raw`` and ``chains_raw`` alone, so
+    holding it is memoizing a pure function of persisted bytes.  A reader
+    reuses it only after the bytes it has just read under the journal lock
+    prove byte-identical over that prefix, which makes reuse exactly as strong
+    as deriving it again and leaves the first read of any prefix — every cold
+    start — a full verification.  Nothing here is ever persisted.
+    """
+
+    events_raw: bytes
+    chains_raw: bytes
+    events: list[dict[str, Any]]
+    expected: list[dict[str, Any]]
+    # Persisted chain rows are proven equal to ``expected`` as they arrive, so
+    # only how many of them have been proven is worth keeping.
+    chains: int
+    entry_ids: set[str]
+    event_hashes: set[str]
+    chain_hashes: set[str]
+
+    def extends(self, events_raw: bytes, chains_raw: bytes) -> bool:
+        return events_raw.startswith(self.events_raw) and chains_raw.startswith(self.chains_raw)
+
+
+# The journal is append-only, so the same bytes are read again on every
+# access.  Verifications are shared per journal directory rather than per
+# ``Journal`` object because a single process holds several journals over one
+# directory (store, transactions, commit runtime, verification) and the memo
+# is a function of the bytes, not of the reader.  The bound keeps a long-lived
+# process from retaining journals it has stopped reading.
+_MEMO_LIMIT = 8
+_MEMOS: dict[tuple[int, int], _VerifiedChain] = {}
+
+
+def _fresh_memo(identity: tuple[int, int]) -> _VerifiedChain:
+    memo = _VerifiedChain(b"", b"", [], [], 0, set(), set(), set())
+    _MEMOS[identity] = memo
+    while len(_MEMOS) > _MEMO_LIMIT:
+        del _MEMOS[next(iter(_MEMOS))]
+    return memo
 
 
 def _is_sha256(value: object) -> bool:
@@ -136,6 +183,8 @@ class Journal:
                         os.close(descriptor)
                 if "head.json" in self.anchor.listdir("journal"):
                     check_private_stat(self.anchor.stat("journal", "head.json"), self.head_path, directory=False, error_type=UnsafeStoreError)
+                info = self.anchor.stat("journal")
+                self._identity = (info.st_dev, info.st_ino)
         except Exception:
             self.close()
             raise
@@ -164,23 +213,21 @@ class Journal:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
 
-    def _event_values_unlocked(self) -> list[dict[str, Any]]:
+    def _raw_unlocked(self, name: str, path: Path) -> bytes:
         try:
-            raw = self.anchor.read_bytes("journal", "events.jsonl")
+            return self.anchor.read_bytes("journal", name)
         except OSError as error:
-            raise JournalError(f"cannot read journal file {self.events_path}") from error
-        values = self._read_lines_from_raw(self.events_path, raw)
+            raise JournalError(f"cannot read journal file {path}") from error
+
+    @staticmethod
+    def _validated_envelopes(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             return [validate_journal_envelope(value) for value in values]
         except ValueError as error:
             raise JournalError(f"journal envelope is invalid: {error}") from error
 
-    def _chain_values_unlocked(self) -> list[dict[str, Any]]:
-        try:
-            raw = self.anchor.read_bytes("journal", "chain.jsonl")
-        except OSError as error:
-            raise JournalError(f"cannot read journal file {self.chain_path}") from error
-        values = self._read_lines_from_raw(self.chain_path, raw)
+    @staticmethod
+    def _validated_chain_rows(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             return [_validate_persisted_chain_value(value) for value in values]
         except ValueError as error:
@@ -211,8 +258,6 @@ class Journal:
             raise JournalError(f"journal file {path} has a partial final line")
         for line in rows[:-1]:
             try:
-                import json
-
                 value = json.loads(line.decode("utf-8"))
             except (UnicodeError, ValueError) as error:
                 raise JournalError(f"journal file {path} has invalid JSON") from error
@@ -240,8 +285,6 @@ class Journal:
     @staticmethod
     def _head_from_raw(raw: bytes) -> dict[str, Any]:
         try:
-            import json
-
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError) as error:
             raise JournalError("journal head is unreadable") from error
@@ -256,133 +299,148 @@ class Journal:
         except ValueError as error:
             raise JournalError(str(error)) from error
 
-    @classmethod
-    def _validate_persisted_values(
-        cls,
-        events: list[dict[str, Any]],
-        chains: list[dict[str, Any]],
-        head_raw: bytes | None,
-    ) -> None:
-        try:
-            chains = [_validate_persisted_chain_value(chain) for chain in chains]
-        except ValueError as error:
-            raise JournalError(str(error)) from error
-        if len(chains) != len(events):
-            if len(chains) < len(events):
-                raise JournalError("journal chain is incomplete")
+    def _verified_chain(
+        self,
+        events_raw: bytes,
+        chains_raw: bytes,
+        *,
+        allow_short_chain: bool,
+        chain_lines_first: bool = False,
+    ) -> _VerifiedChain:
+        """Prove the persisted chain, deriving only what is not already proven.
+
+        A journal only ever grows, so a read normally sees the exact bytes an
+        earlier read already proved valid followed by a suffix.  One
+        byte-for-byte comparison against the memoized prefix establishes that;
+        every other state — a byte rewritten inside the prefix, a truncation,
+        the first read of this directory in this process — discards the memo
+        and re-derives every entry exactly as an unmemoized reader would.  The
+        entry checks below are therefore run against the same bytes, in the
+        same order, with the same first failure as before.
+
+        ``chain_lines_first`` preserves each caller's existing first-error
+        precedence between a malformed chain line and an invalid envelope.
+        """
+
+        memo = _MEMOS.get(self._identity)
+        if memo is None or not memo.extends(events_raw, chains_raw):
+            memo = _fresh_memo(self._identity)
+        event_tail = events_raw[len(memo.events_raw) :]
+        chain_tail = chains_raw[len(memo.chains_raw) :]
+        if chain_lines_first:
+            event_values = self._read_lines_from_raw(self.events_path, event_tail)
+            chain_values = self._read_lines_from_raw(self.chain_path, chain_tail)
+            new_events = self._validated_envelopes(event_values)
+            new_chains = self._validated_chain_rows(chain_values)
+        else:
+            new_events = self._validated_envelopes(self._read_lines_from_raw(self.events_path, event_tail))
+            new_chains = self._validated_chain_rows(self._read_lines_from_raw(self.chain_path, chain_tail))
+        events_count = len(memo.events) + len(new_events)
+        chains_count = memo.chains + len(new_chains)
+        if chains_count > events_count:
             raise JournalError("journal chain has entries without events")
+        if chains_count < events_count and not allow_short_chain:
+            raise JournalError("journal chain is incomplete")
 
-        previous = _EMPTY_CHAIN_SHA256
-        seen_entry_ids: set[str] = set()
-        seen_event_hashes: set[str] = set()
-        seen_chain_hashes: set[str] = set()
-        for expected_sequence, (event, chain) in enumerate(zip(events, chains, strict=True)):
-            entry_id = event["entry_id"]
-            event_hash = hashlib.sha256(canonical_bytes(event)).hexdigest()
-            if event["sequence"] != expected_sequence or entry_id in seen_entry_ids or event_hash in seen_event_hashes:
-                raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
-            expected_chain = cls._chain_value(event, previous)
-            if (
-                canonical_bytes(chain) != canonical_bytes(expected_chain)
-                or expected_chain["chain_sha256"] in seen_chain_hashes
-            ):
-                raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
-            seen_entry_ids.add(entry_id)
-            seen_event_hashes.add(event_hash)
-            seen_chain_hashes.add(expected_chain["chain_sha256"])
-            previous = expected_chain["chain_sha256"]
+        start = min(len(memo.events), memo.chains)
+        previous = memo.expected[start - 1]["chain_sha256"] if start else _EMPTY_CHAIN_SHA256
+        expected_tail: list[dict[str, Any]] = []
+        entry_ids: set[str] = set()
+        event_hashes: set[str] = set()
+        chain_hashes: set[str] = set()
+        for index in range(start, events_count):
+            proven = index < len(memo.events)
+            if proven:
+                expected = memo.expected[index]
+            else:
+                event = new_events[index - len(memo.events)]
+                event_hash = hashlib.sha256(canonical_bytes(event)).hexdigest()
+                if (
+                    event["sequence"] != index
+                    or event["entry_id"] in memo.entry_ids
+                    or event["entry_id"] in entry_ids
+                    or event_hash in memo.event_hashes
+                    or event_hash in event_hashes
+                ):
+                    raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
+                expected = self._chain_value(event, previous)
+            if memo.chains <= index < chains_count:
+                if canonical_bytes(new_chains[index - memo.chains]) != canonical_bytes(expected):
+                    raise JournalError(f"journal chain mismatch at sequence {index}")
+            if not proven:
+                if expected["chain_sha256"] in memo.chain_hashes or expected["chain_sha256"] in chain_hashes:
+                    raise JournalError("journal chain hashes are not unique")
+                entry_ids.add(event["entry_id"])
+                event_hashes.add(event_hash)
+                chain_hashes.add(expected["chain_sha256"])
+                expected_tail.append(expected)
+            previous = expected["chain_sha256"]
 
-        if events:
-            expected_head = {
-                "sequence": events[-1]["sequence"],
-                "chain_sha256": previous,
-                "entry_id": events[-1]["entry_id"],
-            }
-            if head_raw is None:
-                raise JournalError("journal head is missing")
-            cls._head_from_raw(head_raw)
-            if head_raw != canonical_bytes(expected_head):
-                raise JournalError("journal head does not match journal chain")
-            return
-
-        if head_raw is not None:
-            empty_head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
-            cls._head_from_raw(head_raw)
-            if head_raw != canonical_bytes(empty_head):
-                raise JournalError("empty journal head is invalid")
+        # Nothing is memoized until the whole suffix has proved valid, so a
+        # rejected read leaves the previously proven prefix exactly as it was.
+        memo.events.extend(new_events)
+        memo.expected.extend(expected_tail)
+        memo.chains = chains_count
+        memo.entry_ids.update(entry_ids)
+        memo.event_hashes.update(event_hashes)
+        memo.chain_hashes.update(chain_hashes)
+        memo.events_raw = events_raw
+        memo.chains_raw = chains_raw
+        return memo
 
     def verified_snapshot(self) -> PersistedJournalSnapshot:
         """Read and verify persisted journal truth without repairing or writing."""
 
         with self._lock():
             events_raw, chains_raw, head_raw = self._persisted_bytes_unlocked()
-            event_values = self._read_lines_from_raw(self.events_path, events_raw)
-            chain_values = self._read_lines_from_raw(self.chain_path, chains_raw)
-            try:
-                events = [validate_journal_envelope(value) for value in event_values]
-            except ValueError as error:
-                raise JournalError(f"journal envelope is invalid: {error}") from error
-            self._validate_persisted_values(events, chain_values, head_raw)
+            verified = self._verified_chain(events_raw, chains_raw, allow_short_chain=False, chain_lines_first=True)
+            events = verified.events
+            if events:
+                if head_raw is None:
+                    raise JournalError("journal head is missing")
+                self._head_from_raw(head_raw)
+                if head_raw != self._head_bytes(events, verified.expected, len(events) - 1):
+                    raise JournalError("journal head does not match journal chain")
+            elif head_raw is not None:
+                self._head_from_raw(head_raw)
+                if head_raw != _EMPTY_HEAD_BYTES:
+                    raise JournalError("empty journal head is invalid")
             return PersistedJournalSnapshot(
                 tuple(row + b"\n" for row in events_raw.split(b"\n")[:-1]),
                 tuple(row + b"\n" for row in chains_raw.split(b"\n")[:-1]),
                 head_raw,
             )
 
-    def _validate_chain_unlocked(self, *, repair_missing: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        events = self._event_values_unlocked()
-        persisted_chains = self._chain_values_unlocked()
-        if len(persisted_chains) > len(events):
-            raise JournalError("journal chain has entries without events")
-        if len(persisted_chains) < len(events) and not repair_missing:
-            raise JournalError("journal chain is incomplete")
-        previous = _EMPTY_CHAIN_SHA256
-        seen_entry_ids: set[str] = set()
-        seen_event_hashes: set[str] = set()
-        seen_chain_hashes: set[str] = set()
-        expected_chains: list[dict[str, Any]] = []
-        for index, event in enumerate(events):
-            event_hash = hashlib.sha256(canonical_bytes(event)).hexdigest()
-            if event["sequence"] != index or event["entry_id"] in seen_entry_ids or event_hash in seen_event_hashes:
-                raise JournalError("journal sequence, entry IDs, or event hashes are not strictly ordered")
-            expected = self._chain_value(event, previous)
-            if index < len(persisted_chains):
-                if canonical_bytes(persisted_chains[index]) != canonical_bytes(expected):
-                    raise JournalError(f"journal chain mismatch at sequence {event['sequence']}")
-            if expected["chain_sha256"] in seen_chain_hashes:
-                raise JournalError("journal chain hashes are not unique")
-            expected_chains.append(expected)
-            seen_entry_ids.add(event["entry_id"])
-            seen_event_hashes.add(event_hash)
-            seen_chain_hashes.add(expected["chain_sha256"])
-            previous = expected["chain_sha256"]
-        if events:
-            head = {"sequence": events[-1]["sequence"], "chain_sha256": previous, "entry_id": events[-1]["entry_id"]}
-        else:
-            head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
-        head_bytes = canonical_bytes(head)
-        empty_head = {"sequence": -1, "chain_sha256": _EMPTY_CHAIN_SHA256, "entry_id": ""}
-        recoverable_head_bytes = [canonical_bytes(empty_head)]
-        recoverable_head_bytes.extend(
-            canonical_bytes(
-                {
-                    "sequence": events[index]["sequence"],
-                    "chain_sha256": expected_chains[index]["chain_sha256"],
-                    "entry_id": events[index]["entry_id"],
-                }
-            )
-            for index in range(len(persisted_chains))
+    @staticmethod
+    def _head_bytes(events: list[dict[str, Any]], expected_chains: list[dict[str, Any]], index: int) -> bytes:
+        return canonical_bytes(
+            {
+                "sequence": events[index]["sequence"],
+                "chain_sha256": expected_chains[index]["chain_sha256"],
+                "entry_id": events[index]["entry_id"],
+            }
         )
+
+    def _validate_chain_unlocked(self, *, repair_missing: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        verified = self._verified_chain(
+            self._raw_unlocked("events.jsonl", self.events_path),
+            self._raw_unlocked("chain.jsonl", self.chain_path),
+            allow_short_chain=repair_missing,
+        )
+        events = verified.events
+        expected_chains = verified.expected
+        persisted_count = verified.chains
+        head_bytes = self._head_bytes(events, expected_chains, len(events) - 1) if events else _EMPTY_HEAD_BYTES
         head_needs_repair = False
         if self.anchor.exists("journal", "head.json"):
             try:
                 raw_head = self.anchor.read_bytes("journal", "head.json")
-                self._head_from_raw(raw_head)
+                head = self._head_from_raw(raw_head)
             except (OSError, StoreError) as error:
                 raise JournalError("journal head is unreadable") from error
-            if raw_head == head_bytes and len(persisted_chains) == len(events):
+            if raw_head == head_bytes and persisted_count == len(events):
                 pass
-            elif repair_missing and raw_head in recoverable_head_bytes:
+            elif repair_missing and self._is_stale_head(raw_head, head, events, expected_chains, persisted_count):
                 head_needs_repair = True
             else:
                 raise JournalError("journal head does not match journal chain")
@@ -395,11 +453,32 @@ class Journal:
 
         # No persistent repair begins until every existing event, chain row,
         # and head has proved either valid or an accepted stale/missing suffix.
-        for expected in expected_chains[len(persisted_chains) :]:
+        for expected in expected_chains[persisted_count:]:
             self.anchor.append_bytes("journal", "chain.jsonl", data=canonical_bytes(expected) + b"\n")
         if head_needs_repair:
-            _atomic_bytes(self.anchor, "journal", "head.json", data=canonical_bytes(head))
-        return events, expected_chains
+            _atomic_bytes(self.anchor, "journal", "head.json", data=head_bytes)
+        return list(events), list(expected_chains)
+
+    @classmethod
+    def _is_stale_head(
+        cls,
+        raw_head: bytes,
+        head: dict[str, Any],
+        events: list[dict[str, Any]],
+        expected_chains: list[dict[str, Any]],
+        persisted_count: int,
+    ) -> bool:
+        """Accept only a head this journal published for an already-chained event.
+
+        Every event's sequence is its index, so the one candidate a head can
+        match is the head of its own declared sequence; comparing that one
+        candidate is the whole recoverable set, without rebuilding it.
+        """
+
+        sequence = head["sequence"]
+        if sequence == -1:
+            return raw_head == _EMPTY_HEAD_BYTES
+        return 0 <= sequence < persisted_count and raw_head == cls._head_bytes(events, expected_chains, sequence)
 
     def reconcile(self) -> dict[str, Any]:
         """Repair only crash-left chain/head suffixes; reject content tampering."""
