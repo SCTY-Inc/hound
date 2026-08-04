@@ -118,13 +118,21 @@ file.
 | D3 | decided 2026-08-04 (Ali) | gmail-newsletters-attachments: **deferred** — no `ingest.file` attachment adapter until something demonstrably needs newsletter attachments as evidence. Lane removed from the inventory closure; re-entry is a new owner decision. |
 | D4 | decided 2026-08-04 (Ali) | helm-external-ingestion: **deferred** — decide with real usage data if/when Wave 5 revives it. Lane removed from the inventory closure; re-entry is a new owner decision. |
 | D5 | decided 2026-08-04 (Ali) | signal-daily: eligibility gate = Pulse's verified terminal token (the dependency rack's existing edge). Transcription for B5 = OpenAI Whisper API. Lane unblocked. |
+| D6 | decided 2026-08-04 (advisor, under Ali's standing idiomatic-default delegation; open to veto) | `ingest.media` PHI regime: **Option A — narrow.** `media_type` exactly `application/octet-stream`; same operator digest-allowlist gate as `ingest.file` (scanner operation set extended by one label, no behavioral change); schema `houndd.media-capture-record.v1`, `artifact.kind="media"`, dedupe `media:<sha256>`. Real `audio/*`/`video/*` MIME types = a future scanner-boundary slice, decided when M4's youtube lane needs it (VISION reserves this expansion explicitly). Also corrected: B4 does NOT depend on B1 — media capture is caller-supplied SOURCE bytes like `ingest.file`, no adapter host involved. |
 
-### Phase M — lane migration (stage order: import_mirror → shadow → migrated → retired)
+### Phase M — lane migration
 
-Each lane fills its nine evidence slots and gets an `approval_ref` from an
-explicit Ali cutover decision (HSP-22). Per-lane checks: baseline scan, shadow
-parity where required, static no-direct-provider, credential-unset run, socket
-use, recovery drill, one full scheduled cycle, legacy paths absent.
+**REPLANNED 2026-08-04 (Ali: "no legacy, full cutover").** The staged
+shadow-parity/per-lane-approval ceremony is dropped. Each lane's driver is
+rewritten to acquire ONLY through `houndd`, proven with one real end-to-end
+run, and its legacy acquisition path deleted in the same change. Rollback
+during transition is `git revert`, not a retained parallel path. Standing
+constraints that survive the replan: tomorrow's scheduled runs (2026-08-04
+morning) execute legacy one final time — no cutover lands inside that window;
+youtube-transcription still needs B4/B5 first; credential boundary unchanged
+(provider keys end up only in houndd's env). The stage ledger records each
+cutover as freeze_contracts → migrated → retired with the real-run evidence;
+shadow stage entries are not required (shadow-required set drops to empty).
 
 | ID | Status | Contract | Proof |
 |---|---|---|---|
