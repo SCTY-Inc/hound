@@ -1,0 +1,130 @@
+{
+  "schema_version": "hound.migration.no-bypass-matrix.v1",
+  "generated_at": "2026-08-04T15:25:00Z",
+  "generated_by": "E1 consolidation agent",
+  "contract": "HSP-18 (VISION.md:1261): static scan plus credential-unset matrix, every migrated consumer either uses the socket or fails closed. HSP-01 (VISION.md:1244): fixture is a migrated consumer with fake provider credential and direct-client imports; assert only the allowlisted houndd adapter reaches the provider and direct/hound_cli paths fail closed.",
+  "hsp_quotes": {
+    "HSP-01": "There is one external-ingestion boundary after cutover: all external search, URL extraction, capture, file/media intake, and transcription goes through houndd-owned adapters and is journaled; hound_cli is repository execution only and is not an acquisition boundary. Fixture: migrated consumer with fake provider credential and direct-client imports. Test/command: static boundary checker plus Unix-socket integration test with the credential unset. Assert: only the allowlisted houndd adapter reaches the provider; direct and hound_cli acquisition paths fail closed. Retain: boundary scan JSON and journal event bundle.",
+    "HSP-18": "No-bypass enforcement statically rejects provider credentials/endpoints/direct clients/prompt direct skills/artifacts without Hound IDs outside the explicit adapter allowlist, with exclusions only for tests/history/local retrieval/health/deploy/publish; dynamic tests run every migrated consumer with credentials unset. Fixture: positive forbidden-pattern corpus, allowed houndd adapter corpus, and every migrated consumer. Test/command: static scan plus credential-unset matrix. Assert: forbidden consumers fail the scan, allowlisted adapters pass, exclusions are limited to the stated set, and every consumer either uses the socket or fails closed. Retain: scan findings, exclusion manifest, and consumer matrix."
+  },
+  "method": {
+    "summary": "Two independent proofs per HSP-18: (1) a live credential-unset run against an ephemeral keyless houndd for every migrated lane pattern, re-run fresh for this consolidation rather than only citing the cutover-time proofs; (2) a static scan of the whole workspace for provider indicators outside the houndd seam.",
+    "live_proof": {
+      "daemon": "ephemeral houndd at current HEAD, state root and Unix socket under scratch (not the production state root, not houndd.service)",
+      "credential_unset": "houndd serve launched via `env -u EXA_API_KEY -u FIRECRAWL_API_KEY -u FIRECRAWL_ENDPOINT -u OPENAI_API_KEY -u DEEPGRAM_API_KEY -u GOOGLE_APPLICATION_CREDENTIALS`; houndd.adapter_host.AdapterHost.from_env snapshots ADAPTER_ENV_KEYS = (EXA_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_ENDPOINT, OPENAI_API_KEY) once at process start, so ingest.search/ingest.url/transcribe have no registered adapter for the whole process lifetime -- this is a true keyless daemon, not a per-request credential check that could race.",
+      "policy": "generated via `uv run python -m migration.check_policy --emit` from migration/consumer-inventory.v1.json + migration/policy_overlay.v1.json (the same generator GOALIE.md's federation-root-fix task produces the live policy from) -- not hand-written -- copied verbatim into migration/evidence/e1/policy-used.json. Grants each lane owner (gc-benefits, gc-web, gc-wiki, gc-intel) ingest.search/ingest.url/record.get/journal.query on their own producer scope, matching the inventory's target_ops per acquisition lane.",
+      "phi_clear_manifest": "one deliberate entry for a throwaway local fixture (used only to mint a real capture record for the transcribe proof); every other byte sequence, including the separate source_refused fixture, has no matching (sha256, media_type, encoding) tuple and is scanned as 'suspected' -> source_refused.",
+      "state_hygiene": "production state root (~/.local/state/hound) and houndd.service were never touched -- confirmed empty/untouched after teardown; daemon killed and socket removed at the end of the run."
+    },
+    "static_scan": "uv run python -m migration.check_domain_ownership --workspace /home/deploy --json, output saved verbatim to migration/evidence/e1/ownership-scan.json."
+  },
+  "lanes": [
+    {
+      "lane": "benefits-radar",
+      "owner": "gc-benefits",
+      "wave": 2,
+      "cutover_commit": {"repo": "repos/givecare/gc-benefits", "sha": "abffd8976543f88ba70412f939dac153b727dd39", "subject": "feat(automation): cut radar acquisition over to houndd", "date": "2026-08-03T18:26:31Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M2 (M2 complete 2026-08-04: both Wave-2 lanes live on houndd, benefits-radar since abffd89; live proof included in the shared full evidence-stage cycle: 8 searches, 128 leads, 20 captures, 0 failures, 19 retained; cutover-time credential-unset acceptance criterion: 'One real run per lane, credential-unset, correct bb terminal tokens')",
+      "credential_unset_proof": {
+        "run_at": "2026-08-04T15:20Z",
+        "what_ran": "hound-research ingest search --owner-id gc-benefits --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd",
+        "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.25, "journaled": true},
+        "classification": "degraded (adapter_absent) -- fails closed, does not hang, does not reach the network, and still commits a durable degraded evidence record rather than silently dropping the request",
+        "evidence_files": ["migration/evidence/e1/raw/gc-benefits-search.json"]
+      }
+    },
+    {
+      "lane": "pulse",
+      "owner": "gc-web",
+      "wave": 2,
+      "cutover_commit": {"repo": "repos/givecare/gc-web", "sha": "6fb4ac98645664568c2f1138d3900c0d5d8abfba", "subject": "feat(pulse): acquire only through houndd, delete the direct-provider path", "date": "2026-08-04T04:13:31Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M2 (pulse merged 6fb4ac9 + fixes 1475e6d/dbfb1f0, both shadow timers deleted, bb contract updated; defects found+fixed during live proof: bb held-answer object-vs-string normalization, hound_research 5s->180s commit / 60s read timeout fix, non-deterministic acquisition run IDs -> pulse-<date> v3 key namespace)",
+      "credential_unset_proof": {
+        "run_at": "2026-08-04T15:20Z",
+        "what_ran": "hound-research ingest search --owner-id gc-web --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd (gc-web is the shared owner for both pulse and civic-policy-radar; one owner-level proof covers both lanes' acquisition path)",
+        "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.28, "journaled": true},
+        "classification": "degraded (adapter_absent) -- fails closed, no hang, no direct network reach",
+        "evidence_files": ["migration/evidence/e1/raw/gc-web-search.json"]
+      }
+    },
+    {
+      "lane": "civic-policy-radar",
+      "owner": "gc-web",
+      "wave": 3,
+      "cutover_commit": {"repo": "repos/givecare/gc-web", "sha": "2b94dbdd9425fa7ba8d97b5b4c8453e1c9ab08be", "subject": "Merge Care Policy Radar cutover: acquisition via houndd only", "date": "2026-08-04T11:14:15Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M3 (civic-policy-radar: gc-web 20ef28f/2b94dbd -- Civic CLI acquisition replaced by houndd, corpus.propose provider-key env_allowlist deleted, human-gated apply path untouched; 17/17 policy tests + verify-policy-hound-only green post-merge)",
+      "credential_unset_proof": {
+        "run_at": "2026-08-04T15:20Z",
+        "what_ran": "shares the gc-web owner-level credential-unset proof above (same policy grant, same owner_id, same houndd process) -- see the pulse row for the raw response",
+        "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.28, "journaled": true},
+        "classification": "degraded (adapter_absent), covered by the gc-web owner proof",
+        "evidence_files": ["migration/evidence/e1/raw/gc-web-search.json"],
+        "note": "GOALIE.md M3 also records an incident during test iteration where 6 un-faked legacy tests reached the production socket and committed 4 real gc-web entries (run policy-2026-07-21, 10:59Z) -- bounded spend, root-caused, all corpus.propose tests now inject fakes; not a no-bypass violation of the shipped cutover, but retained here for traceability since it is the same owner/lane."
+      }
+    },
+    {
+      "lane": "wiki-refresh",
+      "owner": "gc-wiki",
+      "wave": 3,
+      "cutover_commit": {"repo": "repos/givecare/gc-wiki", "sha": "318872818281c359d3ef765d17c06cf3129537b3", "subject": "feat(refresh-wiki): acquire only through houndd, fix the missing gap-input contract", "date": "2026-08-04T10:55:42Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M3 (wiki-refresh: gc-wiki 3188728 -- REFRESH_FAILED root-caused as undeclared gap-signal inputs, fixed with a two-tier signal: live coverage holes, else deterministic weekly rotation; live proof: completed gc-wiki search, 8 real leads)",
+      "credential_unset_proof": {
+        "run_at": "2026-08-04T15:20Z",
+        "what_ran": "hound-research ingest search --owner-id gc-wiki --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd",
+        "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.30, "journaled": true},
+        "classification": "degraded (adapter_absent) -- fails closed. Distinct from the REFRESH_FAILED contract bug GOALIE.md records for wiki-refresh: that was a missing gap-signal input at the lane-manifest layer (fixed pre-cutover), not a credential-unset behavior; this proof re-confirms the fixed lane still fails closed with no credentials.",
+        "evidence_files": ["migration/evidence/e1/raw/gc-wiki-search.json"]
+      }
+    },
+    {
+      "lane": "intel-refresh",
+      "owner": "gc-intel",
+      "wave": 3,
+      "cutover_commit": {"repo": "repos/givecare/gc-intel", "sha": "c782f49fed30621ef8fcf26c2681188a510965a0", "subject": "Cut intel-refresh acquisition over to houndd-only ingest", "date": "2026-08-04T10:48:00Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M3 (intel-refresh: gc-intel c782f49 -- runbook-level swap, no new conductor; live wire proof completed)",
+      "credential_unset_proof": {
+        "run_at": "2026-08-04T15:20Z",
+        "what_ran": "hound-research ingest search --owner-id gc-intel --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd",
+        "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.24, "journaled": true},
+        "classification": "degraded (adapter_absent) -- fails closed",
+        "evidence_files": ["migration/evidence/e1/raw/gc-intel-search.json"]
+      }
+    }
+  ],
+  "cross_lane_operation_proofs": {
+    "note": "transcribe and ingest.file/media are shared houndd capabilities exercised by radar-curation / youtube-transcription (not yet migrated -- GOALIE.md task #7/W4, blocked_contract) and by any migrated lane that later adds media intake. Proven once here at the daemon level since the fail-closed mechanism (adapter_host env snapshot; PHI clear-manifest scan) is lane-agnostic, not per-owner code.",
+    "transcribe": {
+      "what_ran": "committed one real ingest.media capture record (owner 'research operator', clear-manifest-covered fixture, to obtain a legitimate 64-hex capture_id), then hound-research transcribe --capture-id <that id> against the same OPENAI_API_KEY-unset daemon",
+      "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.23, "journaled": true},
+      "classification": "degraded (adapter_absent) -- no OpenAI key, fails closed, no hang",
+      "evidence_files": ["migration/evidence/e1/raw/media-commit.json", "migration/evidence/e1/raw/transcribe.json"]
+    },
+    "ingest_file_media_source_refused": {
+      "what_ran": "hound-research ingest file with a fresh local fixture whose sha256 has no entry in the frozen phi-clear.json manifest (owner 'ali', operator's own ingest.file grant)",
+      "observed": {"ok": false, "outcome": "invalid", "exit_code": 2, "error": {"code": "source_refused", "retryable": false}},
+      "classification": "source_refused -- the 3C1 clear-manifest gate fails closed for any file/media source without a pre-declared, byte-exact clear-manifest entry; this is independent of credentials (it is the PHI/provenance gate, not the adapter-presence gate) and is retained here because the task asked for one file/media source_refused proof",
+      "evidence_files": ["migration/evidence/e1/raw/ingest-file-refused.json"]
+    }
+  },
+  "static_scan_summary": {
+    "command": "uv run python -m migration.check_domain_ownership --workspace /home/deploy --json",
+    "output_file": "migration/evidence/e1/ownership-scan.json",
+    "total_errors_in_report": 1970,
+    "scanner_infrastructure_failures": 1905,
+    "scanner_infrastructure_failures_breakdown": "1904 'uses symlink' (pnpm .pnpm/node_modules trees across repos/workpad, repos/web-*, etc -- the scanner's own symlink-safety refusal, not a finding about code) + 1 'exceeds 100000 entries' (repos/web-draw/frontend/node_modules/lucide-react/dist/esm/icons directory-size guard)",
+    "real_ownership_violations": 65,
+    "real_ownership_violations_in_five_cutover_repos_lane_code": 0,
+    "real_ownership_violations_classification": "All 65 hits are 'domain repo path ... holds evidence-mechanics indicator(s) ... outside the allowed hound seams (HSP-19)' findings entirely outside repos/givecare/gc-benefits, repos/givecare/gc-web, repos/givecare/gc-wiki, repos/givecare/gc-intel, and repos/givecare/gc-sms lane/acquisition code. They cluster in: agents/_skills/{firecrawl,lead-gen,research,scrapecreators,gws,x-twitter,dev-browser,atelier,diagram-design,lab-context,ship,hound,givecare-live-ops,maintainer,pulse}/** (skill docs, scripts, and reference material for tools those skills operate directly, outside Hound's remit), agents/.agents/*.md and agents/agent-{mira,orb}/** (retired/archived agent planning notes), agents/helm/** (helm's own ingest/log tooling, out of Hound's HSP-19 lane scope), agents/scripts/givecare_email_router.py + givecare_newsletter_ingest.py (Gmail-client indicator, a separate ingestion surface not migrated to Hound), agents/brands/givecare/atelier/*.md and agents/content/**, and repos/web-draw, repos/web-links, repos/web-scty, repos/web-snacklab (all 'playwright-skill' token hits inside package-lock.json/eslint config/gitignore/AGENTS.md prose -- literal string 'playwright' in dependency manifests and docs, not an acquisition-path violation).",
+    "verdict": "No provider-credential, SDK, endpoint, client, or prompt-skill-acquisition indicator appears in any of the five cutover repos' acquisition files (the exact scan_roots GOALIE.md's M2/M3 rows and consumer-inventory.v1.json declare for benefits-radar, pulse, wiki-refresh, intel-refresh, civic-policy-radar). Static HSP-19/HSP-18 boundary holds for every migrated lane; the 65 real hits are pre-existing, unrelated tooling (skills, archives, other web-* repos) that this goal's scope does not cover."
+  },
+  "matrix_verdict": {
+    "all_five_lanes_credential_unset_proven": true,
+    "classification_summary": "5/5 lanes proven degraded-not-hang via a fresh live proof against an ephemeral keyless houndd (4 owner-level runs, gc-web covering both pulse and civic-policy-radar); transcribe and ingest.file/media proven degraded and source_refused respectively at the daemon level.",
+    "static_scan_clean_for_lane_code": true,
+    "deviations_from_the_contract": [
+      "the transcribe proof required minting one real capture record first (transcribe rejects an unresolvable capture_id with outcome 'invalid' before ever reaching the adapter-presence check, per houndd/commit_runtime.py's _resolve_capture ordering) -- this needed one phi-clear.json entry for a throwaway fixture, which is why the phi_clear_manifest is not fully empty; every other byte sequence in the run, including the dedicated source_refused fixture, has no matching entry and was refused as designed",
+      "consumer-inventory.v1.json still shows stage 'freeze_contracts' / status 'legacy_path_active' for all 12 rows even though GOALIE.md records M2/M3 as complete -- the inventory has not yet been bumped to 'migrated' (that is GOALIE task #8, Stage ledger, tracked separately and out of this E1 contract's file ownership); this matrix cites GOALIE.md and verified git SHAs directly rather than the stale inventory stage field",
+      "did not attempt a live proof for radar-curation or youtube-transcription (owners 'GiveCare root' / 'research operator') as full lane cutovers -- both are still pending in GOALIE.md (task #7, W4 blocked_contract) and outside E1's five named lanes; the transcribe/ingest.media/ingest.file proofs above exercise the same daemon-level mechanism those lanes will depend on once cut over"
+    ]
+  }
+}
