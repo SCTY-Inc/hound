@@ -85,7 +85,7 @@ MATCH_FIELDS = frozenset({"kind", "value"})
 MATCH_KINDS = frozenset({"literal", "token"})
 MAX_SCAN_BYTES = 1_048_576
 MAX_LINE_BYTES = 16_384
-CANONICAL_ROW_DIGEST = "3c63daa5f53b4b3a17e3b4c498545d77f6ea7bb0faf6d0046fd3c854ece3b8b9"
+CANONICAL_ROW_DIGEST = "1b25a6ea9ea9253dd5fcf3b729757e5d37b28c6dcc9d1d830cfdb8f3e450d697"
 CANONICAL_CATALOG_DIGEST = "c319e49bae8dc4450a904e44fe08b397a93be1778cd0fbde6ef85b66323b6ca4"
 MAX_CATALOG_BYTES = 65_536
 MAX_INVENTORY_BYTES = 1_048_576
@@ -301,7 +301,7 @@ def validate_inventory(inventory: object, *, require_paths: bool = False, worksp
     expected_ids = {
         "pulse", "benefits-radar", "wiki-refresh", "intel-refresh", "civic-policy-radar",
         "radar-curation", "manual-web", "manual-x", "youtube-transcription",
-        "atelier-entity-discovery", "signal-daily", "workpad-intake-ledger", "gc-gtm-crm",
+        "signal-daily", "workpad-intake-ledger", "gc-gtm-crm",
     }
     seen: set[str] = set()
     stage_status = {

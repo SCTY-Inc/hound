@@ -825,7 +825,7 @@ def test_every_authoritative_row_field_has_exact_canonical_closure(field: str) -
 
 def test_checked_in_rows_are_all_null_baseline_freeze_contracts() -> None:
     rows = _manifest()["consumers"]
-    assert len(rows) == 13
+    assert len(rows) == 12
     assert all(row["stage"] == "freeze_contracts" and row["approval_ref"] is None for row in rows)
     assert all(all(value is None for value in row["evidence"].values()) for row in rows)
 

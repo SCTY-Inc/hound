@@ -361,41 +361,6 @@
       "approval_ref": null
     },
     {
-      "id": "atelier-entity-discovery",
-      "kind": "acquisition",
-      "owner": "Atelier",
-      "cadence_category": "event-driven",
-      "cadence_authority": "Atelier",
-      "contract_ref": "agents/brands/givecare/atelier/pulse-influencer-discovery.md",
-      "scan_roots": [
-        "agents/brands/givecare/atelier/pulse-influencer-discovery.md"
-      ],
-      "legacy_paths": [
-        "agents/brands/givecare/atelier/pulse-influencer-discovery.md"
-      ],
-      "target_ops": [
-        "ingest.search",
-        "ingest.url"
-      ],
-      "blocked_reason": null,
-      "wave": 5,
-      "stage": "freeze_contracts",
-      "status": "legacy_path_active",
-      "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
-      "evidence": {
-        "baseline_scan": null,
-        "stage_ledger": null,
-        "parity": null,
-        "static_no_direct_provider": null,
-        "credential_unset": null,
-        "unix_socket": null,
-        "recovery_drill": null,
-        "full_cycle": null,
-        "legacy_absent": null
-      },
-      "approval_ref": null
-    },
-    {
       "id": "signal-daily",
       "kind": "consumer_only",
       "owner": "GiveCare root",
