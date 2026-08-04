@@ -85,7 +85,14 @@ def exit_code(response: dict[str, Any]) -> int:
     return {400: 2, 404: 3, 503: 5}[status]
 
 
-def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = 5) -> dict[str, Any]:
+# A commit is synchronous: the daemon runs the provider exchange (search or a
+# full page extraction) inside the request, so this bounds a provider round
+# trip plus queueing behind one, not an IPC hop. 5s here caused spurious
+# "houndd is unavailable" failures on every extraction slower than 5s.
+COMMIT_EXCHANGE_TIMEOUT_SECONDS = 180
+
+
+def exchange(socket_path: Path, request: dict[str, Any], *, timeout: float = COMMIT_EXCHANGE_TIMEOUT_SECONDS) -> dict[str, Any]:
     if not socket_path.is_absolute():
         raise CommitClientError("commit socket must be absolute")
     body = request.get("body") if type(request) is dict else None
