@@ -21,7 +21,12 @@ jobs:
           enable-cache: true
       - run: uv python install 3.12
       - run: uv sync --locked
-      - run: uv run pytest -q
+      # The HSP-21 acceptance gate. It validates migration/acceptance.v1.json
+      # against the repository, then runs the full suite and every CI-safe
+      # migration checker the manifest names, so this one command is the
+      # acceptance command GOALIE E6 requires.
+      - name: Acceptance (manifest + suites + migration checkers)
+        run: uv run python migration/check_acceptance.py --run-tests
       - run: uv build
       - name: Smoke-test the built wheel
         run: |

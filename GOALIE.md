@@ -108,7 +108,7 @@ file.
 
 | ID | Status | Contract | Proof |
 |---|---|---|---|
-| C1 | pending | Workpad renders the intake-ledger view read-only (server side already live). Depends W1. | Workpad shows chronological redacted rows; no write/approve/dereference path exists. |
+| C1 | complete (2026-08-04, workpad 3d2e7e7 + 1cea79e/7e93700: intake-ledger view live at review.givecareapp.com/workpad, newest-first + filters, read-only/metadata-only pinned by four static-inspection absence tests — one GET endpoint, no write/approve/dereference affordance, only the nine projected fields, no error-body rendering. Proof lives in the workpad repo's suite.) | Workpad renders the intake-ledger view read-only. | Absence tests green in repos/workpad (cross-repo evidence). |
 | C2 | pending | Reference consumer pattern: per-lane cursor state file + replay discipline + how-to doc (Diátaxis how-to). | A sample consumer replays a cursor across a service restart without loss or duplicates. |
 
 ### Phase D — owner decisions (Ali; each unblocks its lane)

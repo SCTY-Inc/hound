@@ -1,17 +1,782 @@
 {
-  "schema_version": "hound.migration.acceptance.v1",
-  "status": "partial_hsp_coverage",
-  "partial_hsps": ["HSP-13"],
-  "no_new_claim_hsps": ["HSP-15"],
-  "regression_only_hsps": ["HSP-18"],
-  "hsp18_mode": "baseline_only_regression",
-  "claims": {
-    "HSP-13": "inventory schema, exact audited IDs, ownership, paths, targets, and baseline report",
-    "HSP-18": "catalog/checker regression for baseline attribution and forbidden-indicator detection only; no no-bypass completion is claimed"
+ "schema_version": "hound.migration.acceptance.v1",
+ "goal": "GOALIE.md E6 / VISION.md HSP-21: every VISION.md HSP acceptance row claimed exactly once, with named on-disk evidence, one-to-one artifact traceability, and one acceptance command that fails on any missing, duplicated, unordered, or over-claimed row.",
+ "acceptance_command": "uv run python migration/check_acceptance.py --run-tests",
+ "test_command": "python -m pytest -p no:cacheprovider -q",
+ "traceability_scope": {
+  "note": "One-to-one traceability is enforced over proof artifacts, not implementation modules. Every path matching the globs below must be owned by exactly one row (as a `tests` or `evidence` entry); a row may also cite another row's artifact under `supporting`, which is never ownership. The globs must end in `**/*`, not `**`: pathlib's `**` matches directories only, so a `migration/evidence/**` glob silently matches zero files and disables the orphan check entirely.",
+  "globs": [
+   "tests/test_*.py",
+   "tests/generate_*.py",
+   "tests/verify_*.py",
+   "tests/slice3a_evidence_capture.py",
+   "tests/acceptance_*.json",
+   "tests/evidence/**/*",
+   "migration/*.py",
+   "migration/*.json",
+   "migration/evidence/**/*"
+  ],
+  "excluded": [
+   "src/**/*",
+   "tests/conftest.py",
+   "tests/__init__.py",
+   "tests/fixtures/**/*",
+   "tests/golden/**/*",
+   "migration/__init__.py"
+  ],
+  "src_exclusion_reason": "HSP-21 asks that every implementation artifact trace to exactly one row. That is not honestly achievable for src/: the sealed slice manifests already assign the same module to different rows (src/houndd/journal.py is HSP-05 in tests/acceptance_slice1.json and HSP-20 in tests/acceptance_slice3a.json; src/houndd/cursor.py is HSP-20 in slice2a and HSP-08 in slice3a), because a module genuinely serves several acceptance rows. Forcing a single owner per module would be an invention, so this manifest claims one-to-one over proof artifacts only and records the residual gap under HSP-21's `missing`."
+ },
+ "summary": {
+  "total": 22,
+  "complete": 14,
+  "partial": 8,
+  "open": 0
+ },
+ "rows": [
+  {
+   "id": "HSP-01",
+   "vision_line": 1244,
+   "status": "partial",
+   "claim": "One external-ingestion boundary after cutover: all external search, URL extraction, capture, file/media intake, and transcription goes through houndd-owned adapters and is journaled; hound_cli is repository execution only.",
+   "tests": [
+    "tests/test_lane_run.py",
+    "tests/test_cli_ingest_web.py",
+    "tests/test_web_adapter_cli.py"
+   ],
+   "evidence": [
+    "migration/evidence/e1/no-bypass-matrix.json"
+   ],
+   "commands": [
+    {
+     "command": "python -m pytest -p no:cacheprovider -q tests/test_lane_run.py tests/test_cli_ingest_web.py tests/test_web_adapter_cli.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "migration/evidence/e1/raw/",
+    "tests/test_migration_inventory.py"
+   ],
+   "assertions": [
+    "the stateless lane runner and hound-research ingest commands reach providers only through the houndd socket",
+    "five live lanes (benefits-radar, pulse, civic-policy-radar, wiki-refresh, intel-refresh) ran with provider credentials unset and degraded rather than hung or bypassed",
+    "transcribe and ingest.file/media fail closed (degraded / source_refused) at the daemon level with no key present"
+   ],
+   "missing": [
+    "radar-curation and youtube-transcription have not been cut over (GOALIE M4 / task #7, blocked on B5's transcript-representation decision D10), so the boundary is proven for 5 of the 7 acquisition lanes, not all of them",
+    "the inventory now tracks the ledger (benefits-radar migrated, pulse shadow, wiki/intel/civic import_mirror, 7 rows still freeze_contracts as of d23f53f), but the credential-unset proof itself is the E1 matrix artifact from a live atum run, not a repeatable CI suite; nothing in CI re-proves the boundary for a live lane"
+   ],
+   "deviations": []
   },
-  "completion": {
-    "migration_inventory": "migration/consumer-inventory.v1.json",
-    "provider_indicator_catalog": "migration/provider-indicators.v1.json",
-    "checker": "migration/check_consumer_inventory.py"
+  {
+   "id": "HSP-02",
+   "vision_line": 1245,
+   "status": "complete",
+   "claim": "The proof kernel preserves existing hound_cli semantics, legacy record IDs, hashes, exact bytes, guarded-write checks, and verification, and gains no domain logic, scheduler, lineage service, central queue, or approval DB.",
+   "tests": [
+    "tests/test_orchestrator.py",
+    "tests/test_runtime.py",
+    "tests/test_cli.py",
+    "tests/test_contracts.py",
+    "tests/test_primitive_evaluator.py",
+    "tests/test_family_suv_watch.py",
+    "tests/test_web_runtime.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_orchestrator.py tests/test_runtime.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_domain_ownership.py"
+   ],
+   "assertions": [
+    "golden config-migration and legacy run directories reproduce exact effects, run verification, and unchanged legacy hashes/bytes",
+    "the orchestrator gains no scheduler, lineage service, queue, or approval store"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-03",
+   "vision_line": 1246,
+   "status": "complete",
+   "claim": "Slice 3B is future-facing partial coverage only: foreground houndd serve, exactly GET /v1/journal, /v1/health, /v1/ready over local AF_UNIX SOCK_STREAM with wire houndd.uds.v1, one length-prefixed canonical-JSON request/response per connection, no HTTP/TCP/remote/provider transport, strict read envelopes, XDG defaults, owner-only permissions, exits 0/2/3/5.",
+   "tests": [
+    "tests/test_slice3b_service.py",
+    "tests/test_slice3b_hostile.py",
+    "tests/test_slice3b_observations.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_slice3b_service.py tests/test_slice3b_hostile.py tests/test_slice3b_observations.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/acceptance_slice3b.json",
+    "tests/evidence/slice3b/"
+   ],
+   "assertions": [
+    "the only Slice 3B public routes and envelope fields are exact",
+    "invalid framing/path/body fails as specified and pure reads retain no result state",
+    "defaults/overrides preserve identity; no scheduler or alternate transport starts",
+    "all Slice 3B claims remain partial and are sealed to one commit in tests/acceptance_slice3b.json"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-04",
+   "vision_line": 1247,
+   "status": "complete",
+   "claim": "The immutable journal envelope contains exactly the required fields and omits summary, priority, status, next_action, approval, CRM/wiki claims, and domain tags from canonical truth.",
+   "tests": [
+    "tests/test_hsp04_contract.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp04_contract.py",
+     "ci": true
+    }
+   ],
+   "supporting": [],
+   "assertions": [
+    "required field set, value domains, hashes, and the omission set match the contract for every artifact kind",
+    "unknown usage is omitted rather than persisted"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-05",
+   "vision_line": 1248,
+   "status": "complete",
+   "claim": "Provider attempts are durable, outcome-record and journal-event publication is logically crash-recoverable, idempotency keys make retries one commit, non-completed outcomes are durable with logical 200/ok:false and CLI exit 4, and every specified crash point recovers without duplicate or orphan truth.",
+   "tests": [
+    "tests/test_hsp05_transactions.py",
+    "tests/test_slice3c1_commit_runtime.py",
+    "tests/test_slice3c2_adapter_commit.py",
+    "tests/test_b4_media_capture.py",
+    "tests/test_web_adapters.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp05_transactions.py tests/test_slice3c1_commit_runtime.py tests/test_slice3c2_adapter_commit.py tests/test_b4_media_capture.py tests/test_web_adapters.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_e5_fault_matrix.py",
+    "tests/test_b5_transcribe.py"
+   ],
+   "assertions": [
+    "an exact finalized replay returns the original response without source I/O, new state, attempt, or event",
+    "any changed bound request field, digest, or length is a 400 collision; incomplete/noncanonical/tampered reservation state is 503",
+    "accepted attempts produce exactly one attempt, one outcome record, and one journal event",
+    "process kill at every commit point recovers exactly once without reinvoking the provider; no provider retry exists"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-06",
+   "vision_line": 1249,
+   "status": "complete",
+   "claim": "Search, extract, capture, import, and transcription lineage is exact and durable; ingest.media creates an authorized immutable capture ID and transcription records name that origin media, model/provider/version, language, segment/timing hashes, text hash, status, and source lineage, with partial/failed/degraded/refused/interrupted explicit and PHI-free.",
+   "tests": [
+    "tests/test_slice3c1_contract_source_phi.py",
+    "tests/test_b5_transcribe.py",
+    "tests/test_b13_search_options.py",
+    "tests/test_source.py",
+    "tests/test_evidence.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_slice3c1_contract_source_phi.py tests/test_b5_transcribe.py tests/test_b13_search_options.py tests/test_source.py tests/test_evidence.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_b4_media_capture.py",
+    "tests/test_hsp14_legacy_portability.py"
+   ],
+   "assertions": [
+    "transcribe accepts only an authorized, rehashing, blob-verified media-capture ID and refuses absent/out-of-scope/wrong-kind/near-miss IDs indistinguishably, before any reservation, attempt, record, event, or provider call",
+    "every lineage edge and hash resolves; ambiguous lineage fails closed before acceptance",
+    "no transcription lacks its capture or emits PHI; the transcript record carries hashes and policy-safe provenance only",
+    "ingest.search options are additive and retained in records without breaking old-record compatibility"
+   ],
+   "missing": [],
+   "deviations": [
+    "D10 (GOALIE, OPEN): the PHI regime means consumers get no transcript text from hound. Lineage is complete and proven; text-consuming lanes (radar-curation, youtube-transcription) have no representation to consume and are tracked under HSP-01's missing list, not here."
+   ]
+  },
+  {
+   "id": "HSP-07",
+   "vision_line": 1250,
+   "status": "complete",
+   "claim": "Every occurrence remains a distinct event; equal blobs may share storage; object_key groups revisions; content_sha256 identifies bytes; URL dedupe is never destructive.",
+   "tests": [
+    "tests/test_hsp07_dedupe.py",
+    "tests/test_slice3c2_store_compat.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp07_dedupe.py tests/test_slice3c2_store_compat.py",
+     "ci": true
+    }
+   ],
+   "supporting": [],
+   "assertions": [
+    "concurrent same-content captures from two providers produce distinct entry/record identities with a shared blob only on exact byte match",
+    "no URL occurrence is deleted; concurrent dedupe keys are safe",
+    "stores written by the 3C1-era daemon still recover"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-08",
+   "vision_line": 1251,
+   "status": "complete",
+   "claim": "journal query / GET /v1/journal has the specified ANDed filter families, chronological canonical-event results, no totals or snippets, the documented partial intake-ledger.v1 view as the sole projection exception, filter_not_available for lane/topic/entity, fresh cursorless high-watermarks, opaque cursors binding generation/filter hash/principal/last sequence/original high-watermark, and no retained query, delivery, acknowledgement, subscriber, or pure-read result state.",
+   "tests": [
+    "tests/test_hsp08_cursor.py",
+    "tests/test_hsp08_durable_query.py",
+    "tests/test_hsp08_query_contracts.py",
+    "tests/test_hsp08_query_engine.py",
+    "tests/test_b14_descending_query.py",
+    "tests/test_hound_client.py",
+    "tests/test_consumer_replay.py",
+    "tests/test_intake_ledger_projection.py",
+    "tests/test_cli_read_routes.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp08_cursor.py tests/test_hsp08_durable_query.py tests/test_hsp08_query_contracts.py tests/test_hsp08_query_engine.py tests/test_b14_descending_query.py tests/test_hound_client.py tests/test_consumer_replay.py tests/test_intake_ledger_projection.py tests/test_cli_read_routes.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/evidence/slice3a/"
+   ],
+   "assertions": [
+    "filters, ordering, fresh cursorless high-watermarks and preserved cursor high-watermarks are exact",
+    "the optional descending order is additive: legacy cursors keep their digest domain and cross-order reuse is rejected by filter-hash domain separation",
+    "the reference consumer replays across a service restart without loss or duplication and hound holds no subscriber state",
+    "the intake-ledger view returns only its allowlisted authorized-row projection with the view bound into the cursor context"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-09",
+   "vision_line": 1252,
+   "status": "complete",
+   "claim": "The certified Linux principal is exactly linux-uid:<decimal uid> from accepted-socket SO_PEERCRED before request evaluation; the frozen houndd.policy.v1 selects exactly one caller-supplied policy ID without unions; grants intersect the requested_access ceiling; authorization precedes every source/record/provider access; denial or absent protected target is generic 404, policy integrity/change/recovery is 503.",
+   "tests": [
+    "tests/test_hsp09_access.py",
+    "tests/test_hsp09_query_authorization.py",
+    "tests/test_slice3c1_service_authz.py",
+    "tests/test_slice3d_read_routes.py",
+    "tests/test_policy_generator.py"
+   ],
+   "evidence": [
+    "migration/evidence/e1/policy-used.json",
+    "migration/policy_generator.py",
+    "migration/check_policy.py",
+    "migration/policy_overlay.v1.json"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp09_access.py tests/test_hsp09_query_authorization.py tests/test_slice3c1_service_authz.py tests/test_slice3d_read_routes.py tests/test_policy_generator.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_slice3b_hostile.py"
+   ],
+   "assertions": [
+    "exact principal formation and non-override by PID, GID, environment, or request claims; unsigned SO_PEERCRED uids decode correctly",
+    "one-policy selection with no unions, ceiling intersection on the commit path, 404 versus 503 distinction, fail-closed policy replacement",
+    "zero protected metadata/count/cursor/result leakage across principals",
+    "the live policy is byte-reproducible from the inventory plus overlay, so hand edits and inventory drift are detectable"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-10",
+   "vision_line": 1253,
+   "status": "partial",
+   "claim": "Workpad remains the human-readable proposal/review surface; plus/amplify is only an immutable preference annotation; Ali makes the exact decision; decisions.jsonl is audit only; the native owner gate alone applies; receipt and outcome remain distinct.",
+   "tests": [
+    "tests/test_approvals.py"
+   ],
+   "evidence": [
+    "migration/approvals.py"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_approvals.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "migration/check_approvals.py"
+   ],
+   "assertions": [
+    "an annotation cannot fan out, approve, apply, publish, contact, execute, or queue, and an edited annotation fails its hash",
+    "decisions.jsonl alone cannot gate: a tampered body, spliced entry, forged entry hash, truncated line, or sequence mismatch is rejected",
+    "the native gate validates exact receipt subject-artifact hashes; a receipt is an open gate until a decision names it",
+    "receipt, decision, and outcome are three distinct records"
+   ],
+   "missing": [
+    "the Workpad read-only surface IS built and pinned (repos/workpad src/intake-ledger-client.test.ts: one GET endpoint, no write/approve/dereference affordance, nine projected fields only, no error-body rendering) \u2014 but that proof lives in the workpad repo's suite, outside this repo's CI closure, so this row cannot cite it as a runnable artifact here (cross-repo evidence, same class as the approval-walk workspace caveat)",
+    "no annotation record exists in migration/approvals/: the plus/amplify preference clause of this row is proven only against synthetic fixtures, while the receipt and decision clauses now have one real record each"
+   ],
+   "deviations": []
+  },
+  {
+   "id": "HSP-11",
+   "vision_line": 1254,
+   "status": "complete",
+   "claim": "Observability exposes provider errors, spend, freshness, capture completeness, dedupe rate, consumer lag, unprocessed demand, and journal/index/recovery health without protected data.",
+   "tests": [
+    "tests/test_b7_telemetry.py"
+   ],
+   "evidence": [
+    "tests/evidence/b7/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_b7_telemetry.py",
+     "ci": true
+    }
+   ],
+   "supporting": [],
+   "assertions": [
+    "every named signal is present and numerically consistent with the fixture (tests/evidence/b7/consistency-report.json)",
+    "metrics are access-filtered per policy partition and leak nothing across partitions",
+    "the retained snapshot carries no credentials, PHI, or snippets",
+    "a broken snapshot is 503 like every other aggregate read"
+   ],
+   "missing": [],
+   "deviations": [
+    "consumer_lag is reported as projection lag, not subscriber lag: HSP-08 forbids hound holding subscriber state, so true consumer lag is unknowable inside the daemon. Deviation accepted and recorded in GOALIE B7.",
+    "VISION is silent on the telemetry surface; GET /v1/telemetry was chosen in the B6 route pattern and flagged as a choice rather than a contract.",
+    "tests/evidence/b7/telemetry-snapshot.json is rewritten by tests/test_b7_telemetry.py on every run (its generated_at and freshest_capture_at move), so it leaves the working tree dirty after any suite run and is a regenerated byproduct rather than a frozen retained artifact in the sense the HSP rows use. The consistency report it is checked against is the stable part."
+   ]
+  },
+  {
+   "id": "HSP-12",
+   "vision_line": 1255,
+   "status": "complete",
+   "claim": "Failure/recovery acceptance covers concurrent same-content captures, crash after fetch/before commit, 429s, timeouts, truncated bytes, transcript failures, outage abstention, cursor replay, ACL non-leakage, backup restore, exact-hash approval binding, 0/1/16 MiB source limits, base64 wire overhead, digest mismatch, held-FD nofollow TOCTOU checks, the 3C1 clear-manifest PHI gate and pre-acceptance refusal, unsupported-media/encoding invalidation, bounded non-PHI quarantine, and ambiguous record/event/lineage recovery.",
+   "tests": [
+    "tests/test_e5_fault_matrix.py"
+   ],
+   "evidence": [
+    "tests/evidence/e5/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_e5_fault_matrix.py",
+     "ci": true
+    },
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_hsp07_dedupe.py",
+    "tests/test_slice3c1_commit_runtime.py",
+    "tests/test_hound_client.py"
+   ],
+   "assertions": [
+    "each of the 19 demands in tests/evidence/e5/matrix-inventory.json names an existing or new proving test",
+    "a backup restored from a copy alone serves identical journal results, including a journal containing a completed transcription",
+    "hash drift on any bound field is rejected across every commit operation; outage abstention is durable and credential-silent",
+    "no loss, no unauthorized disclosure, no SOURCE path/base64/kind persistence, no downstream duplicate effect"
+   ],
+   "missing": [],
+   "deviations": [
+    "The drill found a blocking defect (Projection._derive_rows treated a completed transcription's transcript: object_key as blob-backed, crashing startup recovery). It was fixed in the same commit as the matrix (cb32e6f) and the tripwire test is now a live green assertion, so the row is claimed complete against fixed code, not against an xfail."
+   ]
+  },
+  {
+   "id": "HSP-13",
+   "vision_line": 1256,
+   "status": "complete",
+   "claim": "The complete audited migration inventory is canonical in migration/consumer-inventory.v1.json; it records every required lane and the two non-acquisition consumers with explicit owner, cadence authority/category, boundary, and stage. Exact timer values remain in lane automation contracts, not Hound.",
+   "tests": [
+    "tests/test_migration_inventory.py"
+   ],
+   "evidence": [
+    "migration/consumer-inventory.v1.json",
+    "migration/consumer_inventory.py",
+    "migration/check_consumer_inventory.py"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python migration/check_consumer_inventory.py --schema-only",
+     "ci": true
+    },
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy",
+     "ci": false,
+     "ci_reason": "requires the real atum workspace; the checked-in schema mode is the CI gate and the full-workspace run is retained as migration/evidence/e1 findings"
+    }
+   ],
+   "supporting": [
+    "migration/provider-indicators.v1.json"
+   ],
+   "assertions": [
+    "the exact required ID set is present with one owner, cadence authority, cadence category, boundary, and stage per entry",
+    "timer truth is absent from Hound; gc-gtm/CRM are consumer-only; out-of-scope entries are absent",
+    "every row field is covered by the canonical row digest, so a silent edit to any authoritative field is rejected"
+   ],
+   "missing": [],
+   "deviations": [
+    "The inventory's stage fields were stale until d23f53f and now track the stage ledger (benefits-radar migrated with an approval_ref, pulse shadow, wiki/intel/civic import_mirror, 7 rows freeze_contracts). HSP-13's own assertions are about schema, ownership, required-ID completeness, and timer-truth absence, all of which hold independently; how far those stages have advanced is HSP-15's claim and is recorded there as partial."
+   ]
+  },
+  {
+   "id": "HSP-14",
+   "vision_line": 1257,
+   "status": "complete",
+   "claim": "Completed repo-local records are imported/mirrored through import.record without rewriting caller-supplied IDs or exact bytes; authorized lineage and hashes survive; SQLite is disposable and rebuilds from journal/records; portability has no absolute-path dependency.",
+   "tests": [
+    "tests/test_hsp14_legacy_portability.py"
+   ],
+   "evidence": [
+    "migration/evidence/m1/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp14_legacy_portability.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/test_e5_fault_matrix.py"
+   ],
+   "assertions": [
+    "byte-for-byte and hash-for-hash identity with unchanged IDs and lineage where present; ID/byte conflicts reject without overwrite",
+    "open/no-stage recovery publishes no raw object and returns only its interrupted import-outcome ID",
+    "rebuilt projection equality and successful verification at a second path",
+    "the real M1 backfill imported 824 provider-derived records (journal 35 to 859 entries) with verify_store green and 5/5 random byte-fidelity spot checks identical through the read path"
+   ],
+   "missing": [],
+   "deviations": []
+  },
+  {
+   "id": "HSP-15",
+   "vision_line": 1258,
+   "status": "partial",
+   "claim": "Migration follows the exact staged order: freeze contracts; import/mirror; shadow Pulse and Benefits; cut over Pulse then Benefits; wiki/intel/Civic; radar/Gmail/manual web/X/YouTube; Atelier and Helm external reads; enable no-bypass; delete only after recovery drill and one full scheduled cycle per lane.",
+   "tests": [
+    "tests/test_stage_ledger.py"
+   ],
+   "evidence": [
+    "migration/stage_ledger.py",
+    "migration/check_stage_ledger.py",
+    "migration/stage-ledger.v1.json"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python migration/check_stage_ledger.py --ledger migration/stage-ledger.v1.json",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "migration/evidence/lanes/pulse/",
+    "migration/evidence/lanes/benefits-radar/"
+   ],
+   "assertions": [
+    "the checker rejects skipped or reordered stages and pre-gate deletion (proven against fixtures)",
+    "the checked-in ledger is a valid hash chain: 8 entries, sequence 0..7, each binding its predecessor's entry hash",
+    "one lane (benefits-radar) has walked freeze_contracts -> import_mirror -> shadow -> migrated with per-stage evidence files and an approval_ref"
+   ],
+   "missing": [
+    "only 1 of the 5 live lanes has reached 'migrated'. pulse stops at 'shadow'; wiki-refresh, intel-refresh, and civic-policy-radar stop at 'import_mirror'; radar-curation and youtube-transcription have no ledger entries at all (GOALIE task #8 is still in flight).",
+    "no lane has reached 'retired' and every entry's 'legacy_absent' evidence slot is null, so the row's deletion gate ('delete only after recovery drill and one full scheduled cycle per lane') is unexercised",
+    "no lane has all nine evidence slots. Counting each lane's union across its whole chain: benefits-radar 7/9 (missing stage_ledger, legacy_absent), pulse 2/9, wiki-refresh 1/9, intel-refresh 0/9, civic-policy-radar 0/9. The 'stage_ledger' slot is null on every entry in the ledger.",
+    "the remaining lanes' full_cycle evidence depends on scheduled runs that have not happened yet (owner schedule: intel, benefits, and pulse on 2026-08-05; civic policy on the evening of 2026-08-05; wiki-refresh on 2026-08-10). Those four lanes stay partial until then; no row here claims a scheduled-run outcome in advance.",
+    "the row's ordering includes a shadow stage for Pulse and Benefits that the owner's 2026-08-04 full-cutover replan dropped; the ledger records shadow entries whose parity evidence is an explicit supersession note (migration/evidence/lanes/*/parity.md), not a parity comparison. VISION's ordering and the executed plan disagree and one of them must be amended (see HSP-16/HSP-17)."
+   ],
+   "deviations": []
+  },
+  {
+   "id": "HSP-16",
+   "vision_line": 1259,
+   "status": "partial",
+   "claim": "Superseded by owner decision (2026-08-04 full-cutover replan): formal shadow parity replaced by one real end-to-end run per lane; VISION.md row amended to record the supersession. Evidence: migration/evidence/lanes/pulse/parity.md plus the live cutover run and credential-unset matrix.",
+   "tests": [
+    "tests/test_hsp16_pulse_parity.py"
+   ],
+   "evidence": [
+    "migration/evidence/lanes/pulse/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp16_pulse_parity.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "migration/evidence/e1/no-bypass-matrix.json",
+    "migration/stage-ledger.v1.json"
+   ],
+   "assertions": [
+    "VISION.md carries the amended supersession row for HSP-16 and pulse/parity.md states the supersession in its own words",
+    "the shadow window (pulse-hound-shadow.timer, 8 planner queries daily 2026-07-31 to 2026-08-04) is durably recorded"
+   ],
+   "missing": [
+    "the amended row's replacement clause is 'one real end-to-end run per lane', and pulse has no retained artifact for it. migration/evidence/lanes/pulse/ holds only import-mirror.md and parity.md; the live-run figures (8 searches, 128 leads, 20 captures) exist solely as GOALIE.md M2 prose, not as evidence this manifest can resolve.",
+    "the stage ledger holds pulse at 'shadow' with no full_cycle, credential_unset, unix_socket, or recovery_drill pointer, and its scheduled cycle is not due until 2026-08-05; claiming the replacement clause now would claim a scheduled-run outcome that has not happened"
+   ],
+   "deviations": [
+    "The parity clause itself is legitimately superseded (VISION.md:1259 amended by owner decision, 2026-08-04). This row is partial on the replacement clause, not on the withdrawn one."
+   ]
+  },
+  {
+   "id": "HSP-17",
+   "vision_line": 1260,
+   "status": "complete",
+   "claim": "Superseded by owner decision (2026-08-04 full-cutover replan): formal shadow parity replaced by one real end-to-end run per lane; VISION.md row amended to record the supersession. Evidence: migration/evidence/lanes/benefits-radar/parity.md plus the live cutover run and credential-unset matrix.",
+   "tests": [
+    "tests/test_hsp17_benefits_parity.py"
+   ],
+   "evidence": [
+    "migration/evidence/lanes/benefits-radar/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp17_benefits_parity.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "migration/evidence/e1/no-bypass-matrix.json",
+    "migration/stage-ledger.v1.json",
+    "migration/approvals/"
+   ],
+   "assertions": [
+    "VISION.md carries the amended supersession row for HSP-17 and benefits-radar/parity.md states the supersession in its own words",
+    "the replacement clause is met by a retained, dated artifact: full-cycle.md records the 2026-08-04 06:35Z discovery-benefits run acquiring only through houndd (8 searches + 6 URL captures, terminal REVIEW_REQUIRED reported), the first scheduled cycle after cutover abffd89",
+    "credentials were absent from the lane: the E1 matrix proves benefits-radar degraded rather than bypassed with provider keys unset",
+    "the lane reached 'migrated' in the stage ledger with static-no-direct-provider, credential-unset, unix-socket, recovery-drill and full-cycle evidence bound to an approve decision by ali"
+   ],
+   "missing": [],
+   "deviations": [
+    "No parity comparator exists or will be built; the owner's replan supersedes the original clause and the amended VISION row is the governing text."
+   ]
+  },
+  {
+   "id": "HSP-18",
+   "vision_line": 1261,
+   "status": "partial",
+   "claim": "No-bypass enforcement statically rejects provider credentials/endpoints/direct clients/prompt direct skills/artifacts without Hound IDs outside the explicit adapter allowlist, with exclusions only for tests/history/local retrieval/health/deploy/publish; dynamic tests run every migrated consumer with credentials unset.",
+   "tests": [],
+   "evidence": [
+    "migration/provider-indicators.v1.json",
+    "migration/evidence/e1/raw/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy --json",
+     "ci": false,
+     "ci_reason": "the static scan needs the real atum workspace; its findings are retained in migration/evidence/e1/no-bypass-matrix.json"
+    }
+   ],
+   "supporting": [
+    "tests/test_migration_inventory.py",
+    "migration/evidence/e1/no-bypass-matrix.json"
+   ],
+   "assertions": [
+    "forbidden provider indicators are detected and uncataloged raw endpoints fail closed rather than passing silently",
+    "the static scan is clean for the lane code of all five cut-over repos",
+    "five of five live lanes ran credential-unset and degraded rather than bypassing (four owner-level runs; gc-web covers pulse and civic-policy-radar)"
+   ],
+   "missing": [
+    "'every migrated consumer' is not yet every consumer: radar-curation and youtube-transcription are not cut over, so the dynamic matrix covers 5 lanes, not the full inventory closure",
+    "the transcribe proof required minting one real capture record, so migration/evidence/e1's phi_clear_manifest is not empty; every other byte sequence in the run, including the dedicated source_refused fixture, was refused as designed",
+    "no test file owns this row: the dynamic matrix is a retained JSON artifact produced by a live run against the atum workspace, not a repeatable CI suite"
+   ],
+   "deviations": []
+  },
+  {
+   "id": "HSP-19",
+   "vision_line": 1262,
+   "status": "partial",
+   "claim": "Domain ownership remains outside Hound: no domain logic, scheduler, approval DB, queue, CRM, wiki, Helm, Pulse curation, Benefits registry, social publishing, CRM write, or internal BB/Git/Discord/calendar event ownership is added.",
+   "tests": [
+    "tests/test_domain_ownership.py"
+   ],
+   "evidence": [
+    "migration/check_domain_ownership.py",
+    "migration/evidence/e1/ownership-scan.json"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_domain_ownership.py",
+     "ci": true
+    },
+    {
+     "command": "uv run python -m migration.check_domain_ownership --workspace /home/deploy --json",
+     "ci": false,
+     "ci_reason": "scans the real atum workspace; output retained as migration/evidence/e1/ownership-scan.json"
+    }
+   ],
+   "supporting": [
+    "migration/provider-indicators.v1.json"
+   ],
+   "assertions": [
+    "the capability dump shows Hound exposing only evidence mechanics and the listed service contract",
+    "the ownership checker classifies domain-logic versus evidence-mechanics indicators per lane and refuses to follow symlinks or oversized directories"
+   ],
+   "missing": [
+    "the full-workspace scan is not clean: 65 real ownership findings remain, all outside the five cut-over repos' lane code (shared skills under agents/_skills/**, retired agent notes, agents/helm/** ingest tooling). None have been adjudicated as allowed-or-fixed, so 'domain ownership remains outside Hound' holds for lane code and is unresolved workspace-wide",
+    "1905 of the report's 1970 errors are scanner infrastructure failures (1904 symlink refusals across pnpm trees, 1 directory-size guard), so the scan cannot currently return a clean verdict even in principle",
+    "the checker cannot run against the hound repo itself as a CI gate: it treats src/hound_research/*.py as domain-repo paths holding houndd-service-import indicators, which is a scanner-scope mismatch rather than a finding"
+   ],
+   "deviations": []
+  },
+  {
+   "id": "HSP-20",
+   "vision_line": 1263,
+   "status": "complete",
+   "claim": "Journal, records, projections, access policies, cursor recovery, service generation, and persistent service identity are independently verifiable after crash, index rebuild, backup restore, and local migration; SQLite never becomes a source of truth; mandatory startup recovery and verification complete before identity load or listening; identity publication uses exact-held-FD linking with the stated postconditions and fails closed otherwise.",
+   "tests": [
+    "tests/test_hsp20_durable_state.py",
+    "tests/test_hsp20_query_snapshot.py",
+    "tests/test_hsp20_verification.py",
+    "tests/test_b6_journal_maintenance_routes.py",
+    "tests/test_b9_projection_refresh.py",
+    "tests/test_b11_incremental_projection.py",
+    "tests/test_b12_chain_verification_cost.py"
+   ],
+   "evidence": [],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hsp20_durable_state.py tests/test_hsp20_query_snapshot.py tests/test_hsp20_verification.py tests/test_b6_journal_maintenance_routes.py tests/test_b9_projection_refresh.py tests/test_b11_incremental_projection.py tests/test_b12_chain_verification_cost.py",
+     "ci": true
+    }
+   ],
+   "supporting": [
+    "tests/evidence/slice3a/",
+    "tests/test_e5_fault_matrix.py"
+   ],
+   "assertions": [
+    "sequence, IDs, hashes, lineage, access decisions, and authorized cursor results match canonical journal truth after each rebuild",
+    "recovery and verification precede identity loading and listening; request-time reads never repair or rebuild SQLite",
+    "in-flight relocation copies, missing required primitives, and lasting observable namespace replacements fail closed without adopting or deleting unverified bytes",
+    "the index refreshes inside the commit path, incrementally, with row-level equivalence to a full rebuild and a bounded per-commit chain-verification cost"
+   ],
+   "missing": [],
+   "deviations": [
+    "B12's chain-verification memo is held for process life (~7KiB/entry) with no prune or segment story below 10k entries; tamper detection is bit-identical, so this is a memory-growth debt, not a soundness gap.",
+    "B11 publication still serializes and verifies the whole index file (~0.2ms/entry); accepted because changing it would break the never-write-through-the-visible-leaf safety model."
+   ]
+  },
+  {
+   "id": "HSP-21",
+   "vision_line": 1264,
+   "status": "partial",
+   "claim": "Completion is machine-verifiable: every implementation artifact/test traces to exactly one acceptance row, all rows have named executable evidence with expected assertions and retained artifacts, and the full acceptance command fails on any missing, duplicated, unordered, or unretained result.",
+   "tests": [
+    "tests/test_acceptance_manifest.py",
+    "tests/test_slice3a_evidence.py",
+    "tests/test_slice3a_historical_evidence.py",
+    "tests/test_slice3b_evidence.py",
+    "tests/test_slice3b_final_evidence_integrity.py",
+    "tests/test_slice3c1_evidence.py",
+    "tests/test_slice3c1_observations.py"
+   ],
+   "evidence": [
+    "migration/acceptance.v1.json",
+    "migration/check_acceptance.py",
+    "tests/acceptance_slice1.json",
+    "tests/acceptance_slice2a.json",
+    "tests/acceptance_slice2b.json",
+    "tests/acceptance_slice3a.json",
+    "tests/acceptance_slice3b.json",
+    "tests/acceptance_slice3c1.json",
+    "tests/generate_slice3a_evidence.py",
+    "tests/generate_slice3b_evidence.py",
+    "tests/generate_slice3c1_evidence.py",
+    "tests/verify_slice3a_historical.py",
+    "tests/verify_slice3b_evidence.py",
+    "tests/verify_slice3c1_evidence.py",
+    "tests/slice3a_evidence_capture.py",
+    "tests/evidence/slice3a/",
+    "tests/evidence/slice3b/",
+    "tests/evidence/slice3c1/"
+   ],
+   "commands": [
+    {
+     "command": "uv run python migration/check_acceptance.py --run-tests",
+     "ci": true
+    }
+   ],
+   "supporting": [],
+   "assertions": [
+    "exactly 22 rows, ordered HSP-01 through HSP-22, with a closed field shape and no unknown keys",
+    "every named artifact resolves on disk and every proof artifact in the declared traceability scope is owned by exactly one row",
+    "no orphan evidence (an in-scope file no row claims) and no unproven claim (a complete row with no test or a nonempty missing list)",
+    "generators and verifiers bind an isolated Git checkout, exact argv, exact source blob bindings, canonical JSON, exact JUnit counters and node IDs; forged bindings and dirty worktrees are rejected"
+   ],
+   "missing": [
+    "one-to-one traceability is enforced over proof artifacts only, not over src/ implementation modules. The sealed slice manifests already assign the same module to two different rows (src/houndd/journal.py: HSP-05 in slice1, HSP-20 in slice3a; src/houndd/cursor.py: HSP-20 in slice2a, HSP-08 in slice3a), which is evidence that a single owner per module would be an invention rather than a fact. See traceability_scope.src_exclusion_reason.",
+    "tests/test_slice3a_evidence.py is excluded from the default pytest run by pyproject addopts (--ignore), so the acceptance command resolves it as an artifact but does not execute it; its historical wrapper tests/test_slice3a_historical_evidence.py is what runs",
+    "this manifest is not itself sealed to a commit the way tests/acceptance_slice3b.json is: it names artifacts by path, not by blob digest, so it detects a missing or unclaimed artifact but not a silently edited one"
+   ],
+   "deviations": []
+  },
+  {
+   "id": "HSP-22",
+   "vision_line": 1265,
+   "status": "partial",
+   "claim": "No migration lane becomes canonical until Ali has explicitly approved the exact immutable cutover proposal; a decline blocks cutover, and the native owner gate validates the exact records/proposal/decision hashes before applying.",
+   "tests": [],
+   "evidence": [
+    "migration/check_approvals.py",
+    "migration/approvals/"
+   ],
+   "commands": [
+    {
+     "command": "PYTHONDONTWRITEBYTECODE=1 python migration/check_approvals.py --receipts migration/approvals/receipts --decisions migration/approvals/decisions.jsonl --workspace /home/deploy --stage-ledger migration/stage-ledger.v1.json",
+     "ci": false,
+     "ci_reason": "the checked-in receipt records its subject artifacts as workspace-relative paths under repos/hound/, so the walk only resolves against the atum workspace root and not against a bare CI checkout"
+    }
+   ],
+   "supporting": [
+    "tests/test_approvals.py",
+    "migration/approvals.py",
+    "migration/stage-ledger.v1.json"
+   ],
+   "assertions": [
+    "the gate walk from receipt to decision to stage-ledger approval_ref rejects a missing decision, a rejecting decision, and a migrated entry with no receipt-subject evidence",
+    "a changed subject-artifact hash, a missing artifact, and a directory in place of a file all fail the gate",
+    "an approved decision with no stage-ledger outcome is reported as an unexecuted approval rather than silently passing"
+   ],
+   "missing": [
+    "one real approval exists, for one lane: gate-benefits-radar-migrated-2026-08-04, an approve decision by ali bound to that lane's migrated ledger entry. The row's own fixture requirement asks for Pulse and Benefits proposals plus an approve and a decline; there is no Pulse proposal and no real decline record.",
+    "pulse, wiki-refresh, intel-refresh, and civic-policy-radar acquire through houndd in production today (GOALIE M2/M3) while the ledger holds them at shadow and import_mirror, and none has an approval record. The ledger is now honest that they have not passed the gate, but the running system is already past it, so this row is unproven for four of the five live lanes rather than merely pending.",
+    "the decline path, the changed-hash rejection, and the decisions-log-alone rejection are proven only against synthetic fixtures in tests/test_approvals.py",
+    "the receipt's subject-artifact paths are recorded relative to the atum workspace (repos/hound/...), so the real approval walk cannot run as a CI gate against a bare checkout"
+   ],
+   "deviations": []
   }
+ ]
 }

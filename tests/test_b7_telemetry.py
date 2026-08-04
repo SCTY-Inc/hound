@@ -486,8 +486,22 @@ def test_b7_telemetry_snapshot_is_free_of_credentials_phi_and_snippets(live) -> 
         for needle in forbidden_substrings:
             assert needle not in blob, (needle, blob)
 
+    def _stable(value):
+        """Normalize per-run identifiers so the retained artifact is deterministic."""
+        import re as _re
+        if isinstance(value, dict):
+            return {key: _stable(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_stable(item) for item in value]
+        if isinstance(value, str):
+            if _re.fullmatch(r"[0-9a-f]{64}", value):
+                return "<sha256>"
+            if _re.match(r"\d{4}-\d{2}-\d{2}T", value):
+                return "<timestamp>"
+        return value
+
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    (EVIDENCE_DIR / "telemetry-snapshot.json").write_text(json.dumps({"policy-a": snapshot_a, "policy-b": snapshot_b}, indent=2, sort_keys=True) + "\n")
+    (EVIDENCE_DIR / "telemetry-snapshot.json").write_text(json.dumps({"policy-a": _stable(snapshot_a), "policy-b": _stable(snapshot_b)}, indent=2, sort_keys=True) + "\n")
     consistency = {
         "policy-a": {"expected": expected_a, "observed": {key: snapshot_a[key] for key in expected_a}},
         "policy-b": {"expected": expected_b, "observed": {key: snapshot_b[key] for key in expected_b}},
