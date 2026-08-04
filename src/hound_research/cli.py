@@ -158,6 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
     _commit_arguments(file_commit)
     file_commit.set_defaults(handler=_handle_ingest_file)
 
+    media_commit = ingest_sub.add_parser("media", help="Commit one certified local media source through houndd")
+    _commit_arguments(media_commit)
+    media_commit.set_defaults(handler=_handle_ingest_media)
+
     search_ingest = ingest_sub.add_parser("search", help="Submit one search lead through houndd")
     _envelope_arguments(search_ingest)
     search_ingest.add_argument("--query", required=True)
@@ -421,8 +425,11 @@ def _commit_request(args: argparse.Namespace, operation: str) -> tuple[Path, dic
         "byte_length": args.byte_length,
     }
     payload: dict[str, Any] = {"source": source}
-    path = "/v1/ingest/file"
     if operation == "ingest.file":
+        path = "/v1/ingest/file"
+        payload["media_type"] = "application/octet-stream"
+    elif operation == "ingest.media":
+        path = "/v1/ingest/media"
         payload["media_type"] = "application/octet-stream"
     else:
         path = "/v1/import-record"
@@ -459,6 +466,10 @@ def _handle_commit(args: argparse.Namespace, operation: str) -> dict[str, Any]:
 
 def _handle_ingest_file(args: argparse.Namespace) -> dict[str, Any]:
     return _handle_commit(args, "ingest.file")
+
+
+def _handle_ingest_media(args: argparse.Namespace) -> dict[str, Any]:
+    return _handle_commit(args, "ingest.media")
 
 
 def _handle_import_record(args: argparse.Namespace) -> dict[str, Any]:

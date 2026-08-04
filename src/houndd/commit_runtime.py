@@ -399,6 +399,13 @@ class CommitRuntime:
                 or payload.get("media_type") != "application/octet-stream"
             ):
                 raise CommitIntegrityError("canonical ingest.file payload is invalid")
+        elif binding.operation == "ingest.media":
+            if (
+                set(payload) != {"source", "media_type"}
+                or type(payload.get("media_type")) is not str
+                or payload.get("media_type") != "application/octet-stream"
+            ):
+                raise CommitIntegrityError("canonical ingest.media payload is invalid")
         elif binding.operation == "import.record":
             if set(payload) != {"source", "record_id"}:
                 raise CommitIntegrityError("canonical import.record payload is invalid")
@@ -642,6 +649,24 @@ class CommitRuntime:
             }
             event_source = {"provider": "local", "native_id": source_record["sha256"], "canonical_url": "none"}
             dedupe = {"object_key": f"file:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
+            record_ids = [record_id]
+        elif operation == "ingest.media":
+            if (
+                set(body) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "source", "lineage"}
+                or body.get("schema_version") != "houndd.media-capture-record.v1"
+                or {key: body.get(key) for key in expected_common} != expected_common
+                or body.get("source") != source_record
+            ):
+                raise CommitIntegrityError("media outcome plan is malformed")
+            artifact = {
+                "kind": "media",
+                "schema": "houndd.media-capture-record.v1",
+                "record_id": record_id,
+                "hash": record_id,
+                "authorized_uri": f"houndd://record/{record_id}",
+            }
+            event_source = {"provider": "local", "native_id": source_record["sha256"], "canonical_url": "none"}
+            dedupe = {"object_key": f"media:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
             record_ids = [record_id]
         elif operation == "import.record":
             legacy = body.get("legacy")
@@ -987,6 +1012,21 @@ class CommitRuntime:
             schema = "houndd.file-record.v1"
             native_id = source_record["sha256"]
             dedupe = {"object_key": f"file:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
+        elif operation == "ingest.media":
+            body = {
+                "schema_version": "houndd.media-capture-record.v1",
+                "attempt_id": marker["attempt_id"],
+                "request_hash": marker["request_hash"],
+                "operation": operation,
+                "outcome": "interrupted",
+                "evidence_status": "interrupted",
+                "source": source_record,
+                "lineage": marker["lineage"],
+            }
+            artifact_kind = "media"
+            schema = "houndd.media-capture-record.v1"
+            native_id = source_record["sha256"]
+            dedupe = {"object_key": f"media:{source_record['sha256']}", "content_sha256": source_record["sha256"]}
         elif operation == "import.record":
             legacy_id = marker["canonical_request"]["operation"]["payload"]["record_id"]
             if _legacy_id(legacy_id, "open import legacy record_id") != legacy_id:
@@ -1021,7 +1061,7 @@ class CommitRuntime:
             producer=marker["producer"],
             artifact={"kind": artifact_kind, "schema": schema, "record_id": result.record_id, "hash": result.record_id, "authorized_uri": f"houndd://record/{result.record_id}"},
             lineage=marker["lineage"],
-            source={"provider": "local" if operation == "ingest.file" else "legacy", "native_id": native_id, "canonical_url": "none"},
+            source={"provider": "local" if operation in {"ingest.file", "ingest.media"} else "legacy", "native_id": native_id, "canonical_url": "none"},
             classification={"outcome": "interrupted", "evidence_status": "interrupted"},
             access=marker["access"],
             policy_id=marker["policy_id"],
@@ -1082,7 +1122,7 @@ class CommitRuntime:
 
     @staticmethod
     def _lineage(request: CommitRequest, scope: PrincipalScope | None, journal: Journal) -> dict[str, str]:
-        if request.operation in {"ingest.file", "ingest.search"}:
+        if request.operation in {"ingest.file", "ingest.media", "ingest.search"}:
             return dict(_NO_LINEAGE)
         if request.operation == "ingest.url":
             declared = request.payload["lineage"]
@@ -1131,6 +1171,8 @@ class CommitRuntime:
         evidence = "clear" if outcome == "completed" else outcome
         if request.operation == "ingest.file":
             return {"schema_version": "houndd.file-record.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": request.operation, "outcome": outcome, "evidence_status": evidence, "source": source, "lineage": lineage}
+        if request.operation == "ingest.media":
+            return {"schema_version": "houndd.media-capture-record.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": request.operation, "outcome": outcome, "evidence_status": evidence, "source": source, "lineage": lineage}
         return {"schema_version": "houndd.import-outcome.v1", "attempt_id": attempt_id, "request_hash": request_hash, "operation": request.operation, "outcome": outcome, "evidence_status": evidence, "legacy": {"record_id": request.payload["record_id"], **source}, "lineage": lineage}
 
     @staticmethod
@@ -1140,6 +1182,10 @@ class CommitRuntime:
             artifact = {"kind": "file", "schema": "houndd.file-record.v1", "record_id": record_id, "hash": record_hash, "authorized_uri": f"houndd://record/{record_id}"}
             source = {"provider": "local", "native_id": request.source.sha256, "canonical_url": "none"}
             object_key = f"file:{request.source.sha256}"
+        elif request.operation == "ingest.media":
+            artifact = {"kind": "media", "schema": "houndd.media-capture-record.v1", "record_id": record_id, "hash": record_hash, "authorized_uri": f"houndd://record/{record_id}"}
+            source = {"provider": "local", "native_id": request.source.sha256, "canonical_url": "none"}
+            object_key = f"media:{request.source.sha256}"
         else:
             assert type(import_id) is str
             artifact = {"kind": "import", "schema": "houndd.import-outcome.v1", "record_id": record_id, "hash": record_hash, "authorized_uri": f"houndd://record/{record_id}"}
@@ -1266,7 +1312,7 @@ class CommitRuntime:
             self._write("commit3c1", "open", open_name, value=marker)
             self._fault("after_open")
             try:
-                if request.operation == "ingest.file":
+                if request.operation in {"ingest.file", "ingest.media"}:
                     self.records.blob(source.data)
                 else:
                     self.records.put_bytes(request.payload["record_id"], source.data, expected_sha256=source.sha256)

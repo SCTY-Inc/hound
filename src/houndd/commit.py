@@ -29,7 +29,7 @@ MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_WIRE_BODY_BYTES = 1_048_576
 SUPPORTED_SOURCE_MEDIA_TYPE = "application/octet-stream"
 SUPPORTED_SOURCE_ENCODING = "identity"
-SOURCE_OPERATIONS = frozenset({"ingest.file", "import.record"})
+SOURCE_OPERATIONS = frozenset({"ingest.file", "ingest.media", "import.record"})
 ADAPTER_OPERATIONS = frozenset({"ingest.search", "ingest.url"})
 MAX_QUERY_CHARS = 1_024
 MAX_LEAD_ID_CHARS = 128
@@ -172,7 +172,7 @@ ROUTE_BINDINGS: tuple[RouteBinding, ...] = (
     RouteBinding("POST", "/v1/ingest/search", "ingest.search", "ingest.search", True),
     RouteBinding("POST", "/v1/ingest/url", "ingest.url", "ingest.url", True),
     RouteBinding("POST", "/v1/ingest/file", "ingest.file", "ingest.file", True),
-    RouteBinding("POST", "/v1/ingest/media", "ingest.media", "ingest.media", False),
+    RouteBinding("POST", "/v1/ingest/media", "ingest.media", "ingest.media", True),
     RouteBinding("POST", "/v1/transcribe", "transcribe", "transcribe", False),
     RouteBinding("POST", "/v1/import-record", "import.record", "import.record", True),
 )
@@ -503,6 +503,9 @@ class CommitRequest:
         elif self.operation == "ingest.file":
             if set(payload) != {"source", "media_type"} or payload.get("source") is not self.source or type(payload.get("media_type")) is not str or payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE:
                 raise TypeError("ingest.file payload is invalid")
+        elif self.operation == "ingest.media":
+            if set(payload) != {"source", "media_type"} or payload.get("source") is not self.source or type(payload.get("media_type")) is not str or payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE:
+                raise TypeError("ingest.media payload is invalid")
         elif self.operation == "import.record":
             if set(payload) != {"source", "record_id"} or payload.get("source") is not self.source or type(payload.get("record_id")) is not str or not payload["record_id"]:
                 raise TypeError("import.record payload is invalid")
@@ -535,6 +538,12 @@ class CommitRequest:
             _strict(payload, {"source", "media_type"}, "ingest.file payload")
             if payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE or type(payload["media_type"]) is not str:
                 raise CommitContractError("ingest.file media_type is unsupported")
+            source = SourceDeclaration.from_value(payload["source"])
+            copied = dict(payload) | {"source": source}
+        elif route.operation == "ingest.media":
+            _strict(payload, {"source", "media_type"}, "ingest.media payload")
+            if payload["media_type"] != SUPPORTED_SOURCE_MEDIA_TYPE or type(payload["media_type"]) is not str:
+                raise CommitContractError("ingest.media media_type is unsupported")
             source = SourceDeclaration.from_value(payload["source"])
             copied = dict(payload) | {"source": source}
         elif route.operation == "import.record":

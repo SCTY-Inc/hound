@@ -252,7 +252,7 @@ class PhiScanner:
             raise PhiInputError("scanner inputs have invalid runtime types")
         if media_type != SUPPORTED_SOURCE_MEDIA_TYPE or encoding != SUPPORTED_SOURCE_ENCODING:
             raise PhiInputError("scanner representation is unsupported")
-        if operation not in {"ingest.file", "import.record"}:
+        if operation not in {"ingest.file", "ingest.media", "import.record"}:
             raise PhiInputError("scanner operation is unsupported")
         digest = hashlib.sha256(data).hexdigest()
         return "clear" if (digest, media_type, encoding) in self._digests else "suspected"

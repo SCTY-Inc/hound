@@ -18,7 +18,7 @@ from .transactions import TransactionCoordinator
 
 
 _RECORD_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-_OUTCOME_SCHEMAS = frozenset({"houndd.import-outcome.v1", "houndd.file-record.v1", "houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
+_OUTCOME_SCHEMAS = frozenset({"houndd.import-outcome.v1", "houndd.file-record.v1", "houndd.media-capture-record.v1", "houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
 _ADAPTER_SCHEMAS = frozenset({"houndd.search-record.v1", "houndd.url-record.v1", "houndd.quarantine-record.v1"})
 def _verify_adapter_outcome(records: RecordStore, event: dict[str, Any], record: Any, schema: str, record_id: str, dedupe: Any, referenced_blobs: set[str]) -> None:
     """Bind one Slice 3C2 outcome record to its exact journal event."""
@@ -327,6 +327,55 @@ def verify_store(root: str | Path, *, projection: bool = True) -> dict[str, Any]
                                 raise ValueError("interrupted file outcome evidence is invalid")
                         else:
                             raise ValueError("file outcome is unsupported")
+                    elif schema == "houndd.media-capture-record.v1":
+                        media_outcome = record
+                        if (
+                            type(media_outcome) is not dict
+                            or set(media_outcome) != {"schema_version", "attempt_id", "request_hash", "operation", "outcome", "evidence_status", "source", "lineage"}
+                            or media_outcome.get("schema_version") != "houndd.media-capture-record.v1"
+                            or media_outcome.get("operation") != "ingest.media"
+                            or type(media_outcome.get("source")) is not dict
+                        ):
+                            raise ValueError("media outcome record is malformed")
+                        source = media_outcome["source"]
+                        source_digest = source.get("sha256")
+                        source_length = source.get("byte_length")
+                        if (
+                            set(source) != {"sha256", "byte_length", "media_type", "encoding"}
+                            or type(source_digest) is not str
+                            or len(source_digest) != 64
+                            or any(character not in "0123456789abcdef" for character in source_digest)
+                            or type(source_length) is not int
+                            or source_length < 0
+                            or source.get("media_type") != "application/octet-stream"
+                            or source.get("encoding") != "identity"
+                            or media_outcome.get("lineage") != {"relation": "none", "record_id": "none", "lead_id": "none"}
+                            or event.get("artifact") != {
+                                "kind": "media",
+                                "schema": "houndd.media-capture-record.v1",
+                                "record_id": record_id,
+                                "hash": record_id,
+                                "authorized_uri": f"houndd://record/{record_id}",
+                            }
+                            or event.get("source") != {"provider": "local", "native_id": source_digest, "canonical_url": "none"}
+                            or event.get("lineage") != media_outcome["lineage"]
+                            or event.get("classification") != {"outcome": media_outcome.get("outcome"), "evidence_status": media_outcome.get("evidence_status")}
+                            or dedupe != {"object_key": f"media:{source_digest}", "content_sha256": source_digest}
+                            or event.get("usage") != {"requests": 0, "bytes": source_length, "cost": 0}
+                        ):
+                            raise ValueError("media outcome does not bind the journal event")
+                        if media_outcome.get("outcome") == "completed":
+                            if media_outcome.get("evidence_status") != "clear":
+                                raise ValueError("completed media outcome evidence is invalid")
+                            blob = records.blobs.get(source_digest)
+                            if len(blob) != source_length:
+                                raise ValueError("media outcome blob length does not bind its source")
+                            referenced_blobs.add(source_digest)
+                        elif media_outcome.get("outcome") == "interrupted":
+                            if media_outcome.get("evidence_status") != "interrupted":
+                                raise ValueError("interrupted media outcome evidence is invalid")
+                        else:
+                            raise ValueError("media outcome is unsupported")
                     elif schema in _ADAPTER_SCHEMAS:
                         _verify_adapter_outcome(records, event, record, schema, record_id, dedupe, referenced_blobs)
                     else:
