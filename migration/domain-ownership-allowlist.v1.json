@@ -1,4 +1,70 @@
 {
   "schema_version": "hound.migration.domain-ownership-allowlist.v1",
-  "entries": []
+  "entries": [
+    {
+      "path_pattern": "repos/givecare/gc-benefits/.env",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/vetting/firecrawl-fetch.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/vetting/vet-loop-contract.schema.json",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/etl.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/firecrawl.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/harness.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/sweep.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/cli/intake.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/src/benefit_engine/cli/records.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/scripts/enrich_programs.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/scripts/ingest_batch.py",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/data/run_history.jsonl",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    },
+    {
+      "path_pattern": "repos/givecare/gc-benefits/data/source_registry.jsonl",
+      "reason": "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane",
+      "decision_ref": "D12 (2026-08-05)"
+    }
+  ]
 }

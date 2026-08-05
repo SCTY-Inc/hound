@@ -485,9 +485,19 @@ def test_sibling_direct_provider_pipeline_outside_scan_roots_is_detected(tmp_pat
 # --- allowlist: loading and validation ------------------------------------------
 
 
-def test_real_allowlist_config_is_valid_and_starts_empty() -> None:
+def test_real_allowlist_config_is_valid_and_scoped_to_d12() -> None:
+    """E3's shipped allowlist started empty pending an owner exception-list
+    decision (GOALIE.md E3). D12 (2026-08-05, Ali) made that decision: the
+    gc-benefits benefit_engine pipeline is a named D1-deferred legacy
+    ETL/intake exception. Every entry must trace to that one decision -- no
+    silent scope creep past what Ali approved."""
+
     entries = load_allowlist(REAL_ALLOWLIST)
-    assert entries == ()
+    assert entries
+    for entry in entries:
+        assert entry["decision_ref"] == "D12 (2026-08-05)"
+        assert entry["reason"] == "D1-deferred legacy benefits ETL/intake tooling, outside the migrated radar lane"
+        assert entry["path_pattern"].startswith("repos/givecare/gc-benefits/")
 
 
 def test_load_allowlist_accepts_a_well_formed_entry(tmp_path: Path) -> None:
