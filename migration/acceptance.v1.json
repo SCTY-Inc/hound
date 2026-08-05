@@ -500,7 +500,8 @@
    ],
    "supporting": [
     "migration/evidence/lanes/pulse/",
-    "migration/evidence/lanes/benefits-radar/"
+    "migration/evidence/lanes/benefits-radar/",
+    "migration/evidence/lanes/intel-refresh/"
    ],
    "assertions": [
     "the checker rejects skipped or reordered stages and pre-gate deletion (proven against fixtures)",
@@ -510,8 +511,9 @@
    "missing": [
     "all 5 live lanes acquire through houndd, but only benefits-radar has reached the formal 'migrated' stage. pulse stops at 'shadow'; wiki-refresh, intel-refresh, and civic-policy-radar stop at 'import_mirror'; radar-curation and youtube-transcription are outside this live five-lane wave and have no ledger entries.",
     "no lane has reached 'retired' and every entry's 'legacy_absent' evidence slot is null, so the row's deletion gate ('delete only after recovery drill and one full scheduled cycle per lane') is unexercised",
-    "no lane has all nine evidence slots. Counting each lane's union across its whole chain: benefits-radar 7/9 (missing stage_ledger, legacy_absent), pulse 2/9, wiki-refresh 1/9, intel-refresh 0/9, civic-policy-radar 0/9. The 'stage_ledger' slot is null on every entry in the ledger.",
+    "no lane has all nine evidence slots. Counting each lane's union across its whole chain: benefits-radar 7/9 (missing stage_ledger, legacy_absent), pulse 2/9, wiki-refresh 1/9, intel-refresh 1/9, civic-policy-radar 0/9. The 'stage_ledger' slot is null on every entry in the ledger.",
     "the remaining lanes' full_cycle evidence depends on scheduled runs that have not happened yet (owner schedule: intel, benefits, and pulse on 2026-08-05; civic policy on the evening of 2026-08-05; wiki-refresh on 2026-08-10). Those four lanes stay partial until then; no row here claims a scheduled-run outcome in advance.",
+    "intel-refresh now has current 7de92fa7 evidence for its operational houndd cutover, but its formal import_mirror stage remains unchanged until the scheduled-cycle and Ali approval gates are met; scheduled acceptance run thr_ctbgqgpxna returned REFRESH_FAILED because Hound 0.5.0 is outside the required 0.4.x range, so the upcoming consumer repair must land before rerun.",
     "the owner's 2026-08-04 full-cutover replan superseded formal shadow parity with one real end-to-end run per lane, but the checked-in ledger retains the historical Pulse and Benefits shadow entries; their parity evidence is an explicit supersession note, not a parity comparison. The VISION ordering remains the normative contract until an owner-approved amendment."
    ],
    "deviations": []
@@ -573,7 +575,7 @@
    ],
    "assertions": [
     "VISION.md carries the amended supersession row for HSP-17 and benefits-radar/parity.md states the supersession in its own words",
-    "the replacement clause is met by a retained, dated artifact: full-cycle.md records the 2026-08-04 06:35Z discovery-benefits run acquiring only through houndd (8 searches + 6 URL captures, terminal REVIEW_REQUIRED reported), the first scheduled cycle after cutover abffd89",
+    "the replacement clause is met by a retained, dated artifact: full-cycle.md records the 2026-08-04 06:35Z discovery-benefits run acquiring only through houndd (8 searches + 6 URL captures, terminal REVIEW_REQUIRED reported), the first scheduled cycle after cutover abffd89; current-main.md binds the exact consumer repair ref f5673e4f625e138d25cf7e6b3830a0e10a74b7f4",
     "credentials were absent from the lane: the E1 matrix proves benefits-radar degraded rather than bypassed with provider keys unset",
     "the lane reached 'migrated' in the stage ledger with static-no-direct-provider, credential-unset, unix-socket, recovery-drill and full-cycle evidence bound to an approve decision by ali"
    ],
@@ -590,7 +592,9 @@
    "tests": [],
    "evidence": [
     "migration/provider-indicators.v1.json",
-    "migration/evidence/e1/raw/"
+    "migration/evidence/e1/raw/",
+    "migration/evidence/e1/no-bypass-scan.json",
+    "migration/evidence/lanes/intel-refresh/"
    ],
    "commands": [
     {
@@ -605,7 +609,7 @@
    ],
    "assertions": [
     "forbidden provider indicators are detected and uncataloged raw endpoints fail closed rather than passing silently",
-    "the static scan is clean for the lane code of all five cut-over repos",
+    "the static scan is clean for the lane code of all five operationally live repos at the current Benefits and Intel refs, with Pulse Cloudflare publication, Pulse Deepgram TTS, exact terminal-status documentation, and the exact gc-wiki Houndd-environment sentence retained as bounded non-acquisition classifications",
     "five of five live lanes ran credential-unset and degraded rather than bypassing (four owner-level runs; gc-web covers pulse and civic-policy-radar)"
    ],
    "missing": [

@@ -85,7 +85,7 @@ MATCH_FIELDS = frozenset({"kind", "value"})
 MATCH_KINDS = frozenset({"literal", "token"})
 MAX_SCAN_BYTES = 1_048_576
 MAX_LINE_BYTES = 16_384
-CANONICAL_ROW_DIGEST = "82b634972b4decdfb2055a92776e5434c0991549c5a3cddafd7bd5915a5682fe"
+CANONICAL_ROW_DIGEST = "9ab5fa20e7dee40b4bd0074aa7a795d5a7a12c8c6acf183f53f0dc68319db916"
 CANONICAL_CATALOG_DIGEST = "c319e49bae8dc4450a904e44fe08b397a93be1778cd0fbde6ef85b66323b6ca4"
 MAX_CATALOG_BYTES = 65_536
 MAX_INVENTORY_BYTES = 1_048_576
@@ -872,6 +872,87 @@ def _is_test_file(path: Path) -> bool:
     return _PYTHON_TEST_FILE.fullmatch(name) is not None or _JS_TEST_FILE.fullmatch(name) is not None
 
 
+_TERMINAL_STATUS_DOCS = frozenset(
+    {
+        "repos/givecare/gc-benefits/AUTOMATION.md",
+        "repos/givecare/gc-intel/AUTOMATION.md",
+        "repos/givecare/gc-web/AUTOMATION.md",
+        "repos/givecare/gc-wiki/AUTOMATION.md",
+    }
+)
+_PULSE_LANE_SCRIPT = "repos/givecare/gc-web/scripts/pulse-lane.sh"
+_PULSE_DRIVER = "repos/givecare/gc-web/research/hound-driver.json"
+_PULSE_PUBLICATION_OPERATIONS = frozenset({"edition.publish", "edition.audio.publish"})
+_PULSE_TTS_OPERATIONS = frozenset({"edition.audio.build"})
+_TERMINAL_STATUS_LINE = re.compile(r"lane-report\.sh\s+\"<lane-name> <TERMINAL_TOKEN> —")
+_WIKI_PROVIDER_ENV_DOC = re.compile(r"^\s*\(`EXA_API_KEY`, `FIRECRAWL_API_KEY`\) live only in houndd's own environment")
+_PULSE_OPERATION = re.compile(r'^\s{4}\"(?P<operation>edition\.(?:publish|audio\.build|audio\.publish))\"\s*:\s*\{')
+_PULSE_CASE = re.compile(r"^\s*(?P<stage>publish|audio-build|audio-publish)\)\s*$")
+
+
+def _pulse_shell_stage(lines: list[str], line_number: int) -> str | None:
+    """Return the exact Pulse case stage owning a bounded shell line."""
+
+    stage: str | None = None
+    for line in lines[:line_number]:
+        match = _PULSE_CASE.fullmatch(line)
+        if match:
+            stage = match.group("stage")
+        elif line.strip() == ";;":
+            stage = None
+    return stage
+
+
+def _pulse_driver_operation(lines: list[str], line_number: int) -> str | None:
+    """Return the exact Pulse driver operation owning a bounded env entry."""
+
+    operation: str | None = None
+    for line in lines[:line_number]:
+        match = _PULSE_OPERATION.match(line)
+        if match:
+            operation = match.group("operation")
+    return operation
+
+
+def _non_acquisition_classification(
+    consumer_id: str, relative: Path, lines: list[str], line_number: int, indicator: Mapping[str, Any]
+) -> str | None:
+    """Classify only exact consumer-owned publication/TTS or report text.
+
+    These are not provider-acquisition exceptions.  The path, provider, and
+    owning stage/operation are all closed so a discovery/search/extract/capture
+    provider hit still fails the scan.
+    """
+
+    path = relative.as_posix()
+    provider = indicator["provider"]
+    line = lines[line_number - 1]
+    if indicator["id"] == "terminal-credential" and path in _TERMINAL_STATUS_DOCS and _TERMINAL_STATUS_LINE.search(line):
+        return "consumer_owned_terminal_status"
+    if (
+        path == "repos/givecare/gc-wiki/AUTOMATION.md"
+        and indicator["id"] in {"exa-credential", "firecrawl-credential"}
+        and _WIKI_PROVIDER_ENV_DOC.fullmatch(line)
+    ):
+        return "consumer_owned_houndd_environment_documentation"
+    if consumer_id != "pulse":
+        return None
+    if path == _PULSE_LANE_SCRIPT:
+        stage = _pulse_shell_stage(lines, line_number)
+        if provider == "cloudflare" and stage in {"publish", "audio-publish"}:
+            return "consumer_owned_publication"
+        if provider == "deepgram" and stage == "audio-build":
+            return "consumer_owned_tts"
+        return None
+    if path == _PULSE_DRIVER:
+        operation = _pulse_driver_operation(lines, line_number)
+        if provider == "cloudflare" and operation in _PULSE_PUBLICATION_OPERATIONS:
+            return "consumer_owned_publication"
+        if provider == "deepgram" and operation in _PULSE_TTS_OPERATIONS:
+            return "consumer_owned_tts"
+    return None
+
+
 def _resolved_manifest_path(value: str, workspace: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else workspace / path
@@ -1064,8 +1145,22 @@ def _scan_workspace(inventory: Mapping[str, Any], catalog: Mapping[str, Any], wo
                     for indicator in known:
                         if indicator["category"] == "evidence_artifact" and re.search(r"(?i)\b(?:hound_id|record_id|artifact_id)\b", line):
                             continue
-                        finding = {"consumer_id": consumer["id"], "path": str(relative), "line": line_number, "indicator_id": indicator["id"], "category": indicator["category"], "baseline": path in legacy}
+                        classification = _non_acquisition_classification(
+                            consumer["id"], relative, lines, line_number, indicator
+                        )
+                        finding = {
+                            "consumer_id": consumer["id"],
+                            "path": str(relative),
+                            "line": line_number,
+                            "indicator_id": indicator["id"],
+                            "category": indicator["category"],
+                            "baseline": path in legacy,
+                        }
+                        if classification is not None:
+                            finding["classification"] = classification
                         findings.append(finding)
+                        if classification is not None:
+                            continue
                         if path in legacy and consumer["stage"] not in {"migrated", "retired"}:
                             baseline.append(finding)
                         else:

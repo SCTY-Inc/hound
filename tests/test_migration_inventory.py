@@ -389,6 +389,82 @@ def test_provider_transport_pairs_only_same_provider(tmp_path: Path) -> None:
     assert outbound == {"firecrawl-http-transport"}
 
 
+def test_pulse_publication_and_tts_classifications_are_exactly_bounded(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    script = workspace / "repos/givecare/gc-web/scripts/pulse-lane.sh"
+    driver = workspace / "repos/givecare/gc-web/research/hound-driver.json"
+    script.parent.mkdir(parents=True)
+    driver.parent.mkdir(parents=True)
+    script.write_text(
+        "case \"$1\" in\n"
+        "publish)\n"
+        "  load_shared_env CLOUDFLARE_API_TOKEN\n"
+        "  ;;\n"
+        "evidence)\n"
+        "  load_shared_env CLOUDFLARE_API_TOKEN\n"
+        "  ;;\n"
+        "audio-build)\n"
+        "  load_shared_env DEEPGRAM_API_KEY\n"
+        "  ;;\n"
+        "esac\n"
+    )
+    driver.write_text(
+        '{\n'
+        '    "edition.publish": {"env_allowlist": ["CLOUDFLARE_API_TOKEN"]},\n'
+        '    "source.discover": {"env_allowlist": ["CLOUDFLARE_API_TOKEN"]},\n'
+        '    "edition.audio.build": {"env_allowlist": ["DEEPGRAM_API_KEY"]}\n'
+        '}\n'
+    )
+    manifest = _manifest()
+    pulse = manifest["consumers"][0]
+    pulse["scan_roots"] = [
+        "repos/givecare/gc-web/scripts/pulse-lane.sh",
+        "repos/givecare/gc-web/research/hound-driver.json",
+    ]
+    pulse["legacy_paths"] = []
+    for other in manifest["consumers"][1:]:
+        other["scan_roots"] = []
+        other["legacy_paths"] = []
+
+    result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
+
+    assert any(":6 (cloudflare-credential)" in failure for failure in result.failures)
+    classified = {
+        (finding["path"], finding["line"]): finding["classification"]
+        for finding in result.findings
+        if "classification" in finding
+    }
+    assert classified[("repos/givecare/gc-web/scripts/pulse-lane.sh", 3)] == "consumer_owned_publication"
+    assert classified[("repos/givecare/gc-web/scripts/pulse-lane.sh", 9)] == "consumer_owned_tts"
+    assert classified[("repos/givecare/gc-web/research/hound-driver.json", 2)] == "consumer_owned_publication"
+    assert classified[("repos/givecare/gc-web/research/hound-driver.json", 4)] == "consumer_owned_tts"
+    assert ("repos/givecare/gc-web/scripts/pulse-lane.sh", 6) not in classified
+
+
+def test_documentation_classification_does_not_mask_other_provider_use(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    path = workspace / "repos/givecare/gc-wiki/AUTOMATION.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "Provider credentials\n"
+        "(`EXA_API_KEY`, `FIRECRAWL_API_KEY`) live only in houndd's own environment\n"
+        "EXA_API_KEY is read directly here\n"
+    )
+    manifest = _manifest()
+    wiki = manifest["consumers"][2]
+    wiki["scan_roots"] = ["repos/givecare/gc-wiki/AUTOMATION.md"]
+    wiki["legacy_paths"] = []
+    for other in manifest["consumers"]:
+        if other is not wiki:
+            other["scan_roots"] = []
+            other["legacy_paths"] = []
+
+    result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
+
+    assert any(":3 (exa-credential)" in failure for failure in result.failures)
+    assert any(finding.get("classification") == "consumer_owned_houndd_environment_documentation" for finding in result.findings)
+
+
 def test_artifact_hound_id_on_another_line_does_not_mask_finding(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     legacy = workspace / "legacy"

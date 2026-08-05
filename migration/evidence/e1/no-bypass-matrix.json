@@ -1,6 +1,6 @@
 {
   "schema_version": "hound.migration.no-bypass-matrix.v1",
-  "generated_at": "2026-08-04T15:25:00Z",
+  "generated_at": "2026-08-05T04:22:38Z",
   "generated_by": "E1 consolidation agent",
   "contract": "HSP-18 (VISION.md:1261): static scan plus credential-unset matrix, every migrated consumer either uses the socket or fails closed. HSP-01 (VISION.md:1244): fixture is a migrated consumer with fake provider credential and direct-client imports; assert only the allowlisted houndd adapter reaches the provider and direct/hound_cli paths fail closed.",
   "hsp_quotes": {
@@ -23,8 +23,8 @@
       "lane": "benefits-radar",
       "owner": "gc-benefits",
       "wave": 2,
-      "cutover_commit": {"repo": "repos/givecare/gc-benefits", "sha": "abffd8976543f88ba70412f939dac153b727dd39", "subject": "feat(automation): cut radar acquisition over to houndd", "date": "2026-08-03T18:26:31Z", "verified": true},
-      "goalie_reference": "GOALIE.md row M2 (M2 complete 2026-08-04: both Wave-2 lanes live on houndd, benefits-radar since abffd89; live proof included in the shared full evidence-stage cycle: 8 searches, 128 leads, 20 captures, 0 failures, 19 retained; cutover-time credential-unset acceptance criterion: 'One real run per lane, credential-unset, correct bb terminal tokens')",
+      "cutover_commit": {"repo": "repos/givecare/gc-benefits", "sha": "f5673e4f625e138d25cf7e6b3830a0e10a74b7f4", "subject": "Remove benefits direct provider adapters", "date": "2026-08-05T02:52:58Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M2 (M2 complete 2026-08-04: both Wave-2 lanes live on houndd, benefits-radar cutover abffd89; current consumer main repair f5673e4f625e138d25cf7e6b3830a0e10a74b7f4; live proof included in the shared full evidence-stage cycle: 8 searches, 128 leads, 20 captures, 0 failures, 19 retained; cutover-time credential-unset acceptance criterion: 'One real run per lane, credential-unset, correct bb terminal tokens')",
       "credential_unset_proof": {
         "run_at": "2026-08-04T15:20Z",
         "what_ran": "hound-research ingest search --owner-id gc-benefits --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd",
@@ -80,14 +80,22 @@
       "lane": "intel-refresh",
       "owner": "gc-intel",
       "wave": 3,
-      "cutover_commit": {"repo": "repos/givecare/gc-intel", "sha": "c782f49fed30621ef8fcf26c2681188a510965a0", "subject": "Cut intel-refresh acquisition over to houndd-only ingest", "date": "2026-08-04T10:48:00Z", "verified": true},
-      "goalie_reference": "GOALIE.md row M3 (intel-refresh: gc-intel c782f49 -- runbook-level swap, no new conductor; live wire proof completed)",
+      "cutover_commit": {"repo": "repos/givecare/gc-intel", "sha": "7de92fa7ed8698ecbd5545e2cb79ba7642bee008", "subject": "fix(intel): read canonical Hound URL records", "date": "2026-08-05T03:21:46Z", "verified": true},
+      "goalie_reference": "GOALIE.md row M3 (intel-refresh: gc-intel c782f49 cutover, current main repair 7de92fa7 -- canonical Hound URL records; live wire proof completed)",
       "credential_unset_proof": {
         "run_at": "2026-08-04T15:20Z",
         "what_ran": "hound-research ingest search --owner-id gc-intel --policy-id atum-owner --query \"caregiver respite programs\" against the ephemeral keyless houndd",
         "observed": {"ok": false, "outcome": "degraded", "exit_code": 4, "elapsed_seconds": 0.24, "journaled": true},
         "classification": "degraded (adapter_absent) -- fails closed",
         "evidence_files": ["migration/evidence/e1/raw/gc-intel-search.json"]
+      },
+      "scheduled_cycle_status": {
+        "run_id": "thr_ctbgqgpxna",
+        "outcome": "REFRESH_FAILED",
+        "reason": "scheduled environment had Hound 0.5.0 outside the required 0.4.x range",
+        "evidence_file": "migration/evidence/lanes/intel-refresh/scheduled-cycle-blocked.md",
+        "counts_as_full_cycle": false,
+        "formal_stage": "import_mirror"
       }
     }
   ],
@@ -107,6 +115,20 @@
     }
   },
   "static_scan_summary": {
+    "inventory_scan": {
+      "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy --json",
+      "output_file": "migration/evidence/e1/no-bypass-scan.json",
+      "valid": true,
+      "failure_count_before": 15,
+      "failure_count_after": 0,
+      "acquisition_bypass_findings_after": 0,
+      "bounded_non_acquisition_classifications": [
+        "consumer_owned_publication",
+        "consumer_owned_tts",
+        "consumer_owned_terminal_status",
+        "consumer_owned_houndd_environment_documentation"
+      ]
+    },
     "command": "uv run python -m migration.check_domain_ownership --workspace /home/deploy --json",
     "output_file": "migration/evidence/e1/ownership-scan.json",
     "total_errors_in_report": 1970,

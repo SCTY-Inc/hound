@@ -161,7 +161,7 @@
       "status": "baseline",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
-        "baseline_scan": null,
+        "baseline_scan": "repos/hound/migration/evidence/lanes/intel-refresh/import-mirror.md",
         "stage_ledger": null,
         "parity": null,
         "static_no_direct_provider": null,

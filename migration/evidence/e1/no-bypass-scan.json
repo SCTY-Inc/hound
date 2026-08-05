@@ -1,0 +1,39 @@
+{
+  "schema_version": "hound.migration.no-bypass-scan.v1",
+  "generated_at": "2026-08-05T04:22:38Z",
+  "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python migration/check_consumer_inventory.py --workspace /home/deploy --json",
+  "hound_head": "aeadbc35e20a8b9ba4f9f0baae0a004a67d839f1",
+  "consumer_refs": {
+    "gc-benefits": "f5673e4f625e138d25cf7e6b3830a0e10a74b7f4",
+    "gc-intel": "7de92fa7ed8698ecbd5545e2cb79ba7642bee008"
+  },
+  "before": {
+    "failures": 15,
+    "classifications": {
+      "pulse_consumer_owned_publication_or_tts": 9,
+      "documentation_only_terminal_status": 4,
+      "houndd_environment_documentation": 2,
+      "acquisition_bypass": 0
+    }
+  },
+  "after": {
+    "valid": true,
+    "failures": [],
+    "coverage_files": 28,
+    "findings": {
+      "consumer_owned_publication": 6,
+      "consumer_owned_tts": 3,
+      "consumer_owned_terminal_status": 4,
+      "consumer_owned_houndd_environment_documentation": 2,
+      "baseline_legacy_path_findings": 5,
+      "acquisition_bypass": 0
+    }
+  },
+  "bounded_rules": [
+    "Cloudflare is non-acquisition only in Pulse publish/audio-publish stages and edition.publish/edition.audio.publish driver operations.",
+    "Deepgram is non-acquisition only in Pulse audio-build stage and edition.audio.build driver operation.",
+    "TERMINAL_TOKEN is non-acquisition only in the four exact lane-report documentation lines.",
+    "The gc-wiki Houndd environment sentence is documentation-only; any other provider use remains a finding."
+  ],
+  "verdict": "clean: no direct acquisition bypass remains in the five operationally live lane roots"
+}
