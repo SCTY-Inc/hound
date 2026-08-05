@@ -27,6 +27,11 @@ jobs:
       # acceptance command GOALIE E6 requires.
       - name: Acceptance (manifest + suites + migration checkers)
         run: uv run python migration/check_acceptance.py --run-tests
+      # Stage-ledger chain + git-anchor check (append-only invariant): a
+      # self-consistent in-place re-derivation of committed entries passes
+      # chain verification alone, so the anchor runs explicitly in CI.
+      - name: Stage ledger (chain + append-only git anchor)
+        run: uv run python migration/check_stage_ledger.py --ledger migration/stage-ledger.v1.json
       - run: uv build
       - name: Smoke-test the built wheel
         run: |

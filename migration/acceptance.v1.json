@@ -509,7 +509,7 @@
     "the five operationally live lanes are represented in the ledger: benefits-radar is migrated, pulse is shadow, and wiki-refresh, intel-refresh, and civic-policy-radar are import_mirror; radar-curation and youtube-transcription remain outside this live five-lane wave"
    ],
    "missing": [
-    "all 5 live lanes acquire through houndd, but only benefits-radar has reached the formal 'migrated' stage. pulse stops at 'shadow'; wiki-refresh, intel-refresh, and civic-policy-radar stop at 'import_mirror'; radar-curation and youtube-transcription are outside this live five-lane wave and have no ledger entries.",
+    "all 5 live lanes acquire through houndd; benefits-radar and pulse have reached the formal 'migrated' stage with approval_refs (pulse: decision 9f58992d, 2026-08-05, D11 one-real-run semantics); wiki-refresh, intel-refresh, civic-policy-radar remain honestly below it pending their scheduled cycles",
     "no lane has reached 'retired' and every entry's 'legacy_absent' evidence slot is null, so the row's deletion gate ('delete only after recovery drill and one full scheduled cycle per lane') is unexercised",
     "no lane has all nine evidence slots. Counting each lane's union across its whole chain: benefits-radar 7/9 (missing stage_ledger, legacy_absent), pulse 2/9, wiki-refresh 1/9, intel-refresh 1/9, civic-policy-radar 0/9. The 'stage_ledger' slot is null on every entry in the ledger.",
     "the remaining lanes' full_cycle evidence depends on scheduled runs that have not happened yet (owner schedule: intel, benefits, and pulse on 2026-08-05; civic policy on the evening of 2026-08-05; wiki-refresh on 2026-08-10). Those four lanes stay partial until then; no row here claims a scheduled-run outcome in advance.",
@@ -629,7 +629,9 @@
    ],
    "evidence": [
     "migration/check_domain_ownership.py",
-    "migration/evidence/e1/ownership-scan.json"
+    "migration/evidence/e1/ownership-scan.json",
+    "migration/domain-ownership-allowlist.v1.json",
+    "migration/evidence/e3/ownership-scan-givecare.json"
    ],
    "commands": [
     {
@@ -650,8 +652,7 @@
     "the ownership checker classifies domain-logic versus evidence-mechanics indicators per lane and refuses to follow symlinks or oversized directories"
    ],
    "missing": [
-    "the full-workspace scan is not clean: 65 real ownership findings remain, all outside the five cut-over repos' lane code (shared skills under agents/_skills/**, retired agent notes, agents/helm/** ingest tooling). None have been adjudicated as allowed-or-fixed, so 'domain ownership remains outside Hound' holds for lane code and is unresolved workspace-wide",
-    "1905 of the report's 1970 errors are scanner infrastructure failures (1904 symlink refusals across pnpm trees, 1 directory-size guard), so the scan cannot currently return a clean verdict even in principle",
+    "the 2026-08-05 repo-wide rescan (migration/evidence/e3/ownership-scan-givecare.json) reduced real code-severity findings to 13, all in gc-benefits' benefit_engine pipeline, now allowlisted under D12 with visibility retained (migration/domain-ownership-allowlist.v1.json); remaining non-violation refusals are 26 infra fail-closed items (symlink/oversize/non-UTF8)",
     "the checker cannot run against the hound repo itself as a CI gate: it treats src/hound_research/*.py as domain-repo paths holding houndd-service-import indicators, which is a scanner-scope mismatch rather than a finding"
    ],
    "deviations": []
@@ -775,8 +776,8 @@
     "an approved decision with no stage-ledger outcome is reported as an unexecuted approval rather than silently passing"
    ],
    "missing": [
-    "one real approval exists, for one lane: gate-benefits-radar-migrated-2026-08-04, an approve decision by ali bound to that lane's migrated ledger entry. The row's own fixture requirement asks for Pulse and Benefits proposals plus an approve and a decline; there is no Pulse proposal and no real decline record.",
-    "pulse, wiki-refresh, intel-refresh, and civic-policy-radar acquire through houndd in production today (GOALIE M2/M3) while the ledger holds them at shadow and import_mirror, and none has an approval record. The ledger is now honest that they have not passed the gate, but the running system is already past it, so this row is unproven for four of the five live lanes rather than merely pending.",
+    "two real approvals exist: gate-benefits-radar-migrated-2026-08-04 and gate-pulse-migrated-2026-08-05 (decision seq 1, receipt a1826a89, stage-ledger entry seq 8) \u2014 the full ledger\u2192decision\u2192receipt\u2192evidence walk verifies for both",
+    "wiki-refresh, intel-refresh, and civic-policy-radar acquire through houndd in production while their formal gates remain open pending scheduled-cycle evidence",
     "the decline path, the changed-hash rejection, and the decisions-log-alone rejection are proven only against synthetic fixtures in tests/test_approvals.py",
     "the receipt's subject-artifact paths are recorded relative to the atum workspace (repos/hound/...), so the real approval walk cannot run as a CI gate against a bare checkout"
    ],

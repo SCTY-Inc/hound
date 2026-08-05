@@ -188,7 +188,10 @@ def test_workspace_path_checks_are_opt_in(tmp_path: Path) -> None:
 
 def test_migrated_stage_requires_all_evidence(tmp_path: Path) -> None:
     manifest = _manifest()
-    item = manifest["consumers"][0]
+    # A row whose evidence slots are still empty: forcing it to migrated
+    # must surface every missing slot, whichever real lanes have since
+    # legitimately migrated with full evidence.
+    item = next(row for row in manifest["consumers"] if row["evidence"]["credential_unset"] is None)
     item["stage"] = "migrated"
     item["status"] = "migrated"
     errors = validate_inventory(manifest, require_paths=False)
@@ -258,10 +261,10 @@ def test_scanner_reports_known_baseline_and_rejects_unclassified(tmp_path: Path)
     legacy.mkdir(parents=True)
     (legacy / "runner.py").write_text("import firecrawl\n# FIRECRAWL_API_KEY\n")
     manifest = _manifest()
-    item = manifest["consumers"][0]
+    item = _unmigrated_row(manifest)
     item["scan_roots"] = ["legacy"]
     item["legacy_paths"] = ["legacy/runner.py"]
-    for other in manifest["consumers"][1:]:
+    for other in (row for row in manifest["consumers"] if row is not item):
         other["scan_roots"] = []
         other["legacy_paths"] = []
     assert any("exact canonical" in error for error in validate_inventory(manifest))
@@ -471,10 +474,10 @@ def test_artifact_hound_id_on_another_line_does_not_mask_finding(tmp_path: Path)
     legacy.mkdir(parents=True)
     (legacy / "artifact.txt").write_text("firecrawl provider_response\nhound_id: known\n")
     manifest = _manifest()
-    item = manifest["consumers"][0]
+    item = _unmigrated_row(manifest)
     item["scan_roots"] = ["legacy"]
     item["legacy_paths"] = ["legacy/artifact.txt"]
-    for other in manifest["consumers"][1:]:
+    for other in (row for row in manifest["consumers"] if row is not item):
         other["scan_roots"] = []
         other["legacy_paths"] = []
     result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
@@ -521,10 +524,10 @@ def test_allowlist_is_exact_file_not_sibling_directory(tmp_path: Path) -> None:
     allowed.write_text("import firecrawl\n")
     path.write_text("import firecrawl\n")
     manifest = _manifest()
-    item = manifest["consumers"][0]
+    item = _unmigrated_row(manifest)
     item["scan_roots"] = ["repos/hound/src/hound_web_adapters"]
     item["legacy_paths"] = []
-    for other in manifest["consumers"][1:]:
+    for other in (row for row in manifest["consumers"] if row is not item):
         other["scan_roots"] = []
         other["legacy_paths"] = []
     result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
@@ -539,10 +542,10 @@ def test_scan_root_can_be_exact_file_without_directory_walk(tmp_path: Path) -> N
     file_path.parent.mkdir(parents=True)
     file_path.write_text("import firecrawl\n")
     manifest = _manifest()
-    item = manifest["consumers"][0]
+    item = _unmigrated_row(manifest)
     item["scan_roots"] = ["legacy.py"]
     item["legacy_paths"] = ["legacy.py"]
-    for other in manifest["consumers"][1:]:
+    for other in (row for row in manifest["consumers"] if row is not item):
         other["scan_roots"] = []
         other["legacy_paths"] = []
     result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
@@ -621,7 +624,14 @@ def test_acceptance_manifest_does_not_claim_hsp15_and_vision_commands_are_runnab
 @pytest.mark.parametrize("field", ["stage", "status", "cadence_authority", "credential_boundary", "evidence", "approval_ref"])
 def test_canonical_rows_freeze_all_authoritative_fields(field: str) -> None:
     manifest = _manifest()
-    manifest["consumers"][0][field] = "migrated" if field not in {"evidence", "approval_ref"} else ({"baseline_scan": "x"} if field == "evidence" else "x")
+    row = manifest["consumers"][0]
+    if field in {"evidence", "approval_ref"}:
+        mutated = {"baseline_scan": "x"} if field == "evidence" else "x"
+    else:
+        # Any value different from the row's current one: the digest must
+        # break on mutation regardless of what the live row holds today.
+        mutated = "retired" if row[field] == "migrated" else "migrated"
+    row[field] = mutated
     assert validate_inventory(manifest)
 
 
@@ -843,9 +853,12 @@ def test_evidence_artifact_does_not_pair_across_providers(tmp_path: Path) -> Non
     workspace.mkdir()
     (workspace / "legacy.py").write_text("firecrawl\nprovider_response\n")
     manifest = _manifest()
-    manifest["consumers"][0]["scan_roots"] = ["legacy.py"]
-    manifest["consumers"][0]["legacy_paths"] = ["legacy.py"]
-    for row in manifest["consumers"][1:]:
+    subject = _unmigrated_row(manifest)
+    subject["scan_roots"] = ["legacy.py"]
+    subject["legacy_paths"] = ["legacy.py"]
+    for row in manifest["consumers"]:
+        if row is subject:
+            continue
         row["scan_roots"] = []
         row["legacy_paths"] = []
     catalog = load_catalog(CATALOG)
@@ -1028,14 +1041,27 @@ def test_vision_retains_future_hsp15_contract_and_eventual_commands() -> None:
         assert command in vision
 
 
+def _unmigrated_row(manifest):
+    """First row still short of migrated: scanner-tolerance tests target
+    pre-migration semantics independent of which live lanes have crossed."""
+    return next(row for row in manifest["consumers"] if row["stage"] not in {"migrated", "retired"})
+
+
 def _scanner_fixture(tmp_path: Path, source: str):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "legacy.py").write_text(source)
     manifest = _manifest()
-    manifest["consumers"][0]["scan_roots"] = ["legacy.py"]
-    manifest["consumers"][0]["legacy_paths"] = ["legacy.py"]
-    for row in manifest["consumers"][1:]:
+    # Pin the subject to a row that is not yet migrated: the scanner is
+    # stricter about migrated consumers, and these cases exercise the
+    # pre-migration tolerance semantics regardless of which real lanes
+    # have since crossed the gate.
+    subject = next(row for row in manifest["consumers"] if row["stage"] not in {"migrated", "retired"})
+    subject["scan_roots"] = ["legacy.py"]
+    subject["legacy_paths"] = ["legacy.py"]
+    for row in manifest["consumers"]:
+        if row is subject:
+            continue
         row["scan_roots"] = []
         row["legacy_paths"] = []
     return manifest, workspace

@@ -52,23 +52,23 @@
         "ingest.search",
         "ingest.url"
       ],
-      "blocked_reason": "Operationally live on houndd; formal migrated stage awaits retained scheduled-cycle evidence and Ali cutover approval.",
+      "blocked_reason": null,
       "wave": 2,
-      "stage": "shadow",
-      "status": "shadow",
+      "stage": "migrated",
+      "status": "migrated",
       "credential_boundary": "provider_credentials_owned_only_by_houndd_after_cutover",
       "evidence": {
         "baseline_scan": "repos/hound/migration/evidence/lanes/pulse/import-mirror.md",
-        "stage_ledger": null,
+        "stage_ledger": "repos/hound/migration/stage-ledger.v1.json",
         "parity": "repos/hound/migration/evidence/lanes/pulse/parity.md",
-        "static_no_direct_provider": null,
-        "credential_unset": null,
-        "unix_socket": null,
-        "recovery_drill": null,
-        "full_cycle": null,
+        "static_no_direct_provider": "repos/hound/migration/evidence/lanes/pulse/static-no-direct-provider.md",
+        "credential_unset": "repos/hound/migration/evidence/lanes/pulse/credential-unset.md",
+        "unix_socket": "repos/hound/migration/evidence/lanes/pulse/unix-socket.md",
+        "recovery_drill": "repos/hound/migration/evidence/lanes/pulse/recovery-drill.md",
+        "full_cycle": "repos/hound/migration/evidence/lanes/pulse/full-cycle.md",
         "legacy_absent": null
       },
-      "approval_ref": null
+      "approval_ref": "9f58992daeb5ec4081a68a452ed331f55b8a5ddc70be0f71f41521b7f61eed3d"
     },
     {
       "id": "benefits-radar",
@@ -164,9 +164,9 @@
         "baseline_scan": "repos/hound/migration/evidence/lanes/intel-refresh/import-mirror.md",
         "stage_ledger": null,
         "parity": null,
-        "static_no_direct_provider": null,
-        "credential_unset": null,
-        "unix_socket": null,
+        "static_no_direct_provider": "repos/hound/migration/evidence/lanes/intel-refresh/static-no-direct-provider.md",
+        "credential_unset": "repos/hound/migration/evidence/lanes/intel-refresh/credential-unset.md",
+        "unix_socket": "repos/hound/migration/evidence/lanes/intel-refresh/unix-socket.md",
         "recovery_drill": null,
         "full_cycle": null,
         "legacy_absent": null
