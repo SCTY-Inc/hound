@@ -18,15 +18,20 @@ HSP-19 draws one boundary in both directions:
   through the ``hound-research`` CLI or the ``hound_client`` library, neither
   of which trips these indicators.
 
-The scanner reuses consumer_inventory's bounded, symlink-safe directory walk
-(``_scan_candidates``/``_path_problem``) so the same fail-closed discipline
-governs both checkers.
+The scanner reuses consumer_inventory's fail-closed symlink/size/entry-count
+guards (``_path_problem``) but walks with its own directory-pruning traversal
+(``_prune_walk``): HSP-19 scans whole consumer repos rather than
+consumer_inventory's bounded per-lane scan_roots lists, so it must not
+descend into node_modules/.venv/.hound/dist/build trees the way a lane-scoped
+scan safely can.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import fnmatch
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -39,18 +44,24 @@ from migration.consumer_inventory import (
     InventoryError,
     MAX_LINE_BYTES,
     MAX_SCAN_BYTES,
+    MAX_SCAN_ENTRIES,
     _matches,
     _path_problem,
-    _scan_candidates,
     load_catalog,
 )
 
-SCHEMA_VERSION = "hound.migration.domain-ownership.v1"
+SCHEMA_VERSION = "hound.migration.domain-ownership.v2"
 HOUND_LANE = "repos/hound"
 
 # Directories that are never source-of-truth for ownership evidence, on top
-# of consumer_inventory's own scanner exclusions.
-_EXTRA_EXCLUSIONS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "dist", "build"})
+# of consumer_inventory's own scanner exclusions. ".hound" holds Hound's own
+# run/plan/record receipts that get written into a driven consumer repo --
+# those are Hound's evidence-mechanics artifacts by construction, not the
+# domain repo authoring evidence mechanics, so they must not count as HSP-19
+# findings for that repo's lane.
+_EXTRA_EXCLUSIONS = frozenset(
+    {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "dist", "build", ".hound"}
+)
 _ALL_EXCLUSIONS = EXCLUSIONS | _EXTRA_EXCLUSIONS
 
 # Provider-indicator categories that represent a domain repo directly holding
@@ -127,8 +138,120 @@ def classify_line(line: str, catalog: Mapping[str, Any]) -> tuple[list[str], lis
     return domain_ids, evidence_ids
 
 
+def _indicator_category_map(catalog: Mapping[str, Any]) -> dict[str, str]:
+    """Map every indicator id (across all three catalogs) to its category."""
+
+    mapping: dict[str, str] = {}
+    for indicator in (*DOMAIN_LOGIC_INDICATORS, *HOUND_INTERNAL_INDICATORS, *catalog.get("indicators", [])):
+        mapping[indicator["id"]] = indicator.get("category", "")
+    return mapping
+
+
+def severity_for_path(relative: Path) -> str:
+    """Markdown is instructional text, never executed -- HSP-19 treats a hit
+    there as a "documentation" severity finding, distinct from a code path
+    that can actually acquire through a provider."""
+
+    return "documentation" if relative.suffix.lower() == ".md" else "code"
+
+
+ALLOWLIST_SCHEMA_VERSION = "hound.migration.domain-ownership-allowlist.v1"
+
+
+def load_allowlist(path: Path) -> tuple[dict[str, Any], ...]:
+    """Load and validate the file-based, reasoned HSP-19 allowlist.
+
+    Each entry silences the evidence-mechanics violation for paths matching
+    its glob pattern, but the underlying hit still appears in the capability
+    dump (as allowlisted, with its reason and decision reference) -- an
+    allowlist entry suppresses enforcement, never visibility.
+    """
+
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InventoryError(f"cannot load ownership allowlist {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise InventoryError("ownership allowlist JSON must be an object")
+    if value.get("schema_version") != ALLOWLIST_SCHEMA_VERSION:
+        raise InventoryError(f"ownership allowlist schema_version must be {ALLOWLIST_SCHEMA_VERSION!r}")
+    entries = value.get("entries")
+    if not isinstance(entries, list):
+        raise InventoryError("ownership allowlist 'entries' must be a list")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise InventoryError(f"ownership allowlist entry {index} must be an object")
+        for field_name in ("path_pattern", "reason", "decision_ref"):
+            if not isinstance(entry.get(field_name), str) or not entry[field_name].strip():
+                raise InventoryError(f"ownership allowlist entry {index} missing non-empty {field_name!r}")
+    return tuple(entries)
+
+
+def _allowlist_match(relative: Path, allowlist: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    posix = relative.as_posix()
+    for entry in allowlist:
+        if fnmatch.fnmatch(posix, entry["path_pattern"]):
+            return entry
+    return None
+
+
 def _excluded(path: Path) -> bool:
     return any(part in _ALL_EXCLUSIONS for part in path.parts)
+
+
+def _prune_walk(root: Path, workspace: Path, failures: list[str]) -> list[Path]:
+    """Walk *root* like consumer_inventory's ``_scan_candidates``, but prune
+    excluded directory names (node_modules, .venv, .hound, ...) before
+    descending into them instead of only filtering the returned candidate
+    list afterward.
+
+    consumer_inventory's shared walker fails closed on every symlink it
+    meets while descending -- correct for its own bounded, lane-scoped scan
+    roots, but HSP-19 walks whole consumer repos, and a pnpm-managed repo's
+    node_modules tree is thousands of hoisting symlinks. Without pruning,
+    one repo alone floods the report with over a thousand "uses symlink"
+    scanner-infrastructure failures that bury the real ownership signal.
+    Pruning a known-excluded, non-symlinked directory by name is not a
+    fail-open weakening: nothing under it is ever a source of ownership
+    evidence, and any actual symlink escape attempt at or below an excluded
+    directory boundary is still refused the moment a non-excluded path is
+    reached, exactly as before.
+    """
+
+    if root.is_file():
+        return [root]
+    candidates: list[Path] = []
+    pending = [root]
+    entries_seen = 0
+    while pending:
+        directory = pending.pop()
+        relative_directory = directory.relative_to(workspace)
+        try:
+            with os.scandir(directory) as iterator:
+                entries = []
+                for entry in iterator:
+                    if entries_seen >= MAX_SCAN_ENTRIES:
+                        failures.append(f"scan directory {relative_directory}: exceeds {MAX_SCAN_ENTRIES} entries")
+                        return candidates
+                    entries_seen += 1
+                    entries.append(entry)
+        except OSError:
+            failures.append(f"scan directory {relative_directory}: unreadable")
+            continue
+        for entry in sorted(entries, key=lambda entry: entry.name):
+            path = Path(entry.path)
+            if entry.name in _ALL_EXCLUSIONS and entry.is_dir(follow_symlinks=False):
+                continue
+            problem = _path_problem(path, workspace)
+            if problem:
+                failures.append(f"scan file {path.relative_to(workspace)}: {problem}")
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+            else:
+                candidates.append(path)
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -136,6 +259,8 @@ class LaneCapability:
     lane: str
     domain_logic_files: list[dict[str, Any]] = field(default_factory=list)
     evidence_mechanics_files: list[dict[str, Any]] = field(default_factory=list)
+    evidence_mechanics_documentation: list[dict[str, Any]] = field(default_factory=list)
+    evidence_mechanics_allowlisted: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -145,13 +270,21 @@ class OwnershipResult:
     failures: list[str]
 
 
-def scan_workspace(workspace: Path, catalog: Mapping[str, Any], *, roots: Sequence[str] = DEFAULT_ROOTS) -> OwnershipResult:
+def scan_workspace(
+    workspace: Path,
+    catalog: Mapping[str, Any],
+    *,
+    roots: Sequence[str] = DEFAULT_ROOTS,
+    allowlist: Sequence[Mapping[str, Any]] = (),
+) -> OwnershipResult:
     """Scan bounded *roots* under *workspace* and classify every file's ownership."""
 
     workspace = workspace.resolve()
     failures: list[str] = []
     lanes: dict[str, LaneCapability] = {}
     seen: set[Path] = set()
+    category_of = _indicator_category_map(catalog)
+    hits: list[dict[str, Any]] = []
 
     for raw_root in roots:
         requested = workspace / raw_root
@@ -163,7 +296,7 @@ def scan_workspace(workspace: Path, catalog: Mapping[str, Any], *, roots: Sequen
         if not (root.is_file() or root.is_dir()):
             failures.append(f"scan root {raw_root}: not a file or directory")
             continue
-        for path in _scan_candidates(root, workspace, failures):
+        for path in _prune_walk(root, workspace, failures):
             if path in seen:
                 continue
             relative = path.relative_to(workspace)
@@ -194,18 +327,56 @@ def scan_workspace(workspace: Path, catalog: Mapping[str, Any], *, roots: Sequen
                 continue
 
             lane = lane_for_path(relative)
+            severity = severity_for_path(relative)
+            allowlist_entry = _allowlist_match(relative, allowlist)
             domain_ids: set[str] = set()
             evidence_ids: set[str] = set()
-            for line in lines:
+            for line_number, line in enumerate(lines, start=1):
                 found_domain, found_evidence = classify_line(line, catalog)
                 domain_ids.update(found_domain)
                 evidence_ids.update(found_evidence)
+                for indicator_id in found_domain:
+                    hits.append(
+                        {
+                            "lane": lane,
+                            "path": str(relative),
+                            "line": line_number,
+                            "indicator_id": indicator_id,
+                            "category": category_of.get(indicator_id, ""),
+                            "class": "domain_logic",
+                            "severity": severity,
+                            "allowlisted": False,
+                            "allowlist_reason": None,
+                        }
+                    )
+                for indicator_id in found_evidence:
+                    hits.append(
+                        {
+                            "lane": lane,
+                            "path": str(relative),
+                            "line": line_number,
+                            "indicator_id": indicator_id,
+                            "category": category_of.get(indicator_id, ""),
+                            "class": "evidence_mechanics",
+                            "severity": severity,
+                            "allowlisted": allowlist_entry is not None,
+                            "allowlist_reason": allowlist_entry["reason"] if allowlist_entry else None,
+                        }
+                    )
 
             entry = lanes.setdefault(lane, LaneCapability(lane))
             if domain_ids:
                 entry.domain_logic_files.append({"path": str(relative), "indicator_ids": sorted(domain_ids)})
             if evidence_ids:
-                entry.evidence_mechanics_files.append({"path": str(relative), "indicator_ids": sorted(evidence_ids)})
+                record = {"path": str(relative), "indicator_ids": sorted(evidence_ids)}
+                if allowlist_entry is not None:
+                    entry.evidence_mechanics_allowlisted.append(
+                        {**record, "reason": allowlist_entry["reason"], "decision_ref": allowlist_entry["decision_ref"]}
+                    )
+                elif severity == "documentation":
+                    entry.evidence_mechanics_documentation.append(record)
+                else:
+                    entry.evidence_mechanics_files.append(record)
 
     violations: list[str] = []
     for lane in sorted(lanes):
@@ -223,6 +394,7 @@ def scan_workspace(workspace: Path, catalog: Mapping[str, Any], *, roots: Sequen
                     f"{', '.join(finding['indicator_ids'])} outside the allowed hound seams (HSP-19)"
                 )
 
+    hits.sort(key=lambda item: (item["path"], item["line"], item["indicator_id"]))
     capability_dump = {
         "schema_version": SCHEMA_VERSION,
         "lanes": [
@@ -230,9 +402,16 @@ def scan_workspace(workspace: Path, catalog: Mapping[str, Any], *, roots: Sequen
                 "lane": lane,
                 "domain_logic_files": sorted(lanes[lane].domain_logic_files, key=lambda item: item["path"]),
                 "evidence_mechanics_files": sorted(lanes[lane].evidence_mechanics_files, key=lambda item: item["path"]),
+                "evidence_mechanics_documentation": sorted(
+                    lanes[lane].evidence_mechanics_documentation, key=lambda item: item["path"]
+                ),
+                "evidence_mechanics_allowlisted": sorted(
+                    lanes[lane].evidence_mechanics_allowlisted, key=lambda item: item["path"]
+                ),
             }
             for lane in sorted(lanes)
         ],
+        "hits": hits,
     }
     return OwnershipResult(capability_dump, violations, failures)
 
@@ -243,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="check-domain-ownership", exit_on_error=False)
     parser.add_argument("--workspace", type=Path, required=True, help="workspace to scan")
     parser.add_argument("--catalog", type=Path, default=Path(__file__).with_name("provider-indicators.v1.json"))
+    parser.add_argument("--allowlist", type=Path, default=Path(__file__).with_name("domain-ownership-allowlist.v1.json"))
     parser.add_argument("--root", action="append", dest="roots", help="workspace-relative scan root (repeatable)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     try:
@@ -254,7 +434,13 @@ def main(argv: list[str] | None = None) -> int:
     result: OwnershipResult | None = None
     try:
         catalog = load_catalog(args.catalog)
-        result = scan_workspace(args.workspace, catalog, roots=tuple(args.roots) if args.roots else DEFAULT_ROOTS)
+        allowlist = load_allowlist(args.allowlist)
+        result = scan_workspace(
+            args.workspace,
+            catalog,
+            roots=tuple(args.roots) if args.roots else DEFAULT_ROOTS,
+            allowlist=allowlist,
+        )
         errors.extend(result.failures)
         errors.extend(result.violations)
     except InventoryError as exc:
@@ -273,6 +459,13 @@ def main(argv: list[str] | None = None) -> int:
         print("valid" if report["valid"] else "invalid")
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
+        if result is not None:
+            doc_hits = sum(len(lane["evidence_mechanics_documentation"]) for lane in result.capability_dump["lanes"])
+            allow_hits = sum(len(lane["evidence_mechanics_allowlisted"]) for lane in result.capability_dump["lanes"])
+            if doc_hits:
+                print(f"NOTE: {doc_hits} documentation-severity hit(s) reported, not counted as violations", file=sys.stderr)
+            if allow_hits:
+                print(f"NOTE: {allow_hits} allowlisted hit(s) reported, not counted as violations", file=sys.stderr)
     return 0 if report["valid"] else 1
 
 
