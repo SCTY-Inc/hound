@@ -274,6 +274,26 @@ def test_scanner_reports_known_baseline_and_rejects_unclassified(tmp_path: Path)
     assert any("unclassified" in error for error in result.failures)
 
 
+def test_scanner_skips_named_test_files_under_a_production_root(tmp_path: Path) -> None:
+    """HSP-18 permits tests, including TypeScript tests under ``src``."""
+
+    workspace = tmp_path / "workspace"
+    surface = workspace / "surface"
+    surface.mkdir(parents=True)
+    (surface / "intake-ledger.test.ts").write_text("const OWNER_TOKEN = 'fixture';\n")
+    manifest = _manifest()
+    manifest["consumers"][0]["scan_roots"] = ["surface"]
+    manifest["consumers"][0]["legacy_paths"] = []
+    for other in manifest["consumers"][1:]:
+        other["scan_roots"] = []
+        other["legacy_paths"] = []
+
+    result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
+
+    assert result.failures == []
+    assert result.coverage == []
+
+
 def test_provider_transport_requires_provider_pair(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     legacy = workspace / "legacy"
@@ -1470,5 +1490,4 @@ def test_checked_in_rows_match_the_stage_ledger() -> None:
         if row["stage"] == "freeze_contracts":
             assert row["approval_ref"] is None
             assert all(value is None for value in row["evidence"].values())
-
 

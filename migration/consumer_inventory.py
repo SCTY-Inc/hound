@@ -859,6 +859,13 @@ def _excluded(path: Path) -> bool:
     return any(part in EXCLUSIONS for part in path.parts)
 
 
+def _is_test_file(path: Path) -> bool:
+    """Recognize a named test that lives beside production source files."""
+
+    name = path.name
+    return name.startswith("test_") or ".test." in name or ".spec." in name
+
+
 def _resolved_manifest_path(value: str, workspace: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else workspace / path
@@ -979,6 +986,8 @@ def _scan_workspace(inventory: Mapping[str, Any], catalog: Mapping[str, Any], wo
         for root in roots:
             for path in _scan_candidates(root, workspace, failures):
                 if path in seen_files:
+                    continue
+                if _is_test_file(path):
                     continue
                 if _excluded(path.relative_to(workspace)):
                     failures.append(f"scan file {path.relative_to(workspace)}: declared exclusion")
