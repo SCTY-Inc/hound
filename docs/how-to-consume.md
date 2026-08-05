@@ -84,6 +84,37 @@ this resnapshot revisits the filtered history from the start, expect it to
 redeliver already-processed entries for a few subsequent pages until it
 catches up again — idempotent processing is what makes that safe.
 
+## Choosing an order (and switching safely)
+
+`journal.query` accepts an optional `order`: `"ascending"` (the default,
+oldest-first — what the reference consumer above always uses) or
+`"descending"` (newest-first, added in hound B14 for lanes that only care
+about recent activity, e.g. a review surface). Pass it through
+`hound_client`'s `journal_query(..., order=...)`.
+
+A cursor is bound to the order that minted it. houndd folds `order` into the
+same `filter_hash` domain that already binds a cursor to its filter, so a
+cursor minted under one order is rejected outright if replayed under the
+other — the same `CursorRejectedError` the reference consumer already
+handles by resnapshotting cursorless (see above). Legacy cursors minted
+before `order` existed keep their original digest domain unchanged, so
+nothing already deployed broke when B14 shipped.
+
+**The consequence for a lane's own state file**: never just start passing a
+different `order` to a lane that already has a persisted, non-null cursor.
+Reset it first — delete the lane's `consumer-state.json` (or otherwise set
+its `cursor` back to `null`) before the first query under the new order.
+This is the same resnapshot path already used for an exhausted or rejected
+cursor, and the same idempotent-processing guarantee is what makes the
+resulting redelivery of already-seen entries safe rather than a source of
+duplicate effects.
+
+A consumer that never persists a cursor across invocations at all — for
+example an on-demand, request-scoped read-through that always walks from a
+fresh cursorless query — has nothing to reset and no cross-order hazard to
+begin with; the caveat above only binds lanes that adopt the per-lane state
+file in the first place.
+
 ## When the cursor is rejected
 
 An unrecoverable cursor (malformed, or bound to an identity/key generation

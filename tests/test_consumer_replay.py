@@ -126,6 +126,18 @@ def _stop_service(process: subprocess.Popen) -> None:
     process.wait(timeout=5)
 
 
+def _kill_service(process: subprocess.Popen) -> None:
+    """Send SIGKILL: no shutdown hook runs, unlike the graceful terminate above.
+
+    Used by the mid-stream restart test so the daemon side of the crash has
+    no chance to flush or checkpoint anything beyond what it already
+    fsynced -- the consumer's own crash-tolerance is what has to hold.
+    """
+
+    process.kill()
+    process.wait(timeout=5)
+
+
 def _drain(
     socket_path: Path,
     state_path: Path,
@@ -202,6 +214,68 @@ def test_consumer_replays_across_restart_without_loss_or_duplicates(tmp_path: Pa
     ledger = _ledger_entry_ids(output_path)
     assert ledger == first_batch + second_batch
     assert len(ledger) == len(set(ledger)) == 8
+
+
+def test_consumer_survives_a_daemon_sigkill_mid_drain(tmp_path: Path) -> None:
+    """Kill houndd (SIGKILL, no graceful shutdown) while the consumer is only
+    partway through draining a backlog, then restart it and finish the drain.
+
+    This is stricter than the two prior restart tests: those stop and
+    restart houndd only *between* fully-drained batches. Here the daemon
+    dies with entries still unread and a cursor already persisted mid-page,
+    so the next run resumes from that exact point against a freshly started
+    daemon instance -- proving cursor persistence survives an ungraceful
+    daemon death, not just a graceful one.
+    """
+
+    state_root = tmp_path / "state"
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    socket_path = runtime / "houndd.sock"
+    consumer_state_path = tmp_path / "lane" / "reader-policy-consumer.consumer-state.json"
+    output_path = tmp_path / "lane" / "reader.jsonl"
+
+    state_root.mkdir(mode=0o700)
+    _write_policy(state_root)
+    entry_ids = _seed_events(state_root, start_sequence=0, count=6)
+
+    process = _start_service(state_root, socket_path)
+    try:
+        # Drain two pages of two, leaving two entries and a live (non-null)
+        # cursor persisted on disk -- the mid-stream point.
+        first = consumer.run_once(
+            socket_path, consumer_state_path, output_path,
+            owner_id=OWNER_ID, policy_id=POLICY_ID, run_id=RUN_ID, limit=2,
+        )
+        second = consumer.run_once(
+            socket_path, consumer_state_path, output_path,
+            owner_id=OWNER_ID, policy_id=POLICY_ID, run_id=RUN_ID, limit=2,
+        )
+        assert first == 2 and second == 2
+        assert consumer.load_state(consumer_state_path).get("cursor") is not None
+        assert _ledger_entry_ids(output_path) == entry_ids[:4]
+    finally:
+        _kill_service(process)
+
+    # houndd is dead with no shutdown hook run, and unlike a graceful stop
+    # nothing unlinked the socket file. houndd's own bind is an atomic
+    # no-replace publish (service.py's RENAME_NOREPLACE) that refuses to
+    # bind over a pre-existing name -- in production this is safe only
+    # because RuntimeDirectory=hound has no RuntimeDirectoryPreserve=, so
+    # systemd wipes and recreates the runtime dir on every (re)start.
+    # Reproduce that guarantee here rather than assuming a bare rebind
+    # would work over the stale file.
+    socket_path.unlink(missing_ok=True)
+    process = _start_service(state_root, socket_path)
+    try:
+        new_count = _drain(socket_path, consumer_state_path, output_path, limit=2)
+    finally:
+        _stop_service(process)
+
+    assert new_count == 2
+    ledger = _ledger_entry_ids(output_path)
+    assert ledger == entry_ids
+    assert len(ledger) == len(set(ledger)) == 6
 
 
 def test_consumer_process_then_persist_survives_a_crash_between_the_two_steps(tmp_path: Path) -> None:
