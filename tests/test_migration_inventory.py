@@ -274,24 +274,86 @@ def test_scanner_reports_known_baseline_and_rejects_unclassified(tmp_path: Path)
     assert any("unclassified" in error for error in result.failures)
 
 
-def test_scanner_skips_named_test_files_under_a_production_root(tmp_path: Path) -> None:
-    """HSP-18 permits tests, including TypeScript tests under ``src``."""
-
-    workspace = tmp_path / "workspace"
-    surface = workspace / "surface"
-    surface.mkdir(parents=True)
-    (surface / "intake-ledger.test.ts").write_text("const OWNER_TOKEN = 'fixture';\n")
+def _test_file_manifest() -> dict[str, object]:
     manifest = _manifest()
     manifest["consumers"][0]["scan_roots"] = ["surface"]
     manifest["consumers"][0]["legacy_paths"] = []
     for other in manifest["consumers"][1:]:
         other["scan_roots"] = []
         other["legacy_paths"] = []
+    return manifest
 
-    result = _scan_workspace(manifest, load_catalog(CATALOG), workspace)
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_inventory.py",
+        *[
+            f"inventory.{kind}.{extension}"
+            for kind in ("test", "spec")
+            for extension in ("js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts")
+        ],
+    ],
+)
+def test_scanner_skips_only_exact_named_test_files(tmp_path: Path, name: str) -> None:
+    """HSP-18 permits only exact Python and JS/TS-family test filenames."""
+
+    workspace = tmp_path / "workspace"
+    surface = workspace / "surface"
+    surface.mkdir(parents=True)
+    (surface / name).write_text("FIRECRAWL_API_KEY = 'fixture'\n")
+
+    result = _scan_workspace(_test_file_manifest(), load_catalog(CATALOG), workspace)
 
     assert result.failures == []
     assert result.coverage == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["prod.test.ts.bak", "prod.spec.ts~", "test_prod.py.bak", "test_prod.sh"],
+)
+def test_scanner_rejects_production_shaped_test_suffix_tricks(tmp_path: Path, name: str) -> None:
+    """An anchored test suffix cannot hide a provider credential."""
+
+    workspace = tmp_path / "workspace"
+    surface = workspace / "surface"
+    surface.mkdir(parents=True)
+    (surface / name).write_text("FIRECRAWL_API_KEY = 'fixture'\n")
+
+    result = _scan_workspace(_test_file_manifest(), load_catalog(CATALOG), workspace)
+
+    assert any("direct-provider indicator" in error for error in result.failures)
+
+
+def test_scanner_rejects_test_named_directories_and_controlled_test_filenames(tmp_path: Path) -> None:
+    """Only a valid, safe file name is excluded; directories and controls are not."""
+
+    workspace = tmp_path / "workspace"
+    surface = workspace / "surface"
+    (surface / "prod.test").mkdir(parents=True)
+    (surface / "prod.test" / "production.ts").write_text("FIRECRAWL_API_KEY = 'fixture'\n")
+    (surface / "test_\x01.py").write_text("FIRECRAWL_API_KEY = 'fixture'\n")
+
+    result = _scan_workspace(_test_file_manifest(), load_catalog(CATALOG), workspace)
+
+    assert any("direct-provider indicator" in error for error in result.failures)
+    assert any("control" in error for error in result.failures)
+
+
+def test_scanner_rejects_a_test_named_symlink(tmp_path: Path) -> None:
+    """A test-looking symlink remains an unsafe path, never an exclusion."""
+
+    workspace = tmp_path / "workspace"
+    surface = workspace / "surface"
+    surface.mkdir(parents=True)
+    target = surface / "production.ts"
+    target.write_text("FIRECRAWL_API_KEY = 'fixture'\n")
+    (surface / "test_bypass.py").symlink_to(target)
+
+    result = _scan_workspace(_test_file_manifest(), load_catalog(CATALOG), workspace)
+
+    assert any("uses symlink" in error for error in result.failures)
 
 
 def test_provider_transport_requires_provider_pair(tmp_path: Path) -> None:
@@ -1490,4 +1552,3 @@ def test_checked_in_rows_match_the_stage_ledger() -> None:
         if row["stage"] == "freeze_contracts":
             assert row["approval_ref"] is None
             assert all(value is None for value in row["evidence"].values())
-

@@ -859,11 +859,17 @@ def _excluded(path: Path) -> bool:
     return any(part in EXCLUSIONS for part in path.parts)
 
 
+_PYTHON_TEST_FILE = re.compile(r"^test_[A-Za-z0-9][A-Za-z0-9_.-]*\.py$")
+_JS_TEST_FILE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$"
+)
+
+
 def _is_test_file(path: Path) -> bool:
-    """Recognize a named test that lives beside production source files."""
+    """Recognize only closed, anchored test filename forms."""
 
     name = path.name
-    return name.startswith("test_") or ".test." in name or ".spec." in name
+    return _PYTHON_TEST_FILE.fullmatch(name) is not None or _JS_TEST_FILE.fullmatch(name) is not None
 
 
 def _resolved_manifest_path(value: str, workspace: Path) -> Path:
@@ -987,14 +993,14 @@ def _scan_workspace(inventory: Mapping[str, Any], catalog: Mapping[str, Any], wo
             for path in _scan_candidates(root, workspace, failures):
                 if path in seen_files:
                     continue
+                problem = _path_problem(path, workspace)
+                if problem:
+                    failures.append(f"scan file {path.relative_to(workspace)}: {problem}")
+                    continue
                 if _is_test_file(path):
                     continue
                 if _excluded(path.relative_to(workspace)):
                     failures.append(f"scan file {path.relative_to(workspace)}: declared exclusion")
-                    continue
-                problem = _path_problem(path, workspace)
-                if problem:
-                    failures.append(f"scan file {path.relative_to(workspace)}: {problem}")
                     continue
                 if path.is_dir():
                     continue
