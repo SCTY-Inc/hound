@@ -13,7 +13,10 @@ Documentation=file:%h/repos/hound/ops/systemd/README.md
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hound/houndd.env
-ExecStart=%h/.local/bin/houndd serve --state %S/discovery --socket %t/hound/houndd.sock
+# %S is the state ROOT (~/.local/state) — StateDirectory=hound only exempts
+# the subdir and sets $STATE_DIRECTORY; it does not graft "hound/" into %S.
+# The subdir must appear literally here, exactly as %t/hound/ does below.
+ExecStart=%h/.local/bin/houndd serve --state %S/hound/discovery --socket %t/hound/houndd.sock
 
 Restart=on-failure
 RestartSec=1

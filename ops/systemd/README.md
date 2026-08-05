@@ -44,6 +44,13 @@ rm -rf ~/.config/systemd/user/houndd.service.d
 #    socket and state paths (StateDirectory=hound -> ~/.local/state/hound,
 #    RuntimeDirectory=hound -> $XDG_RUNTIME_DIR/hound), so existing
 #    consumers need no reconfiguration.
+#    CAUTION (learned 2026-08-05, one crash-looped live attempt): %S/%t in
+#    ExecStart expand to the state/runtime ROOT only — StateDirectory= and
+#    RuntimeDirectory= exempt their subdir from sandboxing and set env vars,
+#    but do NOT graft "hound/" into the specifier. Every ExecStart path must
+#    spell the subdir literally: %S/hound/discovery, %t/hound/houndd.sock.
+#    A bare %S/discovery lands outside the writable bind-mount and the
+#    daemon crash-loops on a read-only filesystem before binding the socket.
 systemctl --user daemon-reload
 systemctl --user restart houndd.service
 systemctl --user status houndd.service
