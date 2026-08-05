@@ -1,0 +1,32 @@
+{
+ "gate_id": "gate-pulse-migrated-2026-08-05",
+ "lane": "pulse",
+ "queue_ref": "https://review.givecareapp.com/",
+ "requested_at": "2026-08-05T00:00:00Z",
+ "schema_version": "hound.approval.gate-receipt.v1",
+ "subject": {
+  "artifacts": [
+   {
+    "hash": "3787af6b1f4c4bc61a88492996f1c7631db399e548d20b1cd43e53fbb7f9a21d",
+    "path": "repos/hound/migration/evidence/lanes/pulse/static-no-direct-provider.md"
+   },
+   {
+    "hash": "702b67d92a8c550ad2ddc696ca41f917070def466dff691b63d631bb83881eae",
+    "path": "repos/hound/migration/evidence/lanes/pulse/credential-unset.md"
+   },
+   {
+    "hash": "303e297164e097645d47f3417509f77e1a1ade5082704194f1c8e8cc6537fc20",
+    "path": "repos/hound/migration/evidence/lanes/pulse/unix-socket.md"
+   },
+   {
+    "hash": "3852c714c9f877b4eaf1e0d32cc81fbf5ba104e5a92bc999a85c8b9e1761938b",
+    "path": "repos/hound/migration/evidence/lanes/pulse/recovery-drill.md"
+   },
+   {
+    "hash": "fc0c89aaec50e2515e69baca7729428548175495ec1559e1cdc340fe1a7601ab",
+    "path": "repos/hound/migration/evidence/lanes/pulse/full-cycle.md"
+   }
+  ],
+  "plan_id": "cutover-pulse-2026-08"
+ }
+}
