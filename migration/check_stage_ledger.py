@@ -11,7 +11,7 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from migration.stage_ledger import LedgerError, lane_stage, load_ledger, validate_deletion, validate_ledger
+from migration.stage_ledger import LedgerError, lane_stage, load_ledger, validate_anchor, validate_deletion, validate_ledger
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,6 +21,21 @@ def main(argv: list[str] | None = None) -> int:
         "--check-deletion",
         metavar="LANE",
         help="also verify LANE has reached the retired stage before its legacy paths may be deleted",
+    )
+    parser.add_argument(
+        "--anchor-ref",
+        default="HEAD",
+        metavar="REF",
+        help=(
+            "git ref to anchor the ledger against (default: HEAD). The hash chain alone cannot tell a legitimate "
+            "append from a historical entry that was rewritten with every downstream hash re-derived to match; "
+            "this check additionally requires every entry already committed at REF to still appear byte-identical "
+            "at the same position -- the ledger may only append. It runs automatically whenever --ledger sits "
+            "inside a git checkout and degrades to a non-fatal 'unavailable' status outside one (e.g. an exported "
+            "copy) or when the file is untracked at REF. KNOWN CONSEQUENCE: a working tree that has rewritten any "
+            "historical entry in place -- even one that re-derives a self-consistent hash chain -- will correctly "
+            "fail this check until that rewrite is committed. That is the check doing its job, not a bug."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     try:
@@ -36,6 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     except LedgerError as exc:
         errors.append(str(exc))
 
+    anchor_report = None
+    if ledger is not None:
+        anchor_report = validate_anchor(args.ledger, ledger, ref=args.anchor_ref)
+        if anchor_report["status"] == "violation":
+            errors.extend(anchor_report["errors"])
+
     lane_report = None
     if not errors and ledger is not None and args.check_deletion is not None:
         deletion_errors = validate_deletion(ledger, args.check_deletion)
@@ -47,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         "valid": not errors,
         "errors": errors,
         "ledger": str(args.ledger),
+        "anchor_check": anchor_report,
         "deletion_check": lane_report,
     }
     if args.json:
@@ -55,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         print("valid" if report["valid"] else "invalid")
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
+        if anchor_report is not None:
+            print(f"ANCHOR: status={anchor_report['status']} ref={anchor_report['ref']}")
         if lane_report is not None:
             print(f"LANE: {lane_report['lane']} stage={lane_report['stage']}")
     return 0 if report["valid"] else 1

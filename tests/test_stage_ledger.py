@@ -15,6 +15,7 @@ from migration.stage_ledger import (
     compute_entry_hash,
     lane_stage,
     load_ledger,
+    validate_anchor,
     validate_deletion,
     validate_ledger,
 )
@@ -584,6 +585,167 @@ def test_load_ledger_rejects_non_object_json(tmp_path: Path) -> None:
         load_ledger(path)
 
 
+# --- git anchor ---------------------------------------------------------
+#
+# Fixture git repos live under tmp_path so these tests never depend on (or
+# risk tripping over) the real hound repo's own working-tree state.
+
+
+def _init_git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Stage Ledger Test"], cwd=repo, check=True)
+    return repo
+
+
+def _commit_ledger(repo: Path, ledger: dict[str, Any], relpath: str = "stage-ledger.v1.json") -> Path:
+    path = repo / relpath
+    path.write_text(json.dumps(ledger))
+    subprocess.run(["git", "add", relpath], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "commit ledger"], cwd=repo, check=True)
+    return path
+
+
+def _rehash_chain(entries: list[dict[str, Any]]) -> None:
+    """Re-derive every entry_hash/previous_entry_hash in order, as a tamperer would."""
+
+    previous = GENESIS_HASH
+    for entry in entries:
+        body = {key: entry[key] for key in ("lane", "from_stage", "to_stage", "timestamp", "evidence", "approval_ref")}
+        entry["previous_entry_hash"] = previous
+        entry["entry_hash"] = compute_entry_hash(entry["sequence"], previous, body)
+        previous = entry["entry_hash"]
+
+
+def test_anchor_rejects_in_place_mutation_even_with_consistent_rehash(tmp_path: Path) -> None:
+    """THE live gap: an uncommitted rewrite of a historical entry with every
+    downstream hash re-derived passes chain verification cleanly, but must
+    still be rejected by the anchor check against the committed copy."""
+
+    repo = _init_git_repo(tmp_path)
+    ledger = (
+        LedgerBuilder()
+        .add("pulse", "freeze_contracts", "import_mirror")
+        .add("pulse", "import_mirror", "shadow", evidence=_evidence(parity="e/parity.json"))
+        .add(
+            "pulse",
+            "shadow",
+            "migrated",
+            evidence=_evidence(
+                static_no_direct_provider="e/a.json",
+                credential_unset="e/b.json",
+                unix_socket="e/c.json",
+                recovery_drill="e/d.json",
+                full_cycle="e/e.json",
+            ),
+            approval_ref="approvals/pulse.json",
+        )
+        .build()
+    )
+    path = _commit_ledger(repo, ledger)
+
+    ledger["entries"][0]["evidence"]["baseline_scan"] = "mutated/path.json"
+    _rehash_chain(ledger["entries"])
+    path.write_text(json.dumps(ledger))
+
+    assert validate_ledger(ledger) == [], "chain verification alone must stay green -- that is the gap"
+
+    report = validate_anchor(path, ledger)
+    assert report["status"] == "violation"
+    assert any("entries[0]" in error and "mutated entry" in error for error in report["errors"])
+
+
+def test_anchor_rejects_truncation(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    ledger = (
+        LedgerBuilder()
+        .add("pulse", "freeze_contracts", "import_mirror")
+        .add("pulse", "import_mirror", "shadow", evidence=_evidence(parity="e/parity.json"))
+        .build()
+    )
+    path = _commit_ledger(repo, ledger)
+
+    truncated = {"schema_version": ledger["schema_version"], "entries": ledger["entries"][:1]}
+    path.write_text(json.dumps(truncated))
+
+    report = validate_anchor(path, truncated)
+    assert report["status"] == "violation"
+    assert any("entries[1]" in error and "truncation" in error for error in report["errors"])
+
+
+def test_anchor_classifies_reorder(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    ledger = (
+        LedgerBuilder()
+        .add("pulse", "freeze_contracts", "import_mirror")
+        .add("wiki-refresh", "freeze_contracts", "import_mirror")
+        .build()
+    )
+    path = _commit_ledger(repo, ledger)
+
+    reordered = {"schema_version": ledger["schema_version"], "entries": [ledger["entries"][1], ledger["entries"][0]]}
+    path.write_text(json.dumps(reordered))
+
+    report = validate_anchor(path, reordered)
+    assert report["status"] == "violation"
+    assert any("entries[0]" in error and "reorder" in error for error in report["errors"])
+
+
+def test_anchor_allows_pure_append(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    builder = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror")
+    path = _commit_ledger(repo, builder.build())
+
+    appended = builder.add("pulse", "import_mirror", "shadow", evidence=_evidence(parity="e/parity.json")).build()
+    path.write_text(json.dumps(appended))
+
+    report = validate_anchor(path, appended)
+    assert report == {"status": "ok", "ref": "HEAD", "reason": None, "errors": []}
+
+
+def test_anchor_unmodified_committed_ledger_is_ok(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = _commit_ledger(repo, ledger)
+
+    report = validate_anchor(path, ledger)
+    assert report == {"status": "ok", "ref": "HEAD", "reason": None, "errors": []}
+
+
+def test_anchor_unavailable_outside_git_checkout(tmp_path: Path) -> None:
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = tmp_path / "ledger.json"
+    path.write_text(json.dumps(ledger))
+
+    report = validate_anchor(path, ledger)
+    assert report["status"] == "unavailable"
+    assert report["errors"] == []
+
+
+def test_anchor_unavailable_when_file_untracked_at_ref(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    subprocess.run(["git", "commit", "--allow-empty", "-q", "-m", "empty"], cwd=repo, check=True)
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = repo / "stage-ledger.v1.json"
+    path.write_text(json.dumps(ledger))
+
+    report = validate_anchor(path, ledger)
+    assert report["status"] == "unavailable"
+    assert report["errors"] == []
+
+
+def test_anchor_unavailable_for_unknown_ref(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = _commit_ledger(repo, ledger)
+
+    report = validate_anchor(path, ledger, ref="does-not-exist")
+    assert report["status"] == "unavailable"
+    assert report["errors"] == []
+
+
 # --- CLI -----------------------------------------------------------------
 
 
@@ -667,3 +829,70 @@ def test_cli_missing_ledger_file_fails_closed(tmp_path: Path) -> None:
     assert "Traceback" not in completed.stderr
     report = json.loads(completed.stdout)
     assert report["valid"] is False
+
+
+def test_cli_anchor_check_runs_without_flag_outside_git_repo(tmp_path: Path) -> None:
+    """No git repo backs tmp_path, so the anchor check must degrade
+    non-fatally rather than failing a ledger that is otherwise valid."""
+
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = _write(tmp_path, ledger)
+    completed = _cli("--ledger", str(path), "--json")
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["valid"] is True
+    assert report["anchor_check"]["status"] == "unavailable"
+
+
+def test_cli_anchor_violation_fails_even_though_chain_verifies(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Stage Ledger Test"], cwd=repo, check=True)
+
+    ledger = (
+        LedgerBuilder()
+        .add("pulse", "freeze_contracts", "import_mirror")
+        .add("pulse", "import_mirror", "shadow", evidence=_evidence(parity="e/parity.json"))
+        .build()
+    )
+    path = repo / "ledger.json"
+    path.write_text(json.dumps(ledger))
+    subprocess.run(["git", "add", "ledger.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "ledger"], cwd=repo, check=True)
+
+    ledger["entries"][0]["evidence"]["baseline_scan"] = "changed.json"
+    previous = ledger["entries"][0]["previous_entry_hash"]
+    for entry in ledger["entries"]:
+        body = {key: entry[key] for key in ("lane", "from_stage", "to_stage", "timestamp", "evidence", "approval_ref")}
+        entry["previous_entry_hash"] = previous
+        entry["entry_hash"] = compute_entry_hash(entry["sequence"], previous, body)
+        previous = entry["entry_hash"]
+    path.write_text(json.dumps(ledger))
+
+    completed = _cli("--ledger", str(path), "--json")
+    assert completed.returncode == 1
+    report = json.loads(completed.stdout)
+    assert report["valid"] is False
+    assert report["anchor_check"]["status"] == "violation"
+    assert any("mutated entry" in error for error in report["anchor_check"]["errors"])
+
+
+def test_cli_anchor_ref_flag_selects_ref(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Stage Ledger Test"], cwd=repo, check=True)
+    ledger = LedgerBuilder().add("pulse", "freeze_contracts", "import_mirror").build()
+    path = repo / "ledger.json"
+    path.write_text(json.dumps(ledger))
+    subprocess.run(["git", "add", "ledger.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "ledger"], cwd=repo, check=True)
+
+    completed = _cli("--ledger", str(path), "--anchor-ref", "does-not-exist", "--json")
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["anchor_check"]["status"] == "unavailable"
+    assert report["anchor_check"]["ref"] == "does-not-exist"

@@ -1,7 +1,12 @@
 """Pure stage-ledger validation for HSP-15.
 
 This module intentionally has no Hound service imports and performs no writes or
-network access.  It is usable from a copied Hound checkout.
+network access.  It is usable from a copied Hound checkout.  The one exception
+is the anchor check (:func:`validate_anchor`), which shells out to a local
+``git`` read (``rev-parse``/``show``) to compare the working ledger against a
+committed copy; that is a local repository read, not a write or a network
+call, and it degrades to a non-fatal "unavailable" status outside a git
+checkout.
 
 A stage ledger is a single append-only, hash-chained JSON document recording
 every migration-lane stage transition (freeze_contracts -> import_mirror ->
@@ -9,6 +14,13 @@ shadow -> migrated -> retired, per ``migration.consumer_inventory.STAGES``).
 Each entry binds a sha256 over the canonical prior-entry hash plus the entry
 body, giving the same tamper-evident chain shape as ``journal/chain.jsonl``
 in the houndd state layout, without any external key infrastructure.
+
+The hash chain alone only proves internal self-consistency: an entry can be
+rewritten and every downstream hash re-derived to match, and the chain check
+stays green because it never looks outside the document.  :func:`validate_anchor`
+closes that gap by requiring every entry already committed at a given git ref
+to still appear byte-identical at the same position in the working copy --
+the ledger may only append, never edit history in place.
 """
 
 from __future__ import annotations
@@ -17,6 +29,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
 
 from migration.consumer_inventory import (
@@ -302,21 +315,159 @@ def validate_deletion(ledger: dict[str, Any], lane: str) -> list[str]:
     return []
 
 
-def load_ledger(path: Path) -> dict[str, Any]:
+def _parse_ledger_bytes(raw: bytes, source: str) -> dict[str, Any]:
+    """Shared hardened parse path for both on-disk and git-anchored ledger bytes."""
+
     try:
-        raw = path.read_bytes()
         if len(raw) > MAX_LEDGER_BYTES:
             raise LedgerError(f"stage ledger exceeds {MAX_LEDGER_BYTES} bytes")
         text = raw.decode("utf-8")
         if problem := _json_text_problem(text):
-            raise LedgerError(f"cannot load stage ledger {path}: {problem}")
+            raise LedgerError(f"cannot load stage ledger {source}: {problem}")
         value = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
     except RecursionError as exc:
-        raise LedgerError(f"cannot load stage ledger {path}: JSON nesting exceeds maximum depth") from exc
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, InventoryError) as exc:
-        raise LedgerError(f"cannot load stage ledger {path}: {exc}") from exc
+        raise LedgerError(f"cannot load stage ledger {source}: JSON nesting exceeds maximum depth") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, InventoryError) as exc:
+        raise LedgerError(f"cannot load stage ledger {source}: {exc}") from exc
     if problem := _json_graph_problem(value):
-        raise LedgerError(f"cannot load stage ledger {path}: {problem}")
+        raise LedgerError(f"cannot load stage ledger {source}: {problem}")
     if type(value) is not dict:
         raise LedgerError("stage ledger JSON must be an object")
     return value
+
+
+def load_ledger(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise LedgerError(f"cannot load stage ledger {path}: {exc}") from exc
+    return _parse_ledger_bytes(raw, str(path))
+
+
+# --- git anchor -----------------------------------------------------------
+#
+# HSP-15's hash chain proves an entry's hash matches its body; it cannot tell
+# a legitimately-appended entry from a historical entry that was rewritten and
+# had every downstream hash re-derived to match.  The anchor check adds the
+# one thing a self-contained document can never provide: an external,
+# unforgeable prior state.  Git's own commit history is that anchor -- once a
+# ledger revision is committed, its committed bytes are exactly what the
+# working copy must still contain at the same position, forever.
+
+_GIT_TIMEOUT_SECONDS = 10
+
+
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_GIT_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _find_git_root(start: Path) -> Path | None:
+    directory = start if start.is_dir() else start.parent
+    try:
+        completed = _run_git(["rev-parse", "--show-toplevel"], cwd=directory)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.decode("utf-8", errors="replace").strip()
+    return Path(text) if text else None
+
+
+def _git_show_bytes(repo_root: Path, ref: str, relpath: str) -> tuple[bytes | None, str | None]:
+    """Return (content, None) on success or (None, reason) on failure."""
+
+    try:
+        completed = _run_git(["show", f"{ref}:{relpath}"], cwd=repo_root)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"git show failed: {exc}"
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        return None, stderr or f"git show {ref}:{relpath} failed"
+    return completed.stdout, None
+
+
+def _entries_or_none(ledger: object) -> list[Any] | None:
+    if type(ledger) is not dict:
+        return None
+    entries = ledger.get("entries")
+    return entries if type(entries) is list else None
+
+
+def validate_anchor(ledger_path: Path, ledger: dict[str, Any], *, ref: str = "HEAD") -> dict[str, Any]:
+    """Enforce append-only history against a git-committed copy of *ledger_path*.
+
+    Returns a report dict with a ``status`` of:
+
+    * ``"ok"`` -- every anchored entry still matches, at the same position.
+    * ``"violation"`` -- the working copy diverges from committed history;
+      ``errors`` names the first divergent position and its kind.
+    * ``"unavailable"`` -- no anchor could be established (not a git checkout,
+      the file is untracked at *ref*, or the anchored copy is unreadable).
+      This is non-fatal by design: it keeps the tool usable on exported
+      copies of the ledger that carry no git history of their own.
+    """
+
+    resolved = ledger_path.resolve()
+    git_root = _find_git_root(resolved)
+    if git_root is None:
+        return {"status": "unavailable", "ref": ref, "reason": "not inside a git checkout", "errors": []}
+
+    try:
+        relpath = resolved.relative_to(git_root.resolve()).as_posix()
+    except ValueError:
+        return {"status": "unavailable", "ref": ref, "reason": "ledger path is outside the git worktree", "errors": []}
+
+    raw, show_error = _git_show_bytes(git_root, ref, relpath)
+    if raw is None:
+        reason = show_error or f"{relpath} is not tracked at {ref}"
+        return {"status": "unavailable", "ref": ref, "reason": reason, "errors": []}
+
+    try:
+        anchored = _parse_ledger_bytes(raw, f"{ref}:{relpath}")
+    except LedgerError as exc:
+        return {"status": "unavailable", "ref": ref, "reason": f"anchored copy is unreadable: {exc}", "errors": []}
+
+    anchored_entries = _entries_or_none(anchored)
+    working_entries = _entries_or_none(ledger)
+    if anchored_entries is None or working_entries is None:
+        return {"status": "unavailable", "ref": ref, "reason": "anchored or working ledger has no entries list", "errors": []}
+
+    errors: list[str] = []
+    for index, anchored_entry in enumerate(anchored_entries):
+        if index >= len(working_entries):
+            errors.append(
+                f"entries[{index}] anchor divergence (truncation): entry committed at {ref} is missing from the "
+                f"working ledger, which has only {len(working_entries)} entries ({len(anchored_entries)} expected)"
+            )
+            break
+        working_entry = working_entries[index]
+        if canonical_bytes(anchored_entry) == canonical_bytes(working_entry):
+            continue
+        moved_from = next(
+            (
+                other
+                for other, other_entry in enumerate(anchored_entries)
+                if other != index and canonical_bytes(other_entry) == canonical_bytes(working_entry)
+            ),
+            None,
+        )
+        if moved_from is not None:
+            errors.append(
+                f"entries[{index}] anchor divergence (reorder): position {index} now holds the entry anchored "
+                f"at position {moved_from} relative to {ref}"
+            )
+        else:
+            errors.append(
+                f"entries[{index}] anchor divergence (mutated entry): this entry no longer matches the copy "
+                f"committed at {ref}, even though it is not a new append"
+            )
+        break
+
+    return {"status": "violation" if errors else "ok", "ref": ref, "reason": None, "errors": errors}
