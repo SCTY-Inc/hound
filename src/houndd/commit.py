@@ -21,7 +21,7 @@ from typing import Any, Mapping
 
 from hound_research.evidence import EvidenceError, validate_public_url
 
-from .adapter_validation import AdapterOutcomeError, validate_search_options
+from .adapter_validation import MAX_LEAD_ID_CHARS, AdapterOutcomeError, validate_search_options
 from .contracts import canonical_bytes, canonical_hash
 
 
@@ -37,7 +37,9 @@ SOURCE_OPERATIONS = frozenset({"ingest.file", "ingest.media", "import.record"})
 # already-authorized media capture the daemon resolves for itself.
 ADAPTER_OPERATIONS = frozenset({"ingest.search", "ingest.url", "transcribe"})
 MAX_QUERY_CHARS = 1_024
-MAX_LEAD_ID_CHARS = 128
+# lead_id's bound lives in adapter_validation (Exa's native lead ID is the
+# provider result URL, so the commit-parse boundary must accept the same
+# URL-scale identifiers the adapter and lineage-resolution stage do).
 
 
 class CommitContractError(ValueError):

@@ -419,6 +419,23 @@ def test_slice3c2_url_lineage_binds_only_an_authorized_search_record(tmp_path: P
         runtime.close()
 
 
+def test_slice3c2_url_lead_id_accepts_url_scale_exa_native_ids() -> None:
+    # Exa's native lead ID is the provider result URL (adapter_validation.py's
+    # own MAX_LEAD_ID_CHARS = 2_048 is documented for exactly this reason).
+    # The commit-parse boundary must accept the same URL-scale identifiers a
+    # completed search record legitimately carries as `native_id`, not a
+    # shorter, undocumented limit that rejects ordinary marketing URLs before
+    # the request ever reaches lineage resolution.
+    long_native_id = "https://www.example.test/newsroom/" + ("x" * 100)
+    assert 128 < len(long_native_id) <= 2_048
+    request, route = _request(
+        "ingest.url",
+        key="k",
+        payload={"url": "https://example.test/a", "lineage": {"kind": "search", "record_id": "a" * 64, "lead_id": long_native_id}},
+    )
+    assert request.canonical_dict(route)["operation"]["payload"]["lineage"]["lead_id"] == long_native_id
+
+
 # ------------------------------------------------------------------ payloads
 
 
