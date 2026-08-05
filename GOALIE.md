@@ -83,7 +83,7 @@ file.
 |---|---|---|---|
 | W1 | complete (Codex fe0c007 + 2026-08-03 repairs) | Construct `CommitRuntime` in service startup; call its `reconcile()` from `HounddStore.recover()`; replace every 503-placeholder assertion with live-commit assertions. Depends R1–R5. | Full crash matrix (kill at each commit point) against the wired service; `ingest.file` + `import.record` end-to-end over the socket. |
 | W2 | mostly complete (Codex fe0c007) | `hound-research ingest file` and `import-record` commands exist and are wired to `commit_client`. Remaining: confirm client XDG socket default and run the installed-console smoke (file on disk → journal entry → `journal query` shows it with provenance) after reinstalling the tool. | Installed-console smoke. |
-| W3 | pending | Seal Slice 3C1: evidence bundle under `tests/evidence/slice3c1/` + `tests/acceptance_slice3c1.json` in the slice3b seal pattern. | Verifier script green; bundle bound to commit/tree. |
+| W3 | complete (2026-08-05: resealed dcf5586/f8adad6 against 9b5c0bf post-R1–R7/W1–W2 — the prior seal bound a pre-repair tree; run slice3c1-117b94cf-35e8-4d66-9e13-c367e98ff3ed, 106/106 tests, independent verifier green (re-verified by main). bb_thread_id is a disclosed local nonce, not a real bb thread — disclosure lives in tests/acceptance_slice3c1.json HSP-21 note because observations.json's closed key set cannot carry it. Reseal followed the slice3b two-commit pattern: 9b5c0bf deletes the stale bundle, the seal commit binds to it.) | Seal Slice 3C1: evidence bundle under `tests/evidence/slice3c1/` + `tests/acceptance_slice3c1.json` in the slice3b seal pattern. | Verifier script green; bundle bound to commit/tree. |
 
 ### Phase B — build out remaining jobs
 
