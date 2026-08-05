@@ -168,6 +168,27 @@
    "sequence": 7,
    "previous_entry_hash": "571e43888ff0eeb20c86eb54fe65cc663165597d24ed5fad5914f5b8fd102439",
    "entry_hash": "a3c2dc9b86f801034f400751902d46606088bb05daa52f87033f2665d4f095d9"
+  },
+  {
+   "lane": "pulse",
+   "from_stage": "shadow",
+   "to_stage": "migrated",
+   "timestamp": "2026-08-05T11:22:00Z",
+   "evidence": {
+    "baseline_scan": null,
+    "credential_unset": "repos/hound/migration/evidence/lanes/pulse/credential-unset.md",
+    "full_cycle": "repos/hound/migration/evidence/lanes/pulse/full-cycle.md",
+    "legacy_absent": null,
+    "parity": "repos/hound/migration/evidence/lanes/pulse/parity.md",
+    "recovery_drill": "repos/hound/migration/evidence/lanes/pulse/recovery-drill.md",
+    "stage_ledger": null,
+    "static_no_direct_provider": "repos/hound/migration/evidence/lanes/pulse/static-no-direct-provider.md",
+    "unix_socket": "repos/hound/migration/evidence/lanes/pulse/unix-socket.md"
+   },
+   "approval_ref": "9f58992daeb5ec4081a68a452ed331f55b8a5ddc70be0f71f41521b7f61eed3d",
+   "sequence": 8,
+   "previous_entry_hash": "a3c2dc9b86f801034f400751902d46606088bb05daa52f87033f2665d4f095d9",
+   "entry_hash": "ce74317da749aa0728c084f78c4609e5f5494f9775d2dd028901b7a8468e71b6"
   }
  ]
 }
