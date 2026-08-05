@@ -88,9 +88,13 @@ the change to make — in `houndd.cli`/`service.py`, not here.
 - `RestrictAddressFamilies=` keeps `AF_INET`/`AF_INET6` open alongside
   `AF_UNIX` because `houndd` hosts the live Exa/Firecrawl adapters, which
   make outbound HTTPS requests from inside the daemon process.
-- `MemoryHigh=384M` / `MemoryMax=512M` match the values already in use on
-  this host's memory-guardrailed slices; adjust both together if the
-  daemon's working set changes.
+- `MemoryHigh=768M` / `MemoryMax=1G` (raised 2026-08-05 after two
+  systemd-oomd kills on 2026-08-04). Note the kills happened at ~105-122M
+  combined RSS+swap — far below the old caps — so they were pressure-based
+  victim selection under host-wide swap contention, not the daemon hitting
+  its ceiling. If kills recur, the levers are `ManagedOOMPreference=` or
+  host swap pressure, not a further cap raise; adjust both values together
+  if the daemon's working set genuinely changes.
 
 ## Testing changes to this unit
 

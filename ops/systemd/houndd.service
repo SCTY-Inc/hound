@@ -25,9 +25,13 @@ RuntimeDirectoryMode=0700
 
 # Explicit memory ceiling — every service on this host gets one (see the
 # operator's host CLAUDE.md, Resources section). Matches the hand-managed
-# unit's memory.conf drop-in.
-MemoryHigh=384M
-MemoryMax=512M
+# unit's memory.conf drop-in. Raised from 384M/512M 2026-08-05: measured
+# peak footprint (cgroup memory.peak) never exceeded ~80M RSS + ~42M swap
+# even at oomd-kill time, so the kills were not houndd hitting its own cap
+# — this raise gives real headroom in case working set grows, but the root
+# driver was host-wide app.slice swap pressure (see task #3 report).
+MemoryHigh=768M
+MemoryMax=1G
 
 # Sandboxing. ProtectHome=read-only would make ~/.local/state (where
 # houndd's journal/store/policy live) unwritable outright; StateDirectory=
